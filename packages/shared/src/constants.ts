@@ -87,3 +87,6 @@ export const AuditActorType = {
   PROVIDER: 'PROVIDER',
 } as const;
 export type AuditActorType = (typeof AuditActorType)[keyof typeof AuditActorType];
+
+export const EventSource = MerchantEventSource;
+export type EventSource = MerchantEventSource;
