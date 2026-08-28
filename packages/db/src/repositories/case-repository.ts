@@ -11,7 +11,7 @@ import {
   ActionExecutionStatus,
 } from '@prisma/client';
 import { prisma } from '../client.js';
-import { validateCaseTransition } from '@recoverai/core';
+import { validateCaseTransition } from '@recoverai/shared';
 
 export interface CreateCaseParams {
   id?: string;

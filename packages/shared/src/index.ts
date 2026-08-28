@@ -4,3 +4,4 @@ export * from './correlation.js';
 export * from './logger.js';
 export * from './types.js';
 export * from './money.js';
+export * from './case-state-machine.js';
