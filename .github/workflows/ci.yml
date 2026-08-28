@@ -45,14 +45,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Generate Prisma Client
+        run: npm run --workspace=@recoverai/db db:generate
+
+      - name: Build Shared Package
+        run: npm run --workspace=@recoverai/shared build
+
       - name: Lint
         run: npm run lint
 
       - name: Typecheck
         run: npm run typecheck
-
-      - name: Generate Prisma Client
-        run: npm run --workspace=@recoverai/db db:generate
 
       - name: Apply Database Schema
         run: npx prisma db push --schema=packages/db/prisma/schema.prisma --accept-data-loss
