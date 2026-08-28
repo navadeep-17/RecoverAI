@@ -61,7 +61,7 @@ jobs:
         run: npx prisma migrate deploy --schema=packages/db/prisma/schema.prisma
 
       - name: Run Unit and Integration Tests
-        run: npm run test
+        run: npx vitest run --reporter=verbose
 
       - name: Build All Workspaces
         run: npm run build
