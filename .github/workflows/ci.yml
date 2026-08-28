@@ -26,6 +26,12 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+    env:
+      DATABASE_URL: "postgresql://recoverai:recoverai_secret@localhost:5432/recoverai?schema=public"
+      PG_BOSS_SCHEMA: "pgboss"
+      NODE_ENV: "test"
+      SESSION_SECRET: "ci_testing_session_secret_32_chars_long"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -48,7 +54,10 @@ jobs:
       - name: Generate Prisma Client
         run: npm run --workspace=@recoverai/db db:generate
 
-      - name: Run Tests
+      - name: Apply Database Schema
+        run: npx prisma db push --schema=packages/db/prisma/schema.prisma --accept-data-loss
+
+      - name: Run Unit and Integration Tests
         run: npm run test
 
       - name: Build All Workspaces

@@ -2,8 +2,9 @@ import PgBoss from 'pg-boss';
 import { loadEnv, createLogger } from '@recoverai/shared';
 
 export interface RecoveryWorkerConfig {
-  connectionString: string;
-  schema: string;
+  connectionString?: string;
+  schema?: string;
+  bossInstance?: PgBoss;
 }
 
 export class RecoveryWorkerService {
@@ -11,7 +12,11 @@ export class RecoveryWorkerService {
   private logger = createLogger();
   private isRunning = false;
 
-  constructor(private config?: Partial<RecoveryWorkerConfig>) {}
+  constructor(private config?: RecoveryWorkerConfig) {
+    if (config?.bossInstance) {
+      this.boss = config.bossInstance;
+    }
+  }
 
   async start(): Promise<void> {
     const env = loadEnv();
@@ -21,23 +26,23 @@ export class RecoveryWorkerService {
     this.logger.info({ schema, msg: 'Initializing pg-boss recovery worker' });
 
     try {
-      this.boss = new PgBoss({
-        connectionString,
-        schema,
-      });
+      if (!this.boss) {
+        this.boss = new PgBoss({
+          connectionString,
+          schema,
+        });
+      }
 
       this.boss.on('error', (err) => {
         this.logger.error({ err, msg: 'pg-boss internal error' });
       });
 
-      if (env.NODE_ENV !== 'test') {
-        await this.boss.start();
-      }
-
+      await this.boss.start();
       this.isRunning = true;
       this.logger.info({ msg: 'Recovery worker service started successfully' });
     } catch (err) {
       this.logger.error({ err, msg: 'Failed to start recovery worker service' });
+      this.isRunning = false;
       throw err;
     }
   }
@@ -45,7 +50,7 @@ export class RecoveryWorkerService {
   async stop(): Promise<void> {
     if (this.boss && this.isRunning) {
       this.logger.info({ msg: 'Stopping recovery worker service...' });
-      await this.boss.stop();
+      await this.boss.stop({ graceful: true, timeout: 5000 });
       this.isRunning = false;
     }
   }
@@ -55,5 +60,9 @@ export class RecoveryWorkerService {
       isRunning: this.isRunning,
       hasBossInstance: this.boss !== null,
     };
+  }
+
+  getBoss(): PgBoss | null {
+    return this.boss;
   }
 }

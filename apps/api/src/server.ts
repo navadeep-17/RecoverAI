@@ -4,12 +4,17 @@ import sensible from '@fastify/sensible';
 import { generateCorrelationId, createLogger, loadEnv } from '@recoverai/shared';
 import { checkDatabaseConnection } from '@recoverai/db';
 
-export function buildServer(): FastifyInstance {
+export interface BuildServerOptions {
+  checkDbConnection?: () => Promise<boolean>;
+}
+
+export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   const env = loadEnv();
   const logger = createLogger({ level: env.LOG_LEVEL, isProduction: env.NODE_ENV === 'production' });
+  const checkDb = options.checkDbConnection ?? checkDatabaseConnection;
 
   const app = fastify({
-    logger: false, // Managed custom logger
+    logger: false,
     genReqId: (req) => {
       const headerId = req.headers['x-correlation-id'] || req.headers['x-request-id'];
       if (typeof headerId === 'string' && headerId.trim().length > 0) {
@@ -59,15 +64,13 @@ export function buildServer(): FastifyInstance {
     });
   });
 
-  // Ready endpoint: readiness probe including DB dependency check
+  // Ready endpoint: strict readiness probe reflecting database connectivity
   app.get('/ready', async (_req, reply) => {
-    const isDbConnected = await checkDatabaseConnection();
+    const isDbConnected = await checkDb();
+    const statusCode = isDbConnected ? 200 : 503;
 
-    const isReady = isDbConnected || env.NODE_ENV === 'test';
-
-    const statusCode = isReady ? 200 : 503;
     return reply.status(statusCode).send({
-      ready: isReady,
+      ready: isDbConnected,
       database: isDbConnected,
       timestamp: new Date().toISOString(),
     });
