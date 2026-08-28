@@ -27,7 +27,7 @@ jobs:
           --health-retries 5
 
     env:
-      DATABASE_URL: "postgresql://recoverai:recoverai_secret@localhost:5432/recoverai?schema=public"
+      DATABASE_URL: "postgresql://recoverai:recoverai_secret@127.0.0.1:5432/recoverai?schema=public"
       PG_BOSS_SCHEMA: "pgboss"
       NODE_ENV: "test"
       SESSION_SECRET: "ci_testing_session_secret_32_chars_long"
