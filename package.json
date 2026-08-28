@@ -18,7 +18,8 @@
     "clean": "npm run --workspaces --if-present clean",
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
-    "build:packages": "npm run --workspace=@recoverai/shared build && npm run --workspace=@recoverai/db build && npm run --workspace=@recoverai/core build && npm run --workspace=@recoverai/policy build && npm run --workspace=@recoverai/integrations build && npm run --workspace=@recoverai/evaluation build"
+    "build:packages": "npm run --workspace=@recoverai/shared build && npm run --workspace=@recoverai/db build && npm run --workspace=@recoverai/core build && npm run --workspace=@recoverai/policy build && npm run --workspace=@recoverai/integrations build && npm run --workspace=@recoverai/evaluation build",
+    "db:migrate:deploy": "npx prisma migrate deploy --schema=packages/db/prisma/schema.prisma"
   },
   "devDependencies": {
     "@types/node": "^20.14.9",
@@ -27,7 +28,8 @@
     "eslint": "^8.57.0",
     "prettier": "^3.3.2",
     "typescript": "^5.5.2",
-    "vitest": "^1.6.0"
+    "vitest": "^1.6.0",
+    "prisma": "^5.16.1"
   },
   "engines": {
     "node": ">=18.0.0"

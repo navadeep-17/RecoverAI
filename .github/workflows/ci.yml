@@ -58,7 +58,7 @@ jobs:
         run: npm run typecheck
 
       - name: Apply Database Migrations (Clean PostgreSQL Migration Gate)
-        run: npm run --workspace=@recoverai/db db:migrate:deploy
+        run: npx prisma migrate deploy --schema=packages/db/prisma/schema.prisma
 
       - name: Run Unit and Integration Tests
         run: npm run test
