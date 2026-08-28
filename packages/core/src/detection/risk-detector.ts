@@ -5,6 +5,7 @@ import {
   NormalizedMerchantEvent,
   AuditActorType,
   Money,
+  MissingEventIdentityError,
 } from '@recoverai/shared';
 import {
   CaseRepository,
@@ -80,7 +81,12 @@ export class RiskDetector {
    */
   private async handlePaymentFailed(event: NormalizedMerchantEvent): Promise<DetectionResult> {
     const merchantId = event.merchantId;
-    const paymentId = event.payment?.paymentId || event.externalEventId || event.dedupeKey;
+    const paymentId = event.payment?.paymentId || event.externalEventId;
+
+    if (!paymentId) {
+      throw new MissingEventIdentityError('PAYMENT_FAILED', 'paymentId or externalEventId');
+    }
+
     const incidentKey = generateIncidentKey(merchantId, RiskType.PAYMENT_FAILURE, paymentId);
 
     // 1. Check if a PAYMENT_SUCCEEDED event already arrived for this payment (suppression)
@@ -150,6 +156,7 @@ export class RiskDetector {
       riskType: RiskType.PAYMENT_FAILURE,
       amountAtRisk,
       currency,
+      incidentKey,
       contextJson: {
         incidentKey,
         source: event.source,
@@ -166,6 +173,19 @@ export class RiskDetector {
         metadata: event.metadata,
       },
     });
+
+    // If concurrent create resolved to existing case
+    if (newCase.status !== CaseStatus.OPEN) {
+      return {
+        riskDetected: true,
+        caseCreated: false,
+        caseId: newCase.id,
+        case: newCase,
+        riskType: RiskType.PAYMENT_FAILURE,
+        deduplicated: true,
+        reason: 'Concurrent creation resolved to existing incident case',
+      };
+    }
 
     await this.auditRepo.record(merchantId, {
       caseId: newCase.id,
@@ -197,7 +217,12 @@ export class RiskDetector {
    */
   private async handleSubscriptionRenewalFailed(event: NormalizedMerchantEvent): Promise<DetectionResult> {
     const merchantId = event.merchantId;
-    const subscriptionId = event.payment?.subscriptionId || event.externalEventId || event.dedupeKey;
+    const subscriptionId = event.payment?.subscriptionId;
+
+    if (!subscriptionId) {
+      throw new MissingEventIdentityError('SUBSCRIPTION_RENEWAL_FAILED', 'payment.subscriptionId');
+    }
+
     const incidentKey = generateIncidentKey(merchantId, RiskType.SUBSCRIPTION_FAILURE, subscriptionId);
 
     // 1. Case Deduplication
@@ -234,7 +259,7 @@ export class RiskDetector {
       customerId = customer.id;
     }
 
-    // 3. Create SUBSCRIPTION_FAILURE RevenueRiskCase
+    // 3. Create SUBSCRIPTION_FAILURE RevenueRiskCase with authoritative incidentKey
     const amountAtRisk = event.amount || '0.00';
     const currency = (event.currency || 'INR').toUpperCase();
     const verifiedFailureCode = event.payment?.verifiedFailureCode || null;
@@ -244,6 +269,7 @@ export class RiskDetector {
       riskType: RiskType.SUBSCRIPTION_FAILURE,
       amountAtRisk,
       currency,
+      incidentKey,
       contextJson: {
         incidentKey,
         source: event.source,
@@ -287,7 +313,12 @@ export class RiskDetector {
    */
   private async handleCheckoutStarted(event: NormalizedMerchantEvent): Promise<DetectionResult> {
     const merchantId = event.merchantId;
-    const checkoutSessionId = event.checkout?.checkoutSessionId || event.externalEventId || event.dedupeKey;
+    const checkoutSessionId = event.checkout?.checkoutSessionId;
+
+    if (!checkoutSessionId) {
+      throw new MissingEventIdentityError('CHECKOUT_STARTED', 'checkout.checkoutSessionId');
+    }
+
     const incidentKey = generateIncidentKey(merchantId, RiskType.CHECKOUT_ABANDONMENT, checkoutSessionId);
 
     // 1. Check if CHECKOUT_COMPLETED already arrived
@@ -313,7 +344,21 @@ export class RiskDetector {
       };
     }
 
-    // 2. Load and validate PolicyConfig threshold
+    // 2. Check if active CHECKOUT_ABANDONMENT case already exists
+    const existingCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, incidentKey);
+    if (existingCase) {
+      return {
+        riskDetected: true,
+        caseCreated: false,
+        caseId: existingCase.id,
+        case: existingCase,
+        riskType: RiskType.CHECKOUT_ABANDONMENT,
+        deduplicated: true,
+        reason: 'Active abandonment case already exists for checkout session',
+      };
+    }
+
+    // 3. Load and validate PolicyConfig threshold
     const config = await this.policyConfigRepo.getOrCreateConfig(merchantId);
     const thresholdMinutes = config.checkoutAbandonmentThresholdMinutes ?? 30;
     if (!Number.isInteger(thresholdMinutes) || thresholdMinutes <= 0) {
@@ -330,11 +375,26 @@ export class RiskDetector {
       };
     }
 
+    // 4. Enforce durable scheduler availability
+    if (!this.jobScheduler) {
+      await this.auditRepo.record(merchantId, {
+        eventType: 'DETECTION_ERROR',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { merchantId, checkoutSessionId },
+        reasonCode: 'DURABLE_SCHEDULER_UNAVAILABLE',
+      });
+      return {
+        riskDetected: false,
+        caseCreated: false,
+        reason: 'Durable job scheduler is required but unavailable; timer not scheduled',
+      };
+    }
+
     const scheduledFor = new Date(event.occurredAt.getTime() + thresholdMinutes * 60 * 1000);
 
-    // 3. Schedule durable abandonment recheck
+    // 5. Schedule durable abandonment recheck
     let scheduledJobId: string | undefined;
-    if (this.jobScheduler) {
+    try {
       const job = await this.jobScheduler.schedule({
         merchantId,
         jobType: 'CHECKOUT_ABANDONMENT_CHECK',
@@ -351,6 +411,18 @@ export class RiskDetector {
         },
       });
       scheduledJobId = job.id;
+    } catch (err: unknown) {
+      await this.auditRepo.record(merchantId, {
+        eventType: 'SCHEDULING_FAILED',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { incidentKey, checkoutSessionId, err: String(err) },
+        reasonCode: 'CHECKOUT_ABANDONMENT_SCHEDULING_FAILED',
+      });
+      return {
+        riskDetected: false,
+        caseCreated: false,
+        reason: 'Failed to schedule durable checkout abandonment check',
+      };
     }
 
     await this.auditRepo.record(merchantId, {
@@ -367,7 +439,7 @@ export class RiskDetector {
     });
 
     return {
-      riskDetected: false,
+      riskDetected: false, // Not yet abandoned
       caseCreated: false,
       scheduledJobId,
       reason: `Checkout started; abandonment recheck scheduled for ${scheduledFor.toISOString()} (${thresholdMinutes}m)`,
@@ -449,7 +521,7 @@ export class RiskDetector {
       customerId = customer.id;
     }
 
-    // 4. Create CHECKOUT_ABANDONMENT case
+    // 4. Create CHECKOUT_ABANDONMENT case with authoritative incidentKey
     const amountAtRisk = (context?.amount as string) || '0.00';
     const currency = ((context?.currency as string) || 'INR').toUpperCase();
 
@@ -458,6 +530,7 @@ export class RiskDetector {
       riskType: RiskType.CHECKOUT_ABANDONMENT,
       amountAtRisk,
       currency,
+      incidentKey,
       contextJson: {
         incidentKey,
         checkoutSessionId,
@@ -496,7 +569,12 @@ export class RiskDetector {
    */
   private async handleInvoiceCreated(event: NormalizedMerchantEvent): Promise<DetectionResult> {
     const merchantId = event.merchantId;
-    const invoiceId = event.invoice?.invoiceId || event.externalEventId || event.dedupeKey;
+    const invoiceId = event.invoice?.invoiceId;
+
+    if (!invoiceId) {
+      throw new MissingEventIdentityError('INVOICE_CREATED', 'invoice.invoiceId');
+    }
+
     const incidentKey = generateIncidentKey(merchantId, RiskType.OVERDUE_RECEIVABLE, invoiceId);
 
     // 1. Check if INVOICE_PAID already arrived
@@ -539,12 +617,27 @@ export class RiskDetector {
       };
     }
 
+    // 3. Enforce durable scheduler availability
+    if (!this.jobScheduler) {
+      await this.auditRepo.record(merchantId, {
+        eventType: 'DETECTION_ERROR',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { merchantId, invoiceId },
+        reasonCode: 'DURABLE_SCHEDULER_UNAVAILABLE',
+      });
+      return {
+        riskDetected: false,
+        caseCreated: false,
+        reason: 'Durable job scheduler is required but unavailable; timer not scheduled',
+      };
+    }
+
     const dueDate = event.invoice?.dueDate || event.occurredAt;
     const scheduledFor = new Date(dueDate.getTime() + graceDays * 24 * 60 * 60 * 1000);
 
-    // 3. Schedule durable overdue recheck
+    // 4. Schedule durable overdue recheck
     let scheduledJobId: string | undefined;
-    if (this.jobScheduler) {
+    try {
       const job = await this.jobScheduler.schedule({
         merchantId,
         jobType: 'INVOICE_OVERDUE_CHECK',
@@ -562,6 +655,18 @@ export class RiskDetector {
         },
       });
       scheduledJobId = job.id;
+    } catch (err: unknown) {
+      await this.auditRepo.record(merchantId, {
+        eventType: 'SCHEDULING_FAILED',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { incidentKey, invoiceId, err: String(err) },
+        reasonCode: 'INVOICE_OVERDUE_SCHEDULING_FAILED',
+      });
+      return {
+        riskDetected: false,
+        caseCreated: false,
+        reason: 'Failed to schedule durable invoice overdue check',
+      };
     }
 
     await this.auditRepo.record(merchantId, {
@@ -661,7 +766,7 @@ export class RiskDetector {
       customerId = customer.id;
     }
 
-    // 4. Create OVERDUE_RECEIVABLE case
+    // 4. Create OVERDUE_RECEIVABLE case with authoritative incidentKey
     const amountAtRisk = (context?.amount as string) || '0.00';
     const currency = ((context?.currency as string) || 'INR').toUpperCase();
 
@@ -670,6 +775,7 @@ export class RiskDetector {
       riskType: RiskType.OVERDUE_RECEIVABLE,
       amountAtRisk,
       currency,
+      incidentKey,
       contextJson: {
         incidentKey,
         invoiceId,
@@ -723,7 +829,32 @@ export class RiskDetector {
     }
 
     if (matchedCase && (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING)) {
-      const recoveredAmount = event.amount ? Money.fromDecimalString(event.amount, matchedCase.currency) : undefined;
+      let recoveredAmount: Money | undefined = undefined;
+      if (event.amount) {
+        const eventCurrency = (event.currency || '').toUpperCase();
+        if (eventCurrency !== matchedCase.currency.toUpperCase()) {
+          await this.auditRepo.record(merchantId, {
+            caseId: matchedCase.id,
+            eventType: 'CURRENCY_MISMATCH_REJECTED',
+            actorType: AuditActorType.SYSTEM,
+            inputSummaryJson: {
+              eventCurrency,
+              caseCurrency: matchedCase.currency,
+              amount: event.amount,
+            },
+            reasonCode: 'PAYMENT_CURRENCY_MISMATCH',
+          });
+          return {
+            riskDetected: false,
+            caseCreated: false,
+            caseId: matchedCase.id,
+            case: matchedCase,
+            reason: `Currency mismatch: event currency "${eventCurrency}" does not match case currency "${matchedCase.currency}"; case remains open`,
+          };
+        }
+        recoveredAmount = Money.fromDecimalString(event.amount, eventCurrency);
+      }
+
       const updatedCase = await this.caseRepo.compareAndSetStatus(
         merchantId,
         matchedCase.id,
@@ -761,11 +892,74 @@ export class RiskDetector {
   }
 
   /**
-   * 8. CHECKOUT_COMPLETED -> Suppress or record observation
+   * 8. CHECKOUT_COMPLETED -> Resolve existing CHECKOUT_ABANDONMENT case or record observation
    */
   private async handleCheckoutCompleted(event: NormalizedMerchantEvent): Promise<DetectionResult> {
     const merchantId = event.merchantId;
     const checkoutSessionId = event.checkout?.checkoutSessionId || event.externalEventId;
+
+    if (!checkoutSessionId) {
+      throw new MissingEventIdentityError('CHECKOUT_COMPLETED', 'checkoutSessionId');
+    }
+
+    const incidentKey = generateIncidentKey(merchantId, RiskType.CHECKOUT_ABANDONMENT, checkoutSessionId);
+    const matchedCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, incidentKey);
+
+    if (matchedCase && (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING)) {
+      let recoveredAmount: Money | undefined = undefined;
+      if (event.amount) {
+        const eventCurrency = (event.currency || '').toUpperCase();
+        if (eventCurrency !== matchedCase.currency.toUpperCase()) {
+          await this.auditRepo.record(merchantId, {
+            caseId: matchedCase.id,
+            eventType: 'CURRENCY_MISMATCH_REJECTED',
+            actorType: AuditActorType.SYSTEM,
+            inputSummaryJson: {
+              eventCurrency,
+              caseCurrency: matchedCase.currency,
+              amount: event.amount,
+            },
+            reasonCode: 'CHECKOUT_CURRENCY_MISMATCH',
+          });
+          return {
+            riskDetected: false,
+            caseCreated: false,
+            caseId: matchedCase.id,
+            case: matchedCase,
+            reason: `Currency mismatch: checkout completed currency "${eventCurrency}" does not match case currency "${matchedCase.currency}"; case remains open`,
+          };
+        }
+        recoveredAmount = Money.fromDecimalString(event.amount, eventCurrency);
+      }
+
+      const updatedCase = await this.caseRepo.compareAndSetStatus(
+        merchantId,
+        matchedCase.id,
+        matchedCase.status,
+        CaseStatus.RECOVERED,
+        {
+          recoveredAmount,
+          resolvedAt: event.occurredAt,
+        },
+      );
+
+      await this.auditRepo.record(merchantId, {
+        caseId: updatedCase.id,
+        eventType: 'CASE_RESOLVED_BY_CHECKOUT_COMPLETION',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { checkoutSessionId, amount: event.amount, currency: event.currency },
+        outputSummaryJson: { status: CaseStatus.RECOVERED, recoveredAmount: event.amount },
+        reasonCode: 'CHECKOUT_COMPLETED_RESOLVED_CASE',
+      });
+
+      return {
+        riskDetected: false,
+        caseCreated: false,
+        caseId: updatedCase.id,
+        case: updatedCase,
+        reason: 'Checkout completed; active abandonment case resolved to RECOVERED',
+      };
+    }
 
     await this.auditRepo.record(merchantId, {
       eventType: 'CHECKOUT_COMPLETED_OBSERVED',
@@ -788,14 +982,40 @@ export class RiskDetector {
     const merchantId = event.merchantId;
     const invoiceId = event.invoice?.invoiceId || event.externalEventId;
 
-    let matchedCase: RevenueRiskCase | null = null;
-    if (invoiceId) {
-      const invoiceIncidentKey = generateIncidentKey(merchantId, RiskType.OVERDUE_RECEIVABLE, invoiceId);
-      matchedCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, invoiceIncidentKey);
+    if (!invoiceId) {
+      throw new MissingEventIdentityError('INVOICE_PAID', 'invoiceId');
     }
 
+    const invoiceIncidentKey = generateIncidentKey(merchantId, RiskType.OVERDUE_RECEIVABLE, invoiceId);
+    const matchedCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, invoiceIncidentKey);
+
     if (matchedCase && (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING)) {
-      const recoveredAmount = event.amount ? Money.fromDecimalString(event.amount, matchedCase.currency) : undefined;
+      let recoveredAmount: Money | undefined = undefined;
+      if (event.amount) {
+        const eventCurrency = (event.currency || '').toUpperCase();
+        if (eventCurrency !== matchedCase.currency.toUpperCase()) {
+          await this.auditRepo.record(merchantId, {
+            caseId: matchedCase.id,
+            eventType: 'CURRENCY_MISMATCH_REJECTED',
+            actorType: AuditActorType.SYSTEM,
+            inputSummaryJson: {
+              eventCurrency,
+              caseCurrency: matchedCase.currency,
+              amount: event.amount,
+            },
+            reasonCode: 'INVOICE_CURRENCY_MISMATCH',
+          });
+          return {
+            riskDetected: false,
+            caseCreated: false,
+            caseId: matchedCase.id,
+            case: matchedCase,
+            reason: `Currency mismatch: invoice paid currency "${eventCurrency}" does not match case currency "${matchedCase.currency}"; case remains open`,
+          };
+        }
+        recoveredAmount = Money.fromDecimalString(event.amount, eventCurrency);
+      }
+
       const updatedCase = await this.caseRepo.compareAndSetStatus(
         merchantId,
         matchedCase.id,
@@ -809,7 +1029,7 @@ export class RiskDetector {
 
       await this.auditRepo.record(merchantId, {
         caseId: updatedCase.id,
-        eventType: 'INVOICE_PAID_OBSERVED',
+        eventType: 'INVOICE_PAID_RESOLVED_CASE',
         actorType: AuditActorType.SYSTEM,
         inputSummaryJson: { invoiceId, amount: event.amount },
         outputSummaryJson: { status: CaseStatus.RECOVERED, recoveredAmount: event.amount },

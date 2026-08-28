@@ -21,7 +21,7 @@ export class ScheduledJobRepository {
         jobType: params.jobType,
         pgBossJobId: params.pgBossJobId,
         scheduledFor: params.scheduledFor,
-        status: 'SCHEDULED',
+        status: 'PENDING_DISPATCH',
         payloadJson: params.payloadJson as Prisma.InputJsonValue,
       },
     });

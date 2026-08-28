@@ -3,6 +3,7 @@ import {
   NormalizedEventType,
   NormalizedMerchantEvent,
   NormalizedMerchantEventSchema,
+  MissingEventIdentityError,
 } from '@recoverai/shared';
 
 export interface DirectMerchantEventInput {
@@ -52,15 +53,45 @@ export interface DirectMerchantEventInput {
 
 export class MerchantEventNormalizer {
   static normalize(input: DirectMerchantEventInput): NormalizedMerchantEvent {
+    // Required fact validation per event type
+    if (input.eventType === NormalizedEventType.CHECKOUT_STARTED || input.eventType === NormalizedEventType.CHECKOUT_COMPLETED) {
+      if (!input.checkout?.checkoutSessionId) {
+        throw new MissingEventIdentityError(input.eventType, 'checkout.checkoutSessionId');
+      }
+    }
+
+    if (input.eventType === NormalizedEventType.INVOICE_CREATED || input.eventType === NormalizedEventType.INVOICE_PAID) {
+      if (!input.invoice?.invoiceId) {
+        throw new MissingEventIdentityError(input.eventType, 'invoice.invoiceId');
+      }
+    }
+
+    if (input.eventType === NormalizedEventType.PAYMENT_FAILED && !input.payment?.paymentId && !input.externalEventId) {
+      throw new MissingEventIdentityError(input.eventType, 'payment.paymentId or externalEventId');
+    }
+
+    if (input.eventType === NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED && !input.payment?.subscriptionId) {
+      throw new MissingEventIdentityError(input.eventType, 'payment.subscriptionId');
+    }
+
     const occurredAt = input.occurredAt
       ? typeof input.occurredAt === 'string'
         ? new Date(input.occurredAt)
         : input.occurredAt
       : new Date();
 
-    const dedupeKey =
-      input.dedupeKey ||
-      `mch:${input.merchantId}:${input.eventType}:${input.externalEventId || input.payment?.paymentId || input.checkout?.checkoutSessionId || input.invoice?.invoiceId || Date.now()}`;
+    const entityRef =
+      input.externalEventId ||
+      input.payment?.paymentId ||
+      input.checkout?.checkoutSessionId ||
+      input.invoice?.invoiceId ||
+      input.payment?.subscriptionId;
+
+    if (!input.dedupeKey && !entityRef) {
+      throw new MissingEventIdentityError(input.eventType, 'dedupeKey or entity identifier');
+    }
+
+    const dedupeKey = input.dedupeKey || `mch:${input.merchantId}:${input.eventType}:${entityRef}`;
 
     const normalized: NormalizedMerchantEvent = {
       merchantId: input.merchantId,

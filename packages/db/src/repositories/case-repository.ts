@@ -49,6 +49,7 @@ export interface CreateCaseParams {
   riskType: RiskType;
   amountAtRisk: ExactMonetaryInput;
   currency?: string;
+  incidentKey?: string;
   contextJson: Record<string, unknown>;
   nextEvaluationAt?: Date;
 }
@@ -91,19 +92,40 @@ export class CaseRepository {
       resolvedCurrency = (resolvedCurrency || 'INR').toUpperCase();
     }
 
-    return prisma.revenueRiskCase.create({
-      data: {
-        id: params.id,
-        merchantId,
-        customerId: params.customerId,
-        riskType: params.riskType,
-        amountAtRisk: toPrismaDecimal(params.amountAtRisk),
-        currency: resolvedCurrency,
-        status: CaseStatus.OPEN,
-        contextJson: params.contextJson as Prisma.InputJsonValue,
-        nextEvaluationAt: params.nextEvaluationAt,
-      },
-    });
+    try {
+      return await prisma.revenueRiskCase.create({
+        data: {
+          id: params.id,
+          merchantId,
+          customerId: params.customerId,
+          riskType: params.riskType,
+          amountAtRisk: toPrismaDecimal(params.amountAtRisk),
+          currency: resolvedCurrency,
+          status: CaseStatus.OPEN,
+          incidentKey: params.incidentKey || undefined,
+          contextJson: params.contextJson as Prisma.InputJsonValue,
+          nextEvaluationAt: params.nextEvaluationAt,
+        },
+      });
+    } catch (err: unknown) {
+      if (
+        err &&
+        typeof err === 'object' &&
+        'code' in err &&
+        (err as { code: string }).code === 'P2002' &&
+        params.incidentKey
+      ) {
+        return prisma.revenueRiskCase.findUniqueOrThrow({
+          where: {
+            merchantId_incidentKey: {
+              merchantId,
+              incidentKey: params.incidentKey,
+            },
+          },
+        });
+      }
+      throw err;
+    }
   }
 
   async getCaseById(merchantId: string, caseId: string): Promise<RevenueRiskCase | null> {
@@ -360,10 +382,15 @@ export class CaseRepository {
         status: {
           in: [CaseStatus.OPEN, CaseStatus.WAITING, CaseStatus.NEEDS_REVIEW],
         },
-        contextJson: {
-          path: ['incidentKey'],
-          equals: incidentKey,
-        },
+        OR: [
+          { incidentKey },
+          {
+            contextJson: {
+              path: ['incidentKey'],
+              equals: incidentKey,
+            },
+          },
+        ],
       },
       include: {
         customer: true,

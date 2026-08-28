@@ -178,6 +178,7 @@ model RevenueRiskCase {
   amountAtRisk       Decimal               @db.Decimal(12, 2)
   currency           String                @default("INR")
   status             CaseStatus            @default(OPEN)
+  incidentKey        String?
   contextJson        Json
   openedAt           DateTime              @default(now())
   nextEvaluationAt   DateTime?
@@ -196,6 +197,7 @@ model RevenueRiskCase {
   scheduledJobs      ScheduledJob[]
   auditEvents        AuditEvent[]
 
+  @@unique([merchantId, incidentKey])
   @@index([merchantId, status])
   @@index([merchantId, riskType])
   @@map("revenue_risk_cases")

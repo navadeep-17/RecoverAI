@@ -6,3 +6,4 @@ export * from './types.js';
 export * from './money.js';
 export * from './case-state-machine.js';
 export * from './events.js';
+export * from './errors.js';

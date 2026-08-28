@@ -3,6 +3,9 @@ import {
   NormalizedEventType,
   NormalizedMerchantEvent,
   NormalizedMerchantEventSchema,
+  UnsupportedProviderEventError,
+  InvalidProviderAmountError,
+  MissingEventIdentityError,
 } from '@recoverai/shared';
 
 export interface RazorpayRawPayload {
@@ -10,6 +13,8 @@ export interface RazorpayRawPayload {
   account_id?: string;
   event?: string;
   contains?: string[];
+  id?: string;
+  event_id?: string;
   payload?: {
     payment?: {
       entity?: {
@@ -71,23 +76,40 @@ export interface RazorpayRawPayload {
   created_at?: number;
 }
 
-export function formatPaiseToDecimalString(amountInPaise: number | string): string {
-  const num = typeof amountInPaise === 'string' ? parseInt(amountInPaise, 10) : amountInPaise;
-  if (isNaN(num) || num < 0) {
-    return '0.00';
+export function formatPaiseToDecimalString(amountInPaise: unknown): string {
+  if (amountInPaise === null || amountInPaise === undefined) {
+    throw new InvalidProviderAmountError('Amount in paise is null or undefined', amountInPaise);
   }
-  const rupees = Math.floor(num / 100);
-  const paise = num % 100;
-  return `${rupees}.${paise.toString().padStart(2, '0')}`;
+
+  let str: string;
+  if (typeof amountInPaise === 'number') {
+    if (!Number.isSafeInteger(amountInPaise) || amountInPaise < 0) {
+      throw new InvalidProviderAmountError('Amount in paise must be a non-negative safe integer', amountInPaise);
+    }
+    str = amountInPaise.toString();
+  } else if (typeof amountInPaise === 'string') {
+    const trimmed = amountInPaise.trim();
+    if (!/^\d+$/.test(trimmed)) {
+      throw new InvalidProviderAmountError('Amount in paise must be an exact numeric string without decimals or special characters', amountInPaise);
+    }
+    str = trimmed;
+  } else {
+    throw new InvalidProviderAmountError('Amount in paise must be a number or string', amountInPaise);
+  }
+
+  const paiseBigInt = BigInt(str);
+  const rupees = paiseBigInt / 100n;
+  const paise = paiseBigInt % 100n;
+  return `${rupees.toString()}.${paise.toString().padStart(2, '0')}`;
 }
 
 export class RazorpayEventNormalizer {
   static normalize(
     merchantId: string,
     raw: RazorpayRawPayload,
-    externalEventId?: string,
+    explicitEventId?: string,
   ): NormalizedMerchantEvent {
-    const eventName = raw.event || '';
+    const eventName = (raw.event || '').trim();
     const paymentEntity = raw.payload?.payment?.entity;
     const subscriptionEntity = raw.payload?.subscription?.entity;
     const invoiceEntity = raw.payload?.invoice?.entity;
@@ -104,7 +126,8 @@ export class RazorpayEventNormalizer {
     } else if (eventName === 'invoice.paid') {
       eventType = NormalizedEventType.INVOICE_PAID;
     } else {
-      eventType = NormalizedEventType.PAYMENT_FAILED;
+      // Any unsupported or unknown Razorpay event must fail closed and NOT produce revenue-risk events
+      throw new UnsupportedProviderEventError('Razorpay', eventName || 'UNKNOWN');
     }
 
     const occurredAt = raw.created_at
@@ -113,14 +136,37 @@ export class RazorpayEventNormalizer {
       ? new Date(paymentEntity.created_at * 1000)
       : new Date();
 
+    const externalEventId = explicitEventId || raw.id || raw.event_id || null;
     const paymentId = paymentEntity?.id || null;
-    const subscriptionId = subscriptionEntity?.id || paymentEntity?.invoice_id || null;
     const invoiceId = invoiceEntity?.id || paymentEntity?.invoice_id || null;
-    const dedupeKey = externalEventId
-      ? `razorpay:${merchantId}:${externalEventId}`
-      : paymentId
-      ? `razorpay:${merchantId}:${paymentId}:${eventName}`
-      : `razorpay:${merchantId}:${Date.now()}:${Math.random().toString(36).substring(2, 9)}`;
+
+    // Authoritative subscription extraction: only from subscription entity or invoice subscription_id (NEVER invoice_id)
+    const subscriptionId = subscriptionEntity?.id || invoiceEntity?.subscription_id || null;
+
+    // Enforce required identities per event type
+    if (eventType === NormalizedEventType.PAYMENT_FAILED && !paymentId && !externalEventId) {
+      throw new MissingEventIdentityError('PAYMENT_FAILED', 'paymentId or externalEventId');
+    }
+    if (eventType === NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED && !subscriptionId) {
+      throw new MissingEventIdentityError('SUBSCRIPTION_RENEWAL_FAILED', 'subscriptionId');
+    }
+    if (eventType === NormalizedEventType.INVOICE_PAID && !invoiceId) {
+      throw new MissingEventIdentityError('INVOICE_PAID', 'invoiceId');
+    }
+
+    // Deterministic dedupe key generation (NO Date.now() or Math.random())
+    let dedupeKey: string;
+    if (externalEventId) {
+      dedupeKey = `razorpay:${merchantId}:event:${externalEventId}`;
+    } else if (paymentId) {
+      dedupeKey = `razorpay:${merchantId}:payment:${paymentId}:${eventName}`;
+    } else if (subscriptionId) {
+      dedupeKey = `razorpay:${merchantId}:sub:${subscriptionId}:${eventName}`;
+    } else if (invoiceId) {
+      dedupeKey = `razorpay:${merchantId}:inv:${invoiceId}:${eventName}`;
+    } else {
+      throw new MissingEventIdentityError(eventName, 'externalEventId or entityId');
+    }
 
     let formattedAmount: string | null = null;
     if (paymentEntity?.amount !== undefined) {
@@ -145,7 +191,7 @@ export class RazorpayEventNormalizer {
         email: paymentEntity?.email || null,
         phone: paymentEntity?.contact || null,
         name: null,
-        contactConsent: null, // Unknown until verified
+        contactConsent: null, // Explicitly unknown until verified
       },
       payment: {
         paymentId,
@@ -164,7 +210,7 @@ export class RazorpayEventNormalizer {
             invoiceId,
             invoiceNumber: invoiceEntity?.invoice_number || null,
             dueDate: invoiceEntity?.expire_by ? new Date(invoiceEntity.expire_by * 1000) : null,
-            paid: invoiceEntity?.status === 'paid',
+            paid: invoiceEntity?.status === 'paid' || eventType === NormalizedEventType.INVOICE_PAID,
           }
         : null,
       metadata: {

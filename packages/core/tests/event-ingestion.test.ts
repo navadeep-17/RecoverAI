@@ -111,6 +111,127 @@ describe('Event Normalizers & Schema Validation', () => {
       expect(normalized.eventType).toBe(NormalizedEventType.PAYMENT_SUCCEEDED);
       expect(normalized.amount).toBe('5000.00');
     });
+    it('throws UnsupportedProviderEventError on unrecognized Razorpay events', () => {
+      const unsupportedEvents = [
+        'refund.processed',
+        'payment.refunded',
+        'subscription.cancelled',
+        'dispute.created',
+        'order.paid',
+        'random.unsupported.event',
+      ];
+
+      for (const evtName of unsupportedEvents) {
+        const rawPayload = {
+          event: evtName,
+          payload: {
+            payment: {
+              entity: {
+                id: 'pay_unsupported_01',
+                amount: 100000,
+                currency: 'INR',
+              },
+            },
+          },
+        };
+
+        expect(() => RazorpayEventNormalizer.normalize(merchantId, rawPayload, 'ext_evt_01')).toThrow(
+          /Unsupported Razorpay event/,
+        );
+      }
+    });
+
+    it('rejects invalid or non-integer paise amounts with InvalidProviderAmountError', () => {
+      const invalidAmounts = ['100abc', '100.5', -1, NaN, Infinity, -100, 100.25, 'invalid'];
+
+      for (const badAmount of invalidAmounts) {
+        const rawPayload = {
+          event: 'payment.failed',
+          payload: {
+            payment: {
+              entity: {
+                id: 'pay_bad_amount',
+                amount: badAmount,
+                currency: 'INR',
+              },
+            },
+          },
+        };
+
+        expect(() => RazorpayEventNormalizer.normalize(merchantId, rawPayload, 'ext_evt_02')).toThrow(
+          /Invalid provider amount/,
+        );
+      }
+    });
+
+    it('generates deterministic dedupeKey without random or timestamp noise', () => {
+      const rawPayloadWithId = {
+        id: 'evt_rzp_deterministic_1',
+        event: 'payment.failed',
+        payload: {
+          payment: {
+            entity: {
+              id: 'pay_det_001',
+              amount: 100000,
+              currency: 'INR',
+            },
+          },
+        },
+      };
+
+      const norm1 = RazorpayEventNormalizer.normalize(merchantId, rawPayloadWithId);
+      const norm2 = RazorpayEventNormalizer.normalize(merchantId, rawPayloadWithId);
+      expect(norm1.dedupeKey).toBe('razorpay:mch_test_norm_01:event:evt_rzp_deterministic_1');
+      expect(norm1.dedupeKey).toBe(norm2.dedupeKey);
+
+      // Without explicit event id: falls back to entity id + event name
+      const rawPayloadWithoutEventId = {
+        event: 'payment.failed',
+        payload: {
+          payment: {
+            entity: {
+              id: 'pay_entity_only_999',
+              amount: 200000,
+              currency: 'INR',
+            },
+          },
+        },
+      };
+
+      const normFallback1 = RazorpayEventNormalizer.normalize(merchantId, rawPayloadWithoutEventId);
+      const normFallback2 = RazorpayEventNormalizer.normalize(merchantId, rawPayloadWithoutEventId);
+      expect(normFallback1.dedupeKey).toBe('razorpay:mch_test_norm_01:payment:pay_entity_only_999:payment.failed');
+      expect(normFallback1.dedupeKey).toBe(normFallback2.dedupeKey);
+    });
+
+    it('extracts subscriptionId strictly from subscription entity or invoice.subscription_id and never from invoice_id', () => {
+      const rawInvoicePayload = {
+        event: 'subscription.charged',
+        payload: {
+          invoice: {
+            entity: {
+              id: 'inv_rzp_999',
+              subscription_id: 'sub_real_authoritative_123',
+              amount: 500000,
+              currency: 'INR',
+            },
+          },
+          payment: {
+            entity: {
+              id: 'pay_inv_charge_1',
+              amount: 500000,
+              currency: 'INR',
+            },
+          },
+        },
+      };
+
+      const normalized = RazorpayEventNormalizer.normalize(merchantId, rawInvoicePayload, 'ext_inv_charge');
+      expect(normalized.payment?.subscriptionId).toBe('sub_real_authoritative_123');
+      expect(normalized.invoice?.invoiceId).toBe('inv_rzp_999');
+      // Proves invoice id is not used as subscription id
+      expect(normalized.payment?.subscriptionId).not.toBe('inv_rzp_999');
+    });
   });
 
   describe('2. MerchantEventNormalizer & SimulatorEventNormalizer', () => {
@@ -134,6 +255,28 @@ describe('Event Normalizers & Schema Validation', () => {
       expect(normalized.eventType).toBe(NormalizedEventType.CHECKOUT_STARTED);
       expect(normalized.amount).toBe('8499.00');
       expect(normalized.checkout?.checkoutSessionId).toBe('sess_chk_123');
+    });
+
+    it('enforces required fact validation on merchant events', () => {
+      // CHECKOUT_STARTED missing checkoutSessionId
+      expect(() =>
+        MerchantEventNormalizer.normalize({
+          merchantId,
+          eventType: NormalizedEventType.CHECKOUT_STARTED,
+          amount: '1000.00',
+          currency: 'INR',
+        }),
+      ).toThrow(/is missing required authoritative identity field/);
+
+      // INVOICE_CREATED missing invoiceId
+      expect(() =>
+        MerchantEventNormalizer.normalize({
+          merchantId,
+          eventType: NormalizedEventType.INVOICE_CREATED,
+          amount: '1000.00',
+          currency: 'INR',
+        }),
+      ).toThrow(/is missing required authoritative identity field/);
     });
 
     it('normalizes invoice.created event', () => {

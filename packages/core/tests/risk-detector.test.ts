@@ -476,6 +476,7 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
         riskType: RiskType.PAYMENT_FAILURE,
         amountAtRisk: '10000.00',
         currency: 'INR',
+        incidentKey: generateIncidentKey(merchantId, RiskType.PAYMENT_FAILURE, 'pay_rec_01'),
         contextJson: {
           incidentKey: generateIncidentKey(merchantId, RiskType.PAYMENT_FAILURE, 'pay_rec_01'),
         },
@@ -503,9 +504,116 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
         }),
       );
     });
+
+    it('CHECKOUT_COMPLETED resolves active CHECKOUT_ABANDONMENT case to RECOVERED', async () => {
+      const checkoutSessionId = 'sess_rec_chk_01';
+      const incidentKey = generateIncidentKey(merchantId, RiskType.CHECKOUT_ABANDONMENT, checkoutSessionId);
+
+      const createdCase = await mockCaseRepo.createCase(merchantId, {
+        riskType: RiskType.CHECKOUT_ABANDONMENT,
+        amountAtRisk: '5999.00',
+        currency: 'INR',
+        incidentKey,
+        contextJson: { incidentKey, checkoutSessionId },
+      });
+
+      const event: NormalizedMerchantEvent = {
+        merchantId,
+        source: MerchantEventSource.MERCHANT,
+        externalEventId: checkoutSessionId,
+        eventType: NormalizedEventType.CHECKOUT_COMPLETED,
+        occurredAt: new Date(),
+        dedupeKey: `mch:${checkoutSessionId}:completed`,
+        amount: '5999.00',
+        currency: 'INR',
+        checkout: { checkoutSessionId },
+      };
+
+      const result = await riskDetector.handleNormalizedEvent(event);
+      expect(result.case?.status).toBe(CaseStatus.RECOVERED);
+      expect(mockAuditRepo.record).toHaveBeenCalledWith(
+        merchantId,
+        expect.objectContaining({
+          eventType: 'CASE_RESOLVED_BY_CHECKOUT_COMPLETION',
+          reasonCode: 'CHECKOUT_COMPLETED_RESOLVED_CASE',
+        }),
+      );
+    });
+
+    it('rejects case resolution and audits CURRENCY_MISMATCH_REJECTED when success event currency differs from case currency', async () => {
+      // Case is in INR
+      const incidentKey = generateIncidentKey(merchantId, RiskType.PAYMENT_FAILURE, 'pay_curr_mismatch');
+      const createdCase = await mockCaseRepo.createCase(merchantId, {
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: '100.00',
+        currency: 'INR',
+        incidentKey,
+        contextJson: { incidentKey },
+      });
+
+      // Event arrives in USD
+      const event: NormalizedMerchantEvent = {
+        merchantId,
+        source: MerchantEventSource.RAZORPAY,
+        externalEventId: 'pay_curr_mismatch',
+        eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+        occurredAt: new Date(),
+        dedupeKey: 'razorpay:mch:pay_curr_mismatch:success',
+        amount: '100.00',
+        currency: 'USD', // Mismatched currency
+        payment: { paymentId: 'pay_curr_mismatch' },
+      };
+
+      const result = await riskDetector.handleNormalizedEvent(event);
+      expect(result.case?.status).toBe(CaseStatus.OPEN); // Case was NOT resolved
+      expect(mockAuditRepo.record).toHaveBeenCalledWith(
+        merchantId,
+        expect.objectContaining({
+          eventType: 'CURRENCY_MISMATCH_REJECTED',
+          reasonCode: 'PAYMENT_CURRENCY_MISMATCH',
+        }),
+      );
+    });
   });
 
-  describe('6. Policy Config Validation & Safe Fallback', () => {
+  describe('6. Policy Config Validation, Missing Schedulers & Safe Fallback', () => {
+    it('fails safely with DETECTION_ERROR if jobScheduler is missing when timer event arrives', async () => {
+      const detectorWithoutScheduler = new RiskDetector(
+        mockCaseRepo,
+        mockCustomerRepo,
+        mockPolicyConfigRepo,
+        mockAuditRepo,
+        mockEventRepo,
+        undefined, // No job scheduler
+      );
+
+      const event: NormalizedMerchantEvent = {
+        merchantId,
+        source: MerchantEventSource.MERCHANT,
+        eventType: NormalizedEventType.CHECKOUT_STARTED,
+        occurredAt: new Date(),
+        dedupeKey: 'mch:no_sched:chk',
+        checkout: { checkoutSessionId: 'sess_no_sched' },
+      };
+
+      const result = await detectorWithoutScheduler.handleNormalizedEvent(event);
+      expect(result.scheduledJobId).toBeUndefined();
+      expect(mockAuditRepo.record).toHaveBeenCalledWith(
+        merchantId,
+        expect.objectContaining({
+          eventType: 'DETECTION_ERROR',
+          reasonCode: 'DURABLE_SCHEDULER_UNAVAILABLE',
+        }),
+      );
+      // Confirms TIMER_SCHEDULED was NEVER recorded
+      expect(mockAuditRepo.record).not.toHaveBeenCalledWith(
+        merchantId,
+        expect.objectContaining({
+          eventType: 'TIMER_SCHEDULED',
+        }),
+      );
+    });
+
     it('fails safely without scheduling if checkoutAbandonmentThresholdMinutes is invalid (<=0)', async () => {
       vi.spyOn(mockPolicyConfigRepo, 'getOrCreateConfig').mockResolvedValueOnce({
         merchantId,
