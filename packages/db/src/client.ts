@@ -12,7 +12,11 @@ const defaultDbUrl =
 
 export function createPrismaClient(): PrismaClient {
   return new PrismaClient({
-    datasourceUrl: defaultDbUrl,
+    datasources: {
+      db: {
+        url: defaultDbUrl,
+      },
+    },
     log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
   });
 }
