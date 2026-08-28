@@ -35,6 +35,12 @@ describe('pg-boss Real Integration Smoke Test', () => {
     // Verify boss instance is active
     expect(boss).toBeDefined();
 
+    const scheduler = worker.getScheduler();
+    expect(scheduler).toBeDefined();
+
+    const riskDetector = worker.getRiskDetector();
+    expect(riskDetector).toBeDefined();
+
     // Gracefully stop worker
     await worker.stop();
     expect(worker.getStatus().isRunning).toBe(false);

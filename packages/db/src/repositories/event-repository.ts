@@ -90,4 +90,22 @@ export class EventRepository {
       data: { processed: true },
     });
   }
+
+  async findEventByTypeAndField(
+    merchantId: string,
+    type: string,
+    fieldPath: string[],
+    value: unknown,
+  ): Promise<MerchantEvent | null> {
+    return prisma.merchantEvent.findFirst({
+      where: {
+        merchantId,
+        type,
+        payloadJson: {
+          path: fieldPath,
+          equals: value as Prisma.InputJsonValue,
+        },
+      },
+    });
+  }
 }

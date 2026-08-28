@@ -15,6 +15,8 @@ describe('RecoveryWorkerService Unit Tests', () => {
       start: async () => mockBoss as unknown as PgBoss,
       stop: async () => {},
       on: () => mockBoss,
+      work: async () => 'mock_work_id',
+      send: async () => 'mock_send_id',
     } as unknown as PgBoss;
 
     const worker = new RecoveryWorkerService({ bossInstance: mockBoss });

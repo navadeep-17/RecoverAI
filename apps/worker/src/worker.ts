@@ -1,16 +1,34 @@
 import PgBoss from 'pg-boss';
 import { loadEnv, createLogger } from '@recoverai/shared';
+import {
+  CaseRepository,
+  CustomerRepository,
+  PolicyConfigRepository,
+  AuditRepository,
+  EventRepository,
+  ScheduledJobRepository,
+} from '@recoverai/db';
+import { RiskDetector } from '@recoverai/core';
+import { PgBossJobScheduler } from './scheduler.js';
 
 export interface RecoveryWorkerConfig {
   connectionString?: string;
   schema?: string;
   bossInstance?: PgBoss;
+  caseRepo?: CaseRepository;
+  customerRepo?: CustomerRepository;
+  policyConfigRepo?: PolicyConfigRepository;
+  auditRepo?: AuditRepository;
+  eventRepo?: EventRepository;
+  scheduledJobRepo?: ScheduledJobRepository;
 }
 
 export class RecoveryWorkerService {
   private boss: PgBoss | null = null;
   private logger = createLogger();
   private isRunning = false;
+  private scheduler: PgBossJobScheduler | null = null;
+  private riskDetector: RiskDetector | null = null;
 
   constructor(private config?: RecoveryWorkerConfig) {
     if (config?.bossInstance) {
@@ -39,12 +57,76 @@ export class RecoveryWorkerService {
 
       await this.boss.start();
       this.isRunning = true;
-      this.logger.info({ msg: 'Recovery worker service started successfully' });
+
+      // Initialize repositories & services
+      const caseRepo = this.config?.caseRepo || new CaseRepository();
+      const customerRepo = this.config?.customerRepo || new CustomerRepository();
+      const policyConfigRepo = this.config?.policyConfigRepo || new PolicyConfigRepository();
+      const auditRepo = this.config?.auditRepo || new AuditRepository();
+      const eventRepo = this.config?.eventRepo || new EventRepository();
+      const scheduledJobRepo = this.config?.scheduledJobRepo || new ScheduledJobRepository();
+
+      this.scheduler = new PgBossJobScheduler(this.boss, scheduledJobRepo);
+      this.riskDetector = new RiskDetector(
+        caseRepo,
+        customerRepo,
+        policyConfigRepo,
+        auditRepo,
+        eventRepo,
+        this.scheduler,
+      );
+
+      // Register pg-boss job subscribers
+      await this.registerJobHandlers(scheduledJobRepo);
+
+      this.logger.info({ msg: 'Recovery worker service started and subscribers registered successfully' });
     } catch (err) {
       this.logger.error({ err, msg: 'Failed to start recovery worker service' });
       this.isRunning = false;
       throw err;
     }
+  }
+
+  private async registerJobHandlers(scheduledJobRepo: ScheduledJobRepository): Promise<void> {
+    if (!this.boss || !this.riskDetector) return;
+
+    // 1. Checkout Abandonment Recheck
+    await this.boss.work('CHECKOUT_ABANDONMENT_CHECK', async (job) => {
+      const data = job.data as {
+        merchantId: string;
+        checkoutSessionId: string;
+        jobRecordId?: string;
+        [key: string]: unknown;
+      };
+      this.logger.info({ msg: 'Processing CHECKOUT_ABANDONMENT_CHECK', data });
+
+      if (this.riskDetector) {
+        await this.riskDetector.evaluateCheckoutTimer(data.merchantId, data.checkoutSessionId, data);
+      }
+
+      if (data.jobRecordId) {
+        await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+      }
+    });
+
+    // 2. Invoice Overdue Recheck
+    await this.boss.work('INVOICE_OVERDUE_CHECK', async (job) => {
+      const data = job.data as {
+        merchantId: string;
+        invoiceId: string;
+        jobRecordId?: string;
+        [key: string]: unknown;
+      };
+      this.logger.info({ msg: 'Processing INVOICE_OVERDUE_CHECK', data });
+
+      if (this.riskDetector) {
+        await this.riskDetector.evaluateInvoiceTimer(data.merchantId, data.invoiceId, data);
+      }
+
+      if (data.jobRecordId) {
+        await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+      }
+    });
   }
 
   async stop(): Promise<void> {
@@ -64,5 +146,13 @@ export class RecoveryWorkerService {
 
   getBoss(): PgBoss | null {
     return this.boss;
+  }
+
+  getScheduler(): PgBossJobScheduler | null {
+    return this.scheduler;
+  }
+
+  getRiskDetector(): RiskDetector | null {
+    return this.riskDetector;
   }
 }

@@ -6,3 +6,7 @@ export * from './agent/agent-contracts.js';
 export * from './agent/llm-provider.js';
 export * from './agent/mock-llm-provider.js';
 export * from './agent/recovery-agent.js';
+export * from './detection/incident-identity.js';
+export * from './detection/job-scheduler-interface.js';
+export * from './detection/risk-detector.js';
+export * from './events/event-ingestion-service.js';

@@ -349,4 +349,25 @@ export class CaseRepository {
       },
     });
   }
+
+  async findActiveCaseByIncidentKey(
+    merchantId: string,
+    incidentKey: string,
+  ): Promise<RevenueRiskCase | null> {
+    return prisma.revenueRiskCase.findFirst({
+      where: {
+        merchantId,
+        status: {
+          in: [CaseStatus.OPEN, CaseStatus.WAITING, CaseStatus.NEEDS_REVIEW],
+        },
+        contextJson: {
+          path: ['incidentKey'],
+          equals: incidentKey,
+        },
+      },
+      include: {
+        customer: true,
+      },
+    });
+  }
 }

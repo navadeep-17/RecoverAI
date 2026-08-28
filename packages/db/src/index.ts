@@ -7,3 +7,4 @@ export * from './repositories/customer-repository.js';
 export * from './repositories/audit-repository.js';
 export * from './repositories/policy-config-repository.js';
 export * from './repositories/human-review-repository.js';
+export * from './repositories/scheduled-job-repository.js';

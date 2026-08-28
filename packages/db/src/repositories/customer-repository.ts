@@ -9,7 +9,7 @@ export class CustomerRepository {
       email?: string;
       phone?: string;
       name?: string;
-      contactConsent?: boolean;
+      contactConsent?: boolean | null;
     },
   ): Promise<Customer> {
     if (data.externalCustomerId) {

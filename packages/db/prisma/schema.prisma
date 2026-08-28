@@ -92,6 +92,7 @@ model Merchant {
   policyConfigs   PolicyConfig[]
   humanReviews    HumanReview[]
   auditEvents     AuditEvent[]
+  scheduledJobs   ScheduledJob[]
 
   @@map("merchants")
 }
@@ -355,6 +356,7 @@ model AuditEvent {
 
 model ScheduledJob {
   id             String          @id @default(uuid())
+  merchantId     String
   caseId         String?
   jobType        String
   pgBossJobId    String?
@@ -364,8 +366,10 @@ model ScheduledJob {
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
 
+  merchant       Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
   case           RevenueRiskCase? @relation(fields: [caseId], references: [id], onDelete: SetNull)
 
+  @@index([merchantId, status])
   @@index([caseId])
   @@index([scheduledFor, status])
   @@map("scheduled_jobs")
