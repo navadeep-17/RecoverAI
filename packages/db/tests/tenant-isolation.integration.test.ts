@@ -18,8 +18,10 @@ import {
   RecoveryActionType,
   PolicyDecision,
   InvalidCaseStateTransitionError,
+  CaseStateConflictError,
   Money,
   InvalidMoneyError,
+  CurrencyMismatchError,
 } from '@recoverai/core';
 import { Prisma } from '@prisma/client';
 
@@ -95,7 +97,7 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
     }
   });
 
-  describe('1. Case State Machine Persistence Invariants', () => {
+  describe('1. Case State Machine Persistence & Concurrency (CAS) Invariants', () => {
     it('allows valid persisted transitions (OPEN -> WAITING -> RECOVERED)', async () => {
       if (!dbAvailable) return;
 
@@ -169,6 +171,34 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
         caseRepo.updateCaseStatus(merchantAId, c.id, CaseStatus.NEEDS_REVIEW),
       ).rejects.toThrow(InvalidCaseStateTransitionError);
     });
+
+    it('enforces atomic optimistic concurrency (CAS) and rejects stale concurrent transitions', async () => {
+      if (!dbAvailable) return;
+
+      // 1. Initial state: OPEN
+      const c = await caseRepo.createCase(merchantAId, {
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: '3500.00',
+        contextJson: {},
+      });
+      expect(c.status).toBe(CaseStatus.OPEN);
+
+      // 2. Simulate concurrent Worker A committing OPEN -> RECOVERED
+      const recovered = await caseRepo.updateCaseStatus(merchantAId, c.id, CaseStatus.RECOVERED, {
+        recoveredAmount: '3500.00',
+      });
+      expect(recovered.status).toBe(CaseStatus.RECOVERED);
+
+      // 3. Stale concurrent operation attempted by another worker based on old OPEN snapshot
+      // Attempting to transition to WAITING fails because DB row is already RECOVERED
+      await expect(
+        caseRepo.updateCaseStatus(merchantAId, c.id, CaseStatus.WAITING),
+      ).rejects.toThrow(InvalidCaseStateTransitionError);
+
+      // 4. Verify persisted state remains securely RECOVERED
+      const finalCase = await caseRepo.getCaseById(merchantAId, c.id);
+      expect(finalCase?.status).toBe(CaseStatus.RECOVERED);
+    });
   });
 
   describe('2. Customer / Case Tenant Consistency Invariants', () => {
@@ -219,11 +249,11 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
     });
   });
 
-  describe('3. Exact Monetary Inputs in Persistence', () => {
+  describe('3. Exact Monetary Inputs, Prisma.Decimal & Currency Invariants', () => {
     it('persists exact monetary amounts via decimal string, Money, and Prisma.Decimal', async () => {
       if (!dbAvailable) return;
 
-      // 1. Decimal string
+      // 1. Valid Decimal string
       const c1 = await caseRepo.createCase(merchantAId, {
         riskType: RiskType.PAYMENT_FAILURE,
         amountAtRisk: '14999.00',
@@ -231,7 +261,7 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       });
       expect(c1.amountAtRisk.toString()).toBe('14999');
 
-      // 2. Money instance
+      // 2. Valid Money instance
       const money = Money.fromDecimalString('2499.50');
       const c2 = await caseRepo.createCase(merchantAId, {
         riskType: RiskType.SUBSCRIPTION_FAILURE,
@@ -240,36 +270,77 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       });
       expect(c2.amountAtRisk.toString()).toBe('2499.5');
 
-      // 3. Prisma.Decimal
-      const dec = new Prisma.Decimal('50000.00');
+      // 3. Valid Prisma.Decimal
+      const dec1 = new Prisma.Decimal('50000.00');
       const c3 = await caseRepo.createCase(merchantAId, {
         riskType: RiskType.OVERDUE_RECEIVABLE,
-        amountAtRisk: dec,
+        amountAtRisk: dec1,
         contextJson: {},
       });
       expect(c3.amountAtRisk.toString()).toBe('50000');
+
+      const dec2 = new Prisma.Decimal('0.10');
+      const c4 = await caseRepo.createCase(merchantAId, {
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: dec2,
+        contextJson: {},
+      });
+      expect(c4.amountAtRisk.toString()).toBe('0.1');
     });
 
-    it('rejects invalid or floating-point monetary input strings at repository boundary', async () => {
+    it('rejects invalid Prisma.Decimal inputs (negative or >2 decimal places)', async () => {
       if (!dbAvailable) return;
 
-      // Rejects strings with >2 decimal places like "1.005"
+      // Prisma.Decimal with >2 decimal places (1.005) -> REJECT
       await expect(
         caseRepo.createCase(merchantAId, {
           riskType: RiskType.PAYMENT_FAILURE,
-          amountAtRisk: '1.005',
+          amountAtRisk: new Prisma.Decimal('1.005'),
           contextJson: {},
         }),
       ).rejects.toThrow(InvalidMoneyError);
 
-      // Rejects negative amounts
+      // Prisma.Decimal with negative value (-1.00) -> REJECT
       await expect(
         caseRepo.createCase(merchantAId, {
           riskType: RiskType.PAYMENT_FAILURE,
-          amountAtRisk: '-100.00',
+          amountAtRisk: new Prisma.Decimal('-1.00'),
           contextJson: {},
         }),
       ).rejects.toThrow(InvalidMoneyError);
+    });
+
+    it('enforces currency consistency between Money and explicit case currency', async () => {
+      if (!dbAvailable) return;
+
+      // Money(INR) + currency INR -> ACCEPT
+      const mInr = Money.fromDecimalString('100.00', 'INR');
+      const c1 = await caseRepo.createCase(merchantAId, {
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: mInr,
+        currency: 'INR',
+        contextJson: {},
+      });
+      expect(c1.currency).toBe('INR');
+
+      // Money(USD) + omitted currency -> Derives USD
+      const mUsd = Money.fromDecimalString('100.00', 'USD');
+      const c2 = await caseRepo.createCase(merchantAId, {
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: mUsd,
+        contextJson: {},
+      });
+      expect(c2.currency).toBe('USD');
+
+      // Money(USD) + explicit currency INR -> REJECT
+      await expect(
+        caseRepo.createCase(merchantAId, {
+          riskType: RiskType.PAYMENT_FAILURE,
+          amountAtRisk: mUsd,
+          currency: 'INR',
+          contextJson: {},
+        }),
+      ).rejects.toThrow(CurrencyMismatchError);
     });
   });
 

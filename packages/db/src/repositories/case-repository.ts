@@ -11,23 +11,36 @@ import {
   ActionExecutionStatus,
 } from '@prisma/client';
 import { prisma } from '../client.js';
-import { validateCaseTransition, Money } from '@recoverai/shared';
+import {
+  validateCaseTransition,
+  Money,
+  InvalidMoneyError,
+  CurrencyMismatchError,
+  CaseStateConflictError,
+} from '@recoverai/shared';
 
 export type ExactMonetaryInput = string | Prisma.Decimal | Money;
 
 export function toPrismaDecimal(val: ExactMonetaryInput): Prisma.Decimal {
-  if (val instanceof Prisma.Decimal) {
-    return val;
-  }
   if (val instanceof Money) {
     return new Prisma.Decimal(val.toDecimalString());
   }
-  if (typeof val === 'string') {
-    // Validate exact decimal string via domain Money class (rejects floats, invalid formats, >2 decimal places)
-    const money = Money.fromDecimalString(val);
-    return new Prisma.Decimal(money.toDecimalString());
+
+  let str: string;
+  if (val instanceof Prisma.Decimal) {
+    str = val.toString();
+  } else if (typeof val === 'string') {
+    str = val;
+  } else {
+    throw new InvalidMoneyError('Invalid monetary input: must be an exact decimal string, Prisma.Decimal, or Money instance');
   }
-  throw new Error('Invalid monetary input: must be an exact decimal string, Prisma.Decimal, or Money instance');
+
+  // Canonical validation through domain Money class:
+  // - Enforces non-negative (rejects -1.00)
+  // - Enforces maximum 2 decimal places (rejects 1.005)
+  // - Enforces valid finite decimal representation
+  const validatedMoney = Money.fromDecimalString(str);
+  return new Prisma.Decimal(validatedMoney.toDecimalString());
 }
 
 export interface CreateCaseParams {
@@ -59,6 +72,19 @@ export class CaseRepository {
       });
     }
 
+    // Currency consistency check between Money instance and explicit currency param
+    let resolvedCurrency = params.currency;
+    if (params.amountAtRisk instanceof Money) {
+      if (resolvedCurrency && resolvedCurrency.toUpperCase() !== params.amountAtRisk.currency) {
+        throw new CurrencyMismatchError(
+          `Case currency mismatch: explicit currency "${resolvedCurrency}" does not match Money currency "${params.amountAtRisk.currency}"`,
+        );
+      }
+      resolvedCurrency = params.amountAtRisk.currency;
+    } else {
+      resolvedCurrency = (resolvedCurrency || 'INR').toUpperCase();
+    }
+
     return prisma.revenueRiskCase.create({
       data: {
         id: params.id,
@@ -66,7 +92,7 @@ export class CaseRepository {
         customerId: params.customerId,
         riskType: params.riskType,
         amountAtRisk: toPrismaDecimal(params.amountAtRisk),
-        currency: params.currency || 'INR',
+        currency: resolvedCurrency,
         status: CaseStatus.OPEN,
         contextJson: params.contextJson as Prisma.InputJsonValue,
         nextEvaluationAt: params.nextEvaluationAt,
@@ -117,16 +143,21 @@ export class CaseRepository {
       nextEvaluationAt?: Date | null;
     },
   ): Promise<RevenueRiskCase> {
-    // Assert tenant ownership and fetch current status
+    // 1. Assert tenant ownership and load current status
     const currentCase = await prisma.revenueRiskCase.findFirstOrThrow({
       where: { id: caseId, merchantId },
     });
 
-    // Enforce canonical domain state-machine transition validator
+    // 2. Enforce canonical domain state-machine transition validator
     validateCaseTransition(currentCase.status, nextStatus, caseId);
 
-    return prisma.revenueRiskCase.update({
-      where: { id: caseId },
+    // 3. Perform atomic Compare-And-Set (CAS) update conditioned on current status
+    const updateResult = await prisma.revenueRiskCase.updateMany({
+      where: {
+        id: caseId,
+        merchantId,
+        status: currentCase.status, // Atomic CAS invariant
+      },
       data: {
         status: nextStatus,
         ...(options?.recoveredAmount !== undefined
@@ -135,6 +166,21 @@ export class CaseRepository {
         ...(options?.resolvedAt !== undefined ? { resolvedAt: options.resolvedAt } : {}),
         ...(options?.nextEvaluationAt !== undefined ? { nextEvaluationAt: options.nextEvaluationAt } : {}),
       },
+    });
+
+    // 4. If affected row count is 0, a concurrent operation modified the case state
+    if (updateResult.count === 0) {
+      throw new CaseStateConflictError(
+        `Concurrent modification conflict on case ${caseId}: expected status was ${currentCase.status} but row was modified concurrently`,
+        caseId,
+        currentCase.status,
+        nextStatus,
+      );
+    }
+
+    // 5. Return updated case
+    return prisma.revenueRiskCase.findUniqueOrThrow({
+      where: { id: caseId },
     });
   }
 

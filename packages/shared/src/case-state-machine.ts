@@ -13,6 +13,18 @@ export class InvalidCaseStateTransitionError extends Error {
   }
 }
 
+export class CaseStateConflictError extends Error {
+  constructor(
+    message: string,
+    public readonly caseId?: string,
+    public readonly expectedStatus?: CaseStatus,
+    public readonly attemptedStatus?: CaseStatus,
+  ) {
+    super(message);
+    this.name = 'CaseStateConflictError';
+  }
+}
+
 /**
  * Frozen Canonical State Transition Matrix for RevenueRiskCase
  *
