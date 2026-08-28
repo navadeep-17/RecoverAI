@@ -14,3 +14,7 @@ export * from './execution/idempotency-generator.js';
 export * from './execution/policy-interface.js';
 export * from './execution/provider-interface.js';
 export * from './execution/action-executor.js';
+export * from './orchestration/orchestrator-types.js';
+export * from './orchestration/customer-reply-classifier.js';
+export * from './orchestration/recovery-orchestrator.js';
+export * from './orchestration/outcome-observer.js';

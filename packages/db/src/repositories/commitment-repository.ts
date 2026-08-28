@@ -104,4 +104,48 @@ export class CommitmentRepository {
 
     return prisma.recoveryCommitment.findUnique({ where: { id: commitmentId } });
   }
+
+  /**
+   * Updates commitment status (e.g. FULFILLED, BROKEN) scoped to tenant and case.
+   */
+  async updateCommitmentStatus(
+    merchantId: string,
+    caseId: string,
+    commitmentId: string,
+    status: 'PENDING' | 'FULFILLED' | 'BROKEN' | 'CANCELLED',
+  ): Promise<RecoveryCommitment> {
+    await prisma.revenueRiskCase.findFirstOrThrow({
+      where: { id: caseId, merchantId },
+    });
+
+    const commitment = await prisma.recoveryCommitment.findFirstOrThrow({
+      where: { id: commitmentId, caseId },
+    });
+
+    return prisma.recoveryCommitment.update({
+      where: { id: commitment.id },
+      data: {
+        status,
+        updatedAt: new Date(),
+      },
+    });
+  }
+
+  /**
+   * Fetches a commitment by ID scoped to tenant and case.
+   */
+  async getCommitmentById(
+    merchantId: string,
+    caseId: string,
+    commitmentId: string,
+  ): Promise<RecoveryCommitment | null> {
+    const parentCase = await prisma.revenueRiskCase.findFirst({
+      where: { id: caseId, merchantId },
+    });
+    if (!parentCase) return null;
+
+    return prisma.recoveryCommitment.findFirst({
+      where: { id: commitmentId, caseId },
+    });
+  }
 }
