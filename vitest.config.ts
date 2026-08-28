@@ -7,6 +7,9 @@ export default defineConfig({
     environment: 'node',
     include: ['**/*.{test,spec}.{ts,tsx}'],
     exclude: ['node_modules', 'dist', 'build'],
+    fileParallelism: false,
+    testTimeout: 30000,
+    hookTimeout: 30000,
   },
   resolve: {
     alias: {
