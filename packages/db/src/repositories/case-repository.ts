@@ -11,13 +11,30 @@ import {
   ActionExecutionStatus,
 } from '@prisma/client';
 import { prisma } from '../client.js';
-import { validateCaseTransition } from '@recoverai/shared';
+import { validateCaseTransition, Money } from '@recoverai/shared';
+
+export type ExactMonetaryInput = string | Prisma.Decimal | Money;
+
+export function toPrismaDecimal(val: ExactMonetaryInput): Prisma.Decimal {
+  if (val instanceof Prisma.Decimal) {
+    return val;
+  }
+  if (val instanceof Money) {
+    return new Prisma.Decimal(val.toDecimalString());
+  }
+  if (typeof val === 'string') {
+    // Validate exact decimal string via domain Money class (rejects floats, invalid formats, >2 decimal places)
+    const money = Money.fromDecimalString(val);
+    return new Prisma.Decimal(money.toDecimalString());
+  }
+  throw new Error('Invalid monetary input: must be an exact decimal string, Prisma.Decimal, or Money instance');
+}
 
 export interface CreateCaseParams {
   id?: string;
   customerId?: string;
   riskType: RiskType;
-  amountAtRisk: string | number | Prisma.Decimal;
+  amountAtRisk: ExactMonetaryInput;
   currency?: string;
   contextJson: Record<string, unknown>;
   nextEvaluationAt?: Date;
@@ -32,13 +49,23 @@ export interface ListCasesFilter {
 
 export class CaseRepository {
   async createCase(merchantId: string, params: CreateCaseParams): Promise<RevenueRiskCase> {
+    // If customerId is provided, enforce customer-case tenant consistency
+    if (params.customerId) {
+      await prisma.customer.findFirstOrThrow({
+        where: {
+          id: params.customerId,
+          merchantId, // Strict tenant ownership
+        },
+      });
+    }
+
     return prisma.revenueRiskCase.create({
       data: {
         id: params.id,
         merchantId,
         customerId: params.customerId,
         riskType: params.riskType,
-        amountAtRisk: new Prisma.Decimal(params.amountAtRisk.toString()),
+        amountAtRisk: toPrismaDecimal(params.amountAtRisk),
         currency: params.currency || 'INR',
         status: CaseStatus.OPEN,
         contextJson: params.contextJson as Prisma.InputJsonValue,
@@ -85,7 +112,7 @@ export class CaseRepository {
     caseId: string,
     nextStatus: CaseStatus,
     options?: {
-      recoveredAmount?: string | number | Prisma.Decimal;
+      recoveredAmount?: ExactMonetaryInput;
       resolvedAt?: Date;
       nextEvaluationAt?: Date | null;
     },
@@ -103,7 +130,7 @@ export class CaseRepository {
       data: {
         status: nextStatus,
         ...(options?.recoveredAmount !== undefined
-          ? { recoveredAmount: new Prisma.Decimal(options.recoveredAmount.toString()) }
+          ? { recoveredAmount: toPrismaDecimal(options.recoveredAmount) }
           : {}),
         ...(options?.resolvedAt !== undefined ? { resolvedAt: options.resolvedAt } : {}),
         ...(options?.nextEvaluationAt !== undefined ? { nextEvaluationAt: options.nextEvaluationAt } : {}),
@@ -200,7 +227,7 @@ export class CaseRepository {
       actionId?: string;
       merchantEventId?: string;
       outcomeType: string;
-      amountRecovered?: string | number | Prisma.Decimal;
+      amountRecovered?: ExactMonetaryInput;
       detailsJson?: Record<string, unknown>;
     },
   ): Promise<RecoveryOutcome> {
@@ -229,7 +256,7 @@ export class CaseRepository {
         outcomeType: data.outcomeType,
         amountRecovered:
           data.amountRecovered !== undefined
-            ? new Prisma.Decimal(data.amountRecovered.toString())
+            ? toPrismaDecimal(data.amountRecovered)
             : null,
         detailsJson: data.detailsJson as Prisma.InputJsonValue,
       },

@@ -1,5 +1,6 @@
 import { Prisma, PolicyConfig } from '@prisma/client';
 import { prisma } from '../client.js';
+import { ExactMonetaryInput, toPrismaDecimal } from './case-repository.js';
 
 export class PolicyConfigRepository {
   async getOrCreateConfig(merchantId: string): Promise<PolicyConfig> {
@@ -31,7 +32,7 @@ export class PolicyConfigRepository {
       maxRetriesPerCase: number;
       maxContactsPerCase: number;
       cooldownHoursBetweenActions: number;
-      highValueThreshold: string | number | Prisma.Decimal;
+      highValueThreshold: ExactMonetaryInput;
       minConfidenceThreshold: number;
       reviewFirstMode: boolean;
       checkoutAbandonmentThresholdMinutes: number;
@@ -44,8 +45,8 @@ export class PolicyConfigRepository {
         maxRetriesPerCase: updates.maxRetriesPerCase ?? 3,
         maxContactsPerCase: updates.maxContactsPerCase ?? 3,
         cooldownHoursBetweenActions: updates.cooldownHoursBetweenActions ?? 24,
-        highValueThreshold: updates.highValueThreshold
-          ? new Prisma.Decimal(updates.highValueThreshold.toString())
+        highValueThreshold: updates.highValueThreshold !== undefined
+          ? toPrismaDecimal(updates.highValueThreshold)
           : new Prisma.Decimal('50000.00'),
         minConfidenceThreshold: updates.minConfidenceThreshold ?? 0.65,
         reviewFirstMode: updates.reviewFirstMode ?? false,
@@ -55,7 +56,7 @@ export class PolicyConfigRepository {
         ...(updates.maxRetriesPerCase !== undefined ? { maxRetriesPerCase: updates.maxRetriesPerCase } : {}),
         ...(updates.maxContactsPerCase !== undefined ? { maxContactsPerCase: updates.maxContactsPerCase } : {}),
         ...(updates.cooldownHoursBetweenActions !== undefined ? { cooldownHoursBetweenActions: updates.cooldownHoursBetweenActions } : {}),
-        ...(updates.highValueThreshold !== undefined ? { highValueThreshold: new Prisma.Decimal(updates.highValueThreshold.toString()) } : {}),
+        ...(updates.highValueThreshold !== undefined ? { highValueThreshold: toPrismaDecimal(updates.highValueThreshold) } : {}),
         ...(updates.minConfidenceThreshold !== undefined ? { minConfidenceThreshold: updates.minConfidenceThreshold } : {}),
         ...(updates.reviewFirstMode !== undefined ? { reviewFirstMode: updates.reviewFirstMode } : {}),
         ...(updates.checkoutAbandonmentThresholdMinutes !== undefined ? { checkoutAbandonmentThresholdMinutes: updates.checkoutAbandonmentThresholdMinutes } : {}),

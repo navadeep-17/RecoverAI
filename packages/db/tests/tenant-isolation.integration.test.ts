@@ -18,7 +18,10 @@ import {
   RecoveryActionType,
   PolicyDecision,
   InvalidCaseStateTransitionError,
+  Money,
+  InvalidMoneyError,
 } from '@recoverai/core';
+import { Prisma } from '@prisma/client';
 
 describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
   let dbAvailable = false;
@@ -168,7 +171,109 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
     });
   });
 
-  describe('2. Tenant Scoping of Case Child Writes', () => {
+  describe('2. Customer / Case Tenant Consistency Invariants', () => {
+    it('rejects creating a RevenueRiskCase when customerId belongs to a different merchant', async () => {
+      if (!dbAvailable) return;
+
+      // Create customer under Merchant A
+      const custA = await customerRepo.getOrCreateCustomer(merchantAId, {
+        externalCustomerId: 'cust_alpha_999',
+        email: 'alpha_user@example.com',
+      });
+      expect(custA.merchantId).toBe(merchantAId);
+
+      // Attempt to link Merchant A customer to Merchant B case
+      await expect(
+        caseRepo.createCase(merchantBId, {
+          customerId: custA.id,
+          riskType: RiskType.PAYMENT_FAILURE,
+          amountAtRisk: '3000.00',
+          contextJson: {},
+        }),
+      ).rejects.toThrow();
+
+      // Verify zero invalid cases exist under Merchant B with custA.id
+      const bCases = await prisma.revenueRiskCase.findMany({
+        where: { merchantId: merchantBId, customerId: custA.id },
+      });
+      expect(bCases.length).toBe(0);
+    });
+
+    it('permits creating a RevenueRiskCase when customerId belongs to the same merchant', async () => {
+      if (!dbAvailable) return;
+
+      const custA = await customerRepo.getOrCreateCustomer(merchantAId, {
+        externalCustomerId: 'cust_alpha_valid',
+        email: 'valid_alpha@example.com',
+      });
+
+      const caseA = await caseRepo.createCase(merchantAId, {
+        customerId: custA.id,
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: '4500.00',
+        contextJson: {},
+      });
+
+      expect(caseA.customerId).toBe(custA.id);
+      expect(caseA.merchantId).toBe(merchantAId);
+    });
+  });
+
+  describe('3. Exact Monetary Inputs in Persistence', () => {
+    it('persists exact monetary amounts via decimal string, Money, and Prisma.Decimal', async () => {
+      if (!dbAvailable) return;
+
+      // 1. Decimal string
+      const c1 = await caseRepo.createCase(merchantAId, {
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: '14999.00',
+        contextJson: {},
+      });
+      expect(c1.amountAtRisk.toString()).toBe('14999');
+
+      // 2. Money instance
+      const money = Money.fromDecimalString('2499.50');
+      const c2 = await caseRepo.createCase(merchantAId, {
+        riskType: RiskType.SUBSCRIPTION_FAILURE,
+        amountAtRisk: money,
+        contextJson: {},
+      });
+      expect(c2.amountAtRisk.toString()).toBe('2499.5');
+
+      // 3. Prisma.Decimal
+      const dec = new Prisma.Decimal('50000.00');
+      const c3 = await caseRepo.createCase(merchantAId, {
+        riskType: RiskType.OVERDUE_RECEIVABLE,
+        amountAtRisk: dec,
+        contextJson: {},
+      });
+      expect(c3.amountAtRisk.toString()).toBe('50000');
+    });
+
+    it('rejects invalid or floating-point monetary input strings at repository boundary', async () => {
+      if (!dbAvailable) return;
+
+      // Rejects strings with >2 decimal places like "1.005"
+      await expect(
+        caseRepo.createCase(merchantAId, {
+          riskType: RiskType.PAYMENT_FAILURE,
+          amountAtRisk: '1.005',
+          contextJson: {},
+        }),
+      ).rejects.toThrow(InvalidMoneyError);
+
+      // Rejects negative amounts
+      await expect(
+        caseRepo.createCase(merchantAId, {
+          riskType: RiskType.PAYMENT_FAILURE,
+          amountAtRisk: '-100.00',
+          contextJson: {},
+        }),
+      ).rejects.toThrow(InvalidMoneyError);
+    });
+  });
+
+  describe('4. Tenant Scoping of Case Child Writes', () => {
     it('prevents Merchant B from adding a plan version to Merchant A case', async () => {
       if (!dbAvailable) return;
 
@@ -238,7 +343,7 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
     });
   });
 
-  describe('3. Cross-Tenant MerchantEvent Deduplication Isolation', () => {
+  describe('5. Cross-Tenant MerchantEvent Deduplication Isolation', () => {
     it('allows same dedupeKey for different merchants without collision or cross-tenant leak', async () => {
       if (!dbAvailable) return;
 
@@ -290,7 +395,7 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
     });
   });
 
-  describe('4. Human Review Tenant Consistency', () => {
+  describe('6. Human Review Tenant Consistency', () => {
     it('rejects review creation when case belongs to a different merchant', async () => {
       if (!dbAvailable) return;
 
@@ -332,7 +437,7 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
     });
   });
 
-  describe('5. General Tenant Scoping, Customer Isolation & Audit Logging', () => {
+  describe('7. General Tenant Scoping, Customer Isolation & Audit Logging', () => {
     it('enforces strict tenant scoping on case retrieval and lists', async () => {
       if (!dbAvailable) return;
 
@@ -438,10 +543,12 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       const updated = await policyConfigRepo.updateConfig(merchantAId, {
         maxRetriesPerCase: 5,
         reviewFirstMode: true,
+        highValueThreshold: Money.fromDecimalString('75000.00'),
       });
 
       expect(updated.maxRetriesPerCase).toBe(5);
       expect(updated.reviewFirstMode).toBe(true);
+      expect(updated.highValueThreshold.toString()).toBe('75000');
     });
   });
 });
