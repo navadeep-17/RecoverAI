@@ -10,3 +10,7 @@ export * from './detection/incident-identity.js';
 export * from './detection/job-scheduler-interface.js';
 export * from './detection/risk-detector.js';
 export * from './events/event-ingestion-service.js';
+export * from './execution/idempotency-generator.js';
+export * from './execution/policy-interface.js';
+export * from './execution/provider-interface.js';
+export * from './execution/action-executor.js';

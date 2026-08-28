@@ -6,6 +6,10 @@ export class MerchantRepository {
     return prisma.merchant.findUnique({ where: { id } });
   }
 
+  async getMerchantById(id: string): Promise<Merchant | null> {
+    return this.findById(id);
+  }
+
   async findBySlug(slug: string): Promise<Merchant | null> {
     return prisma.merchant.findUnique({ where: { slug } });
   }

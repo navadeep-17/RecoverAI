@@ -49,6 +49,10 @@ export class CustomerRepository {
     });
   }
 
+  async updateLastContactedAt(merchantId: string, customerId: string, timestamp = new Date()): Promise<Customer> {
+    return this.updateContactTimestamp(merchantId, customerId, timestamp);
+  }
+
   async setContactConsent(merchantId: string, customerId: string, contactConsent: boolean | null): Promise<Customer> {
     const customer = await prisma.customer.findFirstOrThrow({
       where: { id: customerId, merchantId },

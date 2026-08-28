@@ -1,0 +1,185 @@
+import {
+  Prisma,
+  RecoveryAction,
+  ActionExecutionStatus,
+  RecoveryActionType,
+  PolicyDecision,
+} from '@prisma/client';
+import { prisma } from '../client.js';
+
+export interface CreateActionParams {
+  planVersionId?: string;
+  actionType: RecoveryActionType;
+  actionParams: Record<string, unknown>;
+  idempotencyKey: string;
+  policyDecision: PolicyDecision;
+  policyRationale: string;
+  status?: ActionExecutionStatus;
+  providerName?: string;
+  externalActionId?: string;
+  executionMetadata?: Record<string, unknown>;
+}
+
+export interface UpdateActionStatusParams {
+  status: ActionExecutionStatus;
+  providerName?: string;
+  externalActionId?: string;
+  executionMetadata?: Record<string, unknown>;
+  errorMessage?: string;
+  executedAt?: Date;
+}
+
+export class ActionRepository {
+  /**
+   * Creates an authoritative RecoveryAction under a tenant-scoped case.
+   */
+  async createAction(
+    merchantId: string,
+    caseId: string,
+    params: CreateActionParams,
+  ): Promise<RecoveryAction> {
+    // Assert tenant ownership of the parent case
+    await prisma.revenueRiskCase.findFirstOrThrow({
+      where: { id: caseId, merchantId },
+    });
+
+    if (params.planVersionId) {
+      await prisma.recoveryPlanVersion.findFirstOrThrow({
+        where: { id: params.planVersionId, caseId },
+      });
+    }
+
+    return prisma.recoveryAction.create({
+      data: {
+        caseId,
+        planVersionId: params.planVersionId,
+        actionType: params.actionType,
+        actionParams: params.actionParams as Prisma.InputJsonValue,
+        idempotencyKey: params.idempotencyKey,
+        policyDecision: params.policyDecision,
+        policyRationale: params.policyRationale,
+        status: params.status || ActionExecutionStatus.PENDING,
+        providerName: params.providerName,
+        externalActionId: params.externalActionId,
+        executionMetadata: params.executionMetadata as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  /**
+   * Atomically claims an action for execution.
+   * Uses an atomic predicate (status == PENDING AND case.merchantId == merchantId).
+   * Transitions status to EXECUTING.
+   * Returns { claimed: true, action } on success, or { claimed: false, action } if already claimed or ineligible.
+   */
+  async claimActionForExecution(
+    merchantId: string,
+    actionId: string,
+  ): Promise<{ claimed: boolean; action: RecoveryAction | null }> {
+    // Check tenant ownership and load current action
+    const currentAction = await prisma.recoveryAction.findFirst({
+      where: {
+        id: actionId,
+        case: { merchantId },
+      },
+    });
+
+    if (!currentAction) {
+      return { claimed: false, action: null };
+    }
+
+    if (currentAction.status !== ActionExecutionStatus.PENDING) {
+      return { claimed: false, action: currentAction };
+    }
+
+    // Atomic compare-and-set from PENDING -> EXECUTING
+    const updateResult = await prisma.recoveryAction.updateMany({
+      where: {
+        id: actionId,
+        status: ActionExecutionStatus.PENDING,
+        case: { merchantId },
+      },
+      data: {
+        status: ActionExecutionStatus.EXECUTING,
+        updatedAt: new Date(),
+      },
+    });
+
+    if (updateResult.count === 1) {
+      const claimedAction = await prisma.recoveryAction.findUniqueOrThrow({
+        where: { id: actionId },
+      });
+      return { claimed: true, action: claimedAction };
+    }
+
+    // Another concurrent worker claimed it first
+    const refreshedAction = await prisma.recoveryAction.findUnique({
+      where: { id: actionId },
+    });
+    return { claimed: false, action: refreshedAction };
+  }
+
+  /**
+   * Updates an action with its final execution status and metadata.
+   */
+  async updateActionStatus(
+    merchantId: string,
+    actionId: string,
+    params: UpdateActionStatusParams,
+  ): Promise<RecoveryAction> {
+    // Assert tenant ownership
+    await prisma.recoveryAction.findFirstOrThrow({
+      where: {
+        id: actionId,
+        case: { merchantId },
+      },
+    });
+
+    return prisma.recoveryAction.update({
+      where: { id: actionId },
+      data: {
+        status: params.status,
+        providerName: params.providerName,
+        externalActionId: params.externalActionId,
+        executionMetadata: params.executionMetadata as Prisma.InputJsonValue,
+        errorMessage: params.errorMessage,
+        executedAt: params.executedAt !== undefined ? params.executedAt : (
+          params.status === ActionExecutionStatus.SUCCESS || params.status === ActionExecutionStatus.FAILED
+            ? new Date()
+            : undefined
+        ),
+      },
+    });
+  }
+
+  /**
+   * Fetches an action by ID scoped to merchant tenant.
+   */
+  async getActionById(merchantId: string, actionId: string): Promise<RecoveryAction | null> {
+    return prisma.recoveryAction.findFirst({
+      where: {
+        id: actionId,
+        case: { merchantId },
+      },
+      include: {
+        case: true,
+        planVersion: true,
+      },
+    });
+  }
+
+  /**
+   * Finds an action by idempotency key scoped to merchant tenant.
+   */
+  async findActionByIdempotencyKey(
+    merchantId: string,
+    idempotencyKey: string,
+  ): Promise<RecoveryAction | null> {
+    return prisma.recoveryAction.findFirst({
+      where: {
+        idempotencyKey,
+        case: { merchantId },
+      },
+    });
+  }
+}

@@ -4,6 +4,7 @@ import {
   RecoveryPlanVersion,
   RecoveryAction,
   RecoveryOutcome,
+  Customer,
   CaseStatus,
   RiskType,
   PolicyDecision,
@@ -71,6 +72,13 @@ export interface CreateCaseResult {
   case: RevenueRiskCase;
   created: boolean;
 }
+
+export type CaseWithRelations = RevenueRiskCase & {
+  customer?: Customer | null;
+  actions?: RecoveryAction[];
+  outcomes?: RecoveryOutcome[];
+  planVersions?: RecoveryPlanVersion[];
+};
 
 export class CaseRepository {
   async createCaseIdempotently(merchantId: string, params: CreateCaseParams): Promise<CreateCaseResult> {
@@ -146,7 +154,7 @@ export class CaseRepository {
     return result.case;
   }
 
-  async getCaseById(merchantId: string, caseId: string): Promise<RevenueRiskCase | null> {
+  async getCaseById(merchantId: string, caseId: string): Promise<CaseWithRelations | null> {
     return prisma.revenueRiskCase.findFirst({
       where: {
         id: caseId,

@@ -25,3 +25,16 @@ export class JobSchedulingError extends Error {
     this.name = 'JobSchedulingError';
   }
 }
+
+export class ActionExecutionError extends Error {
+  constructor(
+    public readonly actionId: string,
+    public readonly actionType: string,
+    public readonly reason: string,
+    public readonly cause?: unknown,
+  ) {
+    super(`Action execution failed for [${actionType}] (actionId: ${actionId}): ${reason}`);
+    this.name = 'ActionExecutionError';
+  }
+}
+
