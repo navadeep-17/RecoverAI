@@ -60,6 +60,12 @@ export interface ListCasesFilter {
   offset?: number;
 }
 
+export interface CaseTransitionOptions {
+  recoveredAmount?: ExactMonetaryInput;
+  resolvedAt?: Date;
+  nextEvaluationAt?: Date | null;
+}
+
 export class CaseRepository {
   async createCase(merchantId: string, params: CreateCaseParams): Promise<RevenueRiskCase> {
     // If customerId is provided, enforce customer-case tenant consistency
@@ -143,22 +149,20 @@ export class CaseRepository {
     caseId: string,
     expectedStatus: CaseStatus,
     nextStatus: CaseStatus,
-    options?: {
-      recoveredAmount?: ExactMonetaryInput;
-      resolvedAt?: Date;
-      nextEvaluationAt?: Date | null;
-      caseCurrency?: string;
-    },
+    options?: CaseTransitionOptions,
   ): Promise<RevenueRiskCase> {
     // 1. Enforce canonical domain state-machine transition validator
     validateCaseTransition(expectedStatus, nextStatus, caseId);
 
-    // 2. Validate recoveredAmount currency consistency if supplied as Money
+    // 2. Authoritative currency validation: when recoveredAmount is Money, lookup authoritative case currency from DB
     if (options?.recoveredAmount instanceof Money) {
-      const caseCurrency = options.caseCurrency || (await this.getCaseCurrency(merchantId, caseId));
-      if (options.recoveredAmount.currency !== caseCurrency) {
+      const caseRecord = await prisma.revenueRiskCase.findFirstOrThrow({
+        where: { id: caseId, merchantId },
+        select: { currency: true },
+      });
+      if (options.recoveredAmount.currency !== caseRecord.currency) {
         throw new CurrencyMismatchError(
-          `Recovered amount currency "${options.recoveredAmount.currency}" does not match case currency "${caseCurrency}"`,
+          `Recovered amount currency "${options.recoveredAmount.currency}" does not match case currency "${caseRecord.currency}"`,
         );
       }
     }
@@ -200,29 +204,15 @@ export class CaseRepository {
     merchantId: string,
     caseId: string,
     nextStatus: CaseStatus,
-    options?: {
-      recoveredAmount?: ExactMonetaryInput;
-      resolvedAt?: Date;
-      nextEvaluationAt?: Date | null;
-    },
+    options?: CaseTransitionOptions,
   ): Promise<RevenueRiskCase> {
-    // Assert tenant ownership and load current status & currency
+    // Assert tenant ownership and load current status
     const currentCase = await prisma.revenueRiskCase.findFirstOrThrow({
       where: { id: caseId, merchantId },
+      select: { status: true },
     });
 
-    return this.compareAndSetStatus(merchantId, caseId, currentCase.status, nextStatus, {
-      ...options,
-      caseCurrency: currentCase.currency,
-    });
-  }
-
-  private async getCaseCurrency(merchantId: string, caseId: string): Promise<string> {
-    const record = await prisma.revenueRiskCase.findFirstOrThrow({
-      where: { id: caseId, merchantId },
-      select: { currency: true },
-    });
-    return record.currency;
+    return this.compareAndSetStatus(merchantId, caseId, currentCase.status, nextStatus, options);
   }
 
   async addPlanVersion(
@@ -318,9 +308,10 @@ export class CaseRepository {
       detailsJson?: Record<string, unknown>;
     },
   ): Promise<RecoveryOutcome> {
-    // Assert tenant ownership of parent case and load case currency
+    // Assert tenant ownership of parent case and load authoritative case currency
     const parentCase = await prisma.revenueRiskCase.findFirstOrThrow({
       where: { id: caseId, merchantId },
+      select: { currency: true },
     });
 
     // Enforce currency consistency if amountRecovered is Money

@@ -199,6 +199,44 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       const persistedCase = await caseRepo.getCaseById(merchantAId, c.id);
       expect(persistedCase?.status).toBe(CaseStatus.WAITING);
     });
+
+    it('enforces authoritative case currency in compareAndSetStatus and rejects mismatching Money', async () => {
+      if (!dbAvailable) return;
+
+      const caseInr = await caseRepo.createCase(merchantAId, {
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: '4000.00',
+        currency: 'INR',
+        contextJson: {},
+      });
+      expect(caseInr.status).toBe(CaseStatus.OPEN);
+      expect(caseInr.currency).toBe('INR');
+
+      // Direct compareAndSetStatus: INR case + Money("100.00", USD) -> CurrencyMismatchError
+      await expect(
+        caseRepo.compareAndSetStatus(merchantAId, caseInr.id, CaseStatus.OPEN, CaseStatus.RECOVERED, {
+          recoveredAmount: Money.fromDecimalString('100.00', 'USD'),
+        }),
+      ).rejects.toThrow(CurrencyMismatchError);
+
+      // Verify no mutation occurred (status remains OPEN, recoveredAmount is null)
+      const unmutated = await caseRepo.getCaseById(merchantAId, caseInr.id);
+      expect(unmutated?.status).toBe(CaseStatus.OPEN);
+      expect(unmutated?.recoveredAmount).toBeNull();
+
+      // Direct compareAndSetStatus: INR case + Money("100.00", INR) -> Success
+      const recovered = await caseRepo.compareAndSetStatus(
+        merchantAId,
+        caseInr.id,
+        CaseStatus.OPEN,
+        CaseStatus.RECOVERED,
+        {
+          recoveredAmount: Money.fromDecimalString('100.00', 'INR'),
+        },
+      );
+      expect(recovered.status).toBe(CaseStatus.RECOVERED);
+      expect(recovered.recoveredAmount?.toString()).toBe('100');
+    });
   });
 
   describe('2. Customer / Case Tenant Consistency Invariants', () => {
