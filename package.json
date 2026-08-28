@@ -17,7 +17,8 @@
     "format:check": "prettier --check \"**/*.{ts,tsx,js,json,md}\"",
     "clean": "npm run --workspaces --if-present clean",
     "docker:up": "docker compose up -d",
-    "docker:down": "docker compose down"
+    "docker:down": "docker compose down",
+    "build:packages": "npm run --workspace=@recoverai/shared build && npm run --workspace=@recoverai/db build && npm run --workspace=@recoverai/core build && npm run --workspace=@recoverai/policy build && npm run --workspace=@recoverai/integrations build && npm run --workspace=@recoverai/evaluation build"
   },
   "devDependencies": {
     "@types/node": "^20.14.9",

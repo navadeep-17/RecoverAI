@@ -48,13 +48,13 @@ jobs:
       - name: Generate Prisma Client
         run: npm run --workspace=@recoverai/db db:generate
 
-      - name: Build Shared Package
-        run: npm run --workspace=@recoverai/shared build
+      - name: Build Packages (Declarations)
+        run: npm run build:packages
 
       - name: Lint
         run: npm run lint
 
-      - name: Typecheck
+      - name: Typecheck Workspaces
         run: npm run typecheck
 
       - name: Apply Database Schema
