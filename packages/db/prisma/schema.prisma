@@ -1,0 +1,365 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  MERCHANT_ADMIN
+  REVIEWER
+}
+
+enum RiskType {
+  PAYMENT_FAILURE
+  SUBSCRIPTION_FAILURE
+  CHECKOUT_ABANDONMENT
+  OVERDUE_RECEIVABLE
+}
+
+enum CaseStatus {
+  OPEN
+  WAITING
+  NEEDS_REVIEW
+  RECOVERED
+  STOPPED
+  EXHAUSTED
+}
+
+enum PolicyDecision {
+  ALLOW
+  DENY
+  REVIEW
+}
+
+enum RecoveryActionType {
+  RETRY_PAYMENT
+  REQUEST_PAYMENT_UPDATE
+  CREATE_OR_SEND_PAYMENT_LINK
+  SEND_CHECKOUT_RECOVERY
+  SEND_RECEIVABLE_REMINDER
+  RECORD_PROMISE_TO_PAY
+  SCHEDULE_FOLLOWUP
+  ESCALATE_TO_HUMAN
+  STOP_RECOVERY
+}
+
+enum ActionExecutionStatus {
+  PENDING
+  EXECUTING
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+enum EventSource {
+  RAZORPAY
+  MERCHANT
+  SIMULATOR
+  TIMER
+}
+
+enum AuditActorType {
+  SYSTEM
+  AGENT
+  POLICY
+  HUMAN
+  PROVIDER
+}
+
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  TAKEN_OVER
+  CLOSED
+}
+
+model Merchant {
+  id              String             @id @default(uuid())
+  name            String
+  slug            String             @unique
+  killSwitchActive Boolean           @default(false)
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  users           User[]
+  customers       Customer[]
+  events          MerchantEvent[]
+  cases           RevenueRiskCase[]
+  policyConfigs   PolicyConfig[]
+  humanReviews    HumanReview[]
+  auditEvents     AuditEvent[]
+
+  @@map("merchants")
+}
+
+model User {
+  id           String        @id @default(uuid())
+  merchantId   String
+  email        String        @unique
+  passwordHash String
+  name         String
+  role         Role          @default(REVIEWER)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  merchant     Merchant      @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  reviews      HumanReview[]
+
+  @@index([merchantId])
+  @@map("users")
+}
+
+model Customer {
+  id                String            @id @default(uuid())
+  merchantId        String
+  externalCustomerId String?
+  email             String?
+  phone             String?
+  name              String?
+  contactConsent    Boolean           @default(true)
+  optedOut          Boolean           @default(false)
+  lastContactedAt   DateTime?
+  metadataJson      Json?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  merchant          Merchant          @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  cases             RevenueRiskCase[]
+
+  @@unique([merchantId, externalCustomerId])
+  @@index([merchantId])
+  @@map("customers")
+}
+
+model MerchantEvent {
+  id              String            @id @default(uuid())
+  merchantId      String
+  source          EventSource
+  externalEventId String?
+  type            String
+  occurredAt      DateTime
+  receivedAt      DateTime          @default(now())
+  dedupeKey       String            @unique
+  payloadJson     Json
+
+  merchant        Merchant          @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  outcomes        RecoveryOutcome[]
+
+  @@index([merchantId, type])
+  @@map("merchant_events")
+}
+
+model WebhookEvent {
+  id              String            @id @default(uuid())
+  provider        String
+  externalEventId String?
+  signature       String?
+  verified        Boolean           @default(false)
+  dedupeKey       String            @unique
+  rawPayload      String
+  processed       Boolean           @default(false)
+  receivedAt      DateTime          @default(now())
+
+  @@index([provider, externalEventId])
+  @@map("webhook_events")
+}
+
+model RevenueRiskCase {
+  id                 String                @id @default(uuid())
+  merchantId         String
+  customerId         String?
+  riskType           RiskType
+  amountAtRisk       Decimal               @db.Decimal(12, 2)
+  currency           String                @default("INR")
+  status             CaseStatus            @default(OPEN)
+  contextJson        Json
+  openedAt           DateTime              @default(now())
+  nextEvaluationAt   DateTime?
+  recoveredAmount    Decimal?              @db.Decimal(12, 2)
+  resolvedAt         DateTime?
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+
+  merchant           Merchant              @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  customer           Customer?             @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  planVersions       RecoveryPlanVersion[]
+  actions            RecoveryAction[]
+  outcomes           RecoveryOutcome[]
+  reviews            HumanReview[]
+  commitments        RecoveryCommitment[]
+  scheduledJobs      ScheduledJob[]
+  auditEvents        AuditEvent[]
+
+  @@index([merchantId, status])
+  @@index([merchantId, riskType])
+  @@map("revenue_risk_cases")
+}
+
+model RecoveryPlanVersion {
+  id                   String             @id @default(uuid())
+  caseId               String
+  version              Int
+  diagnosisCode        String
+  diagnosisSummary     String
+  confidence           Float
+  proposedActionType   RecoveryActionType
+  proposedActionParams Json
+  reasoningSummary     String
+  followUpAfterSeconds Int?
+  shouldStop           Boolean            @default(false)
+  shouldEscalate       Boolean            @default(false)
+  createdAt            DateTime           @default(now())
+
+  case                 RevenueRiskCase    @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  actions              RecoveryAction[]
+
+  @@unique([caseId, version])
+  @@map("recovery_plan_versions")
+}
+
+model RecoveryAction {
+  id                   String                @id @default(uuid())
+  caseId               String
+  planVersionId        String?
+  actionType           RecoveryActionType
+  actionParams         Json
+  idempotencyKey       String                @unique
+  policyDecision       PolicyDecision
+  policyRationale      String
+  status               ActionExecutionStatus @default(PENDING)
+  providerName         String?
+  externalActionId     String?
+  executionMetadata    Json?
+  errorMessage         String?
+  executedAt           DateTime?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+
+  case                 RevenueRiskCase       @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  planVersion          RecoveryPlanVersion?  @relation(fields: [planVersionId], references: [id], onDelete: SetNull)
+  outcomes             RecoveryOutcome[]
+  humanReviews         HumanReview[]
+
+  @@index([caseId, status])
+  @@map("recovery_actions")
+}
+
+model RecoveryOutcome {
+  id              String            @id @default(uuid())
+  caseId          String
+  actionId        String?
+  merchantEventId String?
+  outcomeType     String
+  amountRecovered Decimal?          @db.Decimal(12, 2)
+  detailsJson     Json?
+  observedAt      DateTime          @default(now())
+
+  case            RevenueRiskCase   @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  action          RecoveryAction?   @relation(fields: [actionId], references: [id], onDelete: SetNull)
+  merchantEvent   MerchantEvent?    @relation(fields: [merchantEventId], references: [id], onDelete: SetNull)
+
+  @@index([caseId])
+  @@map("recovery_outcomes")
+}
+
+model PolicyConfig {
+  id                        String   @id @default(uuid())
+  merchantId                String
+  maxRetriesPerCase         Int      @default(3)
+  maxContactsPerCase        Int      @default(3)
+  cooldownHoursBetweenActions Int    @default(24)
+  highValueThreshold        Decimal  @default(50000.00) @db.Decimal(12, 2)
+  minConfidenceThreshold    Float    @default(0.65)
+  reviewFirstMode           Boolean  @default(false)
+  checkoutAbandonmentThresholdMinutes Int @default(30)
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+
+  merchant                  Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId])
+  @@map("policy_configs")
+}
+
+model HumanReview {
+  id               String          @id @default(uuid())
+  merchantId       String
+  caseId           String
+  actionId         String?
+  reviewerId       String?
+  reasonForReview  String
+  status           ReviewStatus    @default(PENDING)
+  reviewDecision   String?
+  reviewNotes      String?
+  revalidatedAt    DateTime?
+  revalidatedPolicyDecision PolicyDecision?
+  resolvedAt       DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  merchant         Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  case             RevenueRiskCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  action           RecoveryAction? @relation(fields: [actionId], references: [id], onDelete: SetNull)
+  reviewer         User?           @relation(fields: [reviewerId], references: [id], onDelete: SetNull)
+
+  @@index([merchantId, status])
+  @@map("human_reviews")
+}
+
+model RecoveryCommitment {
+  id               String          @id @default(uuid())
+  caseId           String
+  promisedAmount   Decimal         @db.Decimal(12, 2)
+  promisedDate     DateTime
+  status           String          @default("PENDING")
+  extractedFromText String?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  case             RevenueRiskCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId])
+  @@map("recovery_commitments")
+}
+
+model AuditEvent {
+  id               String          @id @default(uuid())
+  merchantId       String
+  caseId           String?
+  eventType        String
+  actorType        AuditActorType
+  actorId          String?
+  inputSummaryJson Json?
+  outputSummaryJson Json?
+  reasonCode       String?
+  createdAt        DateTime        @default(now())
+
+  merchant         Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  case             RevenueRiskCase? @relation(fields: [caseId], references: [id], onDelete: SetNull)
+
+  @@index([merchantId, eventType])
+  @@index([caseId])
+  @@map("audit_events")
+}
+
+model ScheduledJob {
+  id             String          @id @default(uuid())
+  caseId         String?
+  jobType        String
+  pgBossJobId    String?
+  scheduledFor   DateTime
+  status         String          @default("SCHEDULED")
+  payloadJson    Json
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  case           RevenueRiskCase? @relation(fields: [caseId], references: [id], onDelete: SetNull)
+
+  @@index([caseId])
+  @@index([scheduledFor, status])
+  @@map("scheduled_jobs")
+}

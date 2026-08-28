@@ -1,0 +1,30 @@
+{
+  "name": "@recoverai/worker",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts",
+    "start": "node dist/index.js",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "@recoverai/core": "*",
+    "@recoverai/db": "*",
+    "@recoverai/integrations": "*",
+    "@recoverai/policy": "*",
+    "@recoverai/shared": "*",
+    "dotenv": "^16.4.5",
+    "pg-boss": "^9.0.3",
+    "pino": "^9.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "rimraf": "^5.0.7",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.2"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@recoverai/shared": ["packages/shared/src/index.ts"],
+      "@recoverai/db": ["packages/db/src/index.ts"],
+      "@recoverai/core": ["packages/core/src/index.ts"],
+      "@recoverai/policy": ["packages/policy/src/index.ts"],
+      "@recoverai/integrations": ["packages/integrations/src/index.ts"],
+      "@recoverai/evaluation": ["packages/evaluation/src/index.ts"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*",
+    "apps/*/src/**/*",
+    "apps/*/tests/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "**/dist",
+    "**/build"
+  ]
+}
