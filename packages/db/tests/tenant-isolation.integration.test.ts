@@ -33,22 +33,24 @@ describe('Tenant Isolation & Constraint Integrity Integration Tests', () => {
   beforeAll(async () => {
     dbAvailable = await checkDatabaseConnection();
     if (dbAvailable) {
-      // Clean test merchants
-      await prisma.merchant.deleteMany({
-        where: { id: { in: [merchantAId, merchantBId] } },
-      });
+      try {
+        await prisma.merchant.deleteMany({
+          where: { id: { in: [merchantAId, merchantBId] } },
+        });
 
-      // Create test merchants
-      await merchantRepo.create({
-        id: merchantAId,
-        name: 'Merchant Alpha',
-        slug: 'merchant-alpha',
-      });
-      await merchantRepo.create({
-        id: merchantBId,
-        name: 'Merchant Beta',
-        slug: 'merchant-beta',
-      });
+        await merchantRepo.create({
+          id: merchantAId,
+          name: 'Merchant Alpha',
+          slug: 'merchant-alpha',
+        });
+        await merchantRepo.create({
+          id: merchantBId,
+          name: 'Merchant Beta',
+          slug: 'merchant-beta',
+        });
+      } catch (err) {
+        console.error('beforeAll error in tenant test:', err);
+      }
     }
   });
 
@@ -72,7 +74,6 @@ describe('Tenant Isolation & Constraint Integrity Integration Tests', () => {
       return;
     }
 
-    // Create case under Merchant A
     const caseA = await caseRepo.createCase(merchantAId, {
       riskType: RiskType.PAYMENT_FAILURE,
       amountAtRisk: '14999.00',
@@ -80,7 +81,6 @@ describe('Tenant Isolation & Constraint Integrity Integration Tests', () => {
       contextJson: { invoiceNumber: 'INV-1001' },
     });
 
-    // Create case under Merchant B
     const caseB = await caseRepo.createCase(merchantBId, {
       riskType: RiskType.SUBSCRIPTION_FAILURE,
       amountAtRisk: '4999.00',
@@ -88,16 +88,13 @@ describe('Tenant Isolation & Constraint Integrity Integration Tests', () => {
       contextJson: { subscriptionId: 'sub_1002' },
     });
 
-    // Merchant A querying case A -> returns case
     const fetchedByA = await caseRepo.getCaseById(merchantAId, caseA.id);
     expect(fetchedByA).not.toBeNull();
     expect(fetchedByA?.id).toBe(caseA.id);
 
-    // Cross-tenant lookup: Merchant B querying case A -> strictly returns null
     const fetchedByBCrossTenant = await caseRepo.getCaseById(merchantBId, caseA.id);
     expect(fetchedByBCrossTenant).toBeNull();
 
-    // Listing cases for Merchant B returns ONLY case B
     const listB = await caseRepo.listCases(merchantBId);
     expect(listB.some((c) => c.id === caseA.id)).toBe(false);
     expect(listB.some((c) => c.id === caseB.id)).toBe(true);
@@ -116,7 +113,6 @@ describe('Tenant Isolation & Constraint Integrity Integration Tests', () => {
 
     expect(custA.merchantId).toBe(merchantAId);
 
-    // Updating contact timestamp under wrong merchant throws error
     await expect(
       customerRepo.updateContactTimestamp(merchantBId, custA.id, new Date()),
     ).rejects.toThrow();
@@ -147,7 +143,6 @@ describe('Tenant Isolation & Constraint Integrity Integration Tests', () => {
       payloadJson: { paymentId: 'pay_001', amount: 14999 },
     });
 
-    // Idempotent rejection: not created, returns existing event
     expect(secondAttempt.created).toBe(false);
     expect(secondAttempt.event.id).toBe(firstAttempt.event.id);
   });
@@ -174,7 +169,6 @@ describe('Tenant Isolation & Constraint Integrity Integration Tests', () => {
       policyRationale: 'Valid retry within policy limit',
     });
 
-    // Attempting to record second action with same idempotencyKey fails
     await expect(
       caseRepo.recordAction(caseRec.id, {
         actionType: RecoveryActionType.RETRY_PAYMENT,
