@@ -1,0 +1,7 @@
+-- AlterTable
+ALTER TABLE "policy_configs" ADD COLUMN "maxActionsPerCase" INTEGER NOT NULL DEFAULT 5,
+ADD COLUMN "quietHoursStart" INTEGER NOT NULL DEFAULT 21,
+ADD COLUMN "quietHoursEnd" INTEGER NOT NULL DEFAULT 9,
+ADD COLUMN "quietHoursTimezone" TEXT NOT NULL DEFAULT 'Asia/Kolkata',
+ADD COLUMN "maxRecoveryWindowDays" INTEGER NOT NULL DEFAULT 30,
+ADD COLUMN "overdueGracePeriodDays" INTEGER NOT NULL DEFAULT 3;

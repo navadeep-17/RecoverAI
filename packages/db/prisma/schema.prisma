@@ -268,19 +268,25 @@ model RecoveryOutcome {
 }
 
 model PolicyConfig {
-  id                        String   @id @default(uuid())
-  merchantId                String
-  maxRetriesPerCase         Int      @default(3)
-  maxContactsPerCase        Int      @default(3)
-  cooldownHoursBetweenActions Int    @default(24)
-  highValueThreshold        Decimal  @default(50000.00) @db.Decimal(12, 2)
-  minConfidenceThreshold    Float    @default(0.65)
-  reviewFirstMode           Boolean  @default(false)
-  checkoutAbandonmentThresholdMinutes Int @default(30)
-  createdAt                 DateTime @default(now())
-  updatedAt                 DateTime @updatedAt
+  id                                  String   @id @default(uuid())
+  merchantId                          String
+  maxRetriesPerCase                   Int      @default(3)
+  maxContactsPerCase                  Int      @default(3)
+  maxActionsPerCase                   Int      @default(5)
+  cooldownHoursBetweenActions         Int      @default(24)
+  highValueThreshold                  Decimal  @default(50000.00) @db.Decimal(12, 2)
+  minConfidenceThreshold              Float    @default(0.65)
+  reviewFirstMode                     Boolean  @default(false)
+  checkoutAbandonmentThresholdMinutes Int      @default(30)
+  quietHoursStart                     Int      @default(21)
+  quietHoursEnd                       Int      @default(9)
+  quietHoursTimezone                  String   @default("Asia/Kolkata")
+  maxRecoveryWindowDays               Int      @default(30)
+  overdueGracePeriodDays              Int      @default(3)
+  createdAt                           DateTime @default(now())
+  updatedAt                           DateTime @updatedAt
 
-  merchant                  Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  merchant                            Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
 
   @@unique([merchantId])
   @@map("policy_configs")

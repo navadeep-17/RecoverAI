@@ -47,13 +47,21 @@ export class Money {
     return new Money(paise, currency);
   }
 
+  static isValidDecimalString(amountStr?: string | null): boolean {
+    if (!amountStr || typeof amountStr !== 'string') return false;
+    const trimmed = amountStr.trim();
+    if (!trimmed) return false;
+    const decimalRegex = /^([0-9]+)(?:\.([0-9]{1,2}))?$/;
+    return decimalRegex.test(trimmed);
+  }
+
   static fromDecimalString(amountStr: string, currency = 'INR'): Money {
     const trimmed = amountStr.trim();
     if (!trimmed) {
       throw new InvalidMoneyError('Monetary amount string cannot be empty');
     }
 
-    const decimalRegex = /^([0-9]+)(?:.([0-9]{1,2}))?$/;
+    const decimalRegex = /^([0-9]+)(?:\.([0-9]{1,2}))?$/;
     const match = decimalRegex.exec(trimmed);
 
     if (!match) {

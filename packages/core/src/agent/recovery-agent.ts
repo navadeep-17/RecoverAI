@@ -1,11 +1,22 @@
 import { AgentContext, AgentProposal, AgentProposalSchema } from './agent-contracts.js';
 import { LLMProvider } from './llm-provider.js';
 import { isActionCompatible, IncompatibleActionForRiskError } from '../domain/action-compatibility.js';
+import { RecoveryActionType } from '@recoverai/shared';
 
 export class AgentOutputParsingError extends Error {
   constructor(message: string, public readonly rawOutput?: string) {
     super(message);
     this.name = 'AgentOutputParsingError';
+  }
+}
+
+export class ActionNotAllowedByContextError extends Error {
+  constructor(
+    public readonly actionType: RecoveryActionType,
+    public readonly allowedActions: readonly RecoveryActionType[],
+  ) {
+    super(`Action "${actionType}" is not allowed by context.allowedActions: [${allowedActions.join(', ')}]`);
+    this.name = 'ActionNotAllowedByContextError';
   }
 }
 
@@ -17,10 +28,12 @@ export class RecoveryAgent {
    *
    * Invariants:
    * - Proposes EXACTLY ONE next action.
+   * - Strict Zod parsing (.strict()) rejecting unknown fields (e.g. policyDecision, executeNow).
+   * - Enforces proposal is in context.allowedActions (ActionNotAllowedByContextError).
+   * - Enforces proposal is canonically compatible with risk family (IncompatibleActionForRiskError).
    * - Zero direct database mutation.
    * - Zero external third-party side effects.
-   * - Zero policy decision making (PolicyEngine decides).
-   * - Strict validation against AgentProposalSchema and Action/Risk compatibility.
+   * - Zero policy decision authority (PolicyEngine decides).
    */
   async generateProposal(context: AgentContext): Promise<AgentProposal> {
     const systemPrompt = this.buildSystemPrompt();
@@ -34,9 +47,26 @@ export class RecoveryAgent {
     });
 
     const parsedJson = this.extractAndParseJson(response.rawText);
-    const validatedProposal = AgentProposalSchema.parse(parsedJson);
+    
+    let validatedProposal: AgentProposal;
+    try {
+      validatedProposal = AgentProposalSchema.parse(parsedJson);
+    } catch (err) {
+      throw new AgentOutputParsingError(
+        `Agent proposal failed strict schema validation: ${(err as Error).message}`,
+        response.rawText,
+      );
+    }
 
-    // Enforce domain action compatibility for the risk family
+    // 1. Enforce proposal is in context.allowedActions
+    if (!context.allowedActions.includes(validatedProposal.proposedActionType)) {
+      throw new ActionNotAllowedByContextError(
+        validatedProposal.proposedActionType,
+        context.allowedActions,
+      );
+    }
+
+    // 2. Enforce canonical domain action compatibility for the risk family
     if (!isActionCompatible(context.riskType, validatedProposal.proposedActionType)) {
       throw new IncompatibleActionForRiskError(context.riskType, validatedProposal.proposedActionType);
     }
@@ -51,11 +81,12 @@ Your role is to analyze verified, ground-truth revenue-risk cases and propose EX
 CRITICAL ARCHITECTURAL RULES:
 1. You only PROPOSE actions. You NEVER execute actions, mutate data, or decide policy authorization.
 2. Return ONLY valid JSON matching the exact required schema. No Markdown commentary outside the JSON object.
-3. Propose EXACTLY ONE next action from the allowed action types provided in the context.
+3. Propose EXACTLY ONE next action strictly chosen from the provided allowedActions list.
 4. Confidence must be a float between 0.0 and 1.0.
 5. If payment failure was a hard decline (fraud, lost/stolen card, closed account), do NOT propose RETRY_PAYMENT.
 6. If recovery is impossible or all avenues are exhausted, set shouldStop to true or propose STOP_RECOVERY.
 7. If human intervention is required, set shouldEscalate to true or propose ESCALATE_TO_HUMAN.
+8. Do NOT emit any unauthorized keys (such as policyDecision, executeNow, toolCall).
 
 REQUIRED JSON OUTPUT SCHEMA:
 {

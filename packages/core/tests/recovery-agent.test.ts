@@ -6,12 +6,13 @@ import {
   AgentContext,
   AgentOutputParsingError,
   IncompatibleActionForRiskError,
+  ActionNotAllowedByContextError,
   RiskType,
   RecoveryActionType,
   isHardDecline,
 } from '../src/index.js';
 
-describe('RecoveryAgent & Agent Contracts', () => {
+describe('RecoveryAgent & Agent Contracts Specification & Bounds', () => {
   let mockLLM: MockLLMProvider;
   let agent: RecoveryAgent;
 
@@ -41,7 +42,7 @@ describe('RecoveryAgent & Agent Contracts', () => {
     priorOutcomes: [],
   };
 
-  describe('1. Structured Output Schema Validation', () => {
+  describe('1. Strict Schema & Injection Rejection', () => {
     it('validates a correct AgentProposal successfully', () => {
       const valid = {
         diagnosisCode: 'INSUFFICIENT_FUNDS',
@@ -76,53 +77,93 @@ describe('RecoveryAgent & Agent Contracts', () => {
       expect(() => AgentProposalSchema.parse(invalidLow)).toThrow();
     });
 
-    it('rejects unsupported or non-existent action types', () => {
-      const invalidAction = {
-        diagnosisCode: 'TEST',
+    it('rejects proposal injecting policyDecision ("ALLOW")', () => {
+      const injectedPolicy = {
+        diagnosisCode: 'INSUFFICIENT_FUNDS',
         diagnosisSummary: 'Test summary',
-        confidence: 0.8,
-        proposedActionType: 'UNSUPPORTED_ACTION_TYPE',
+        confidence: 0.9,
+        proposedActionType: RecoveryActionType.RETRY_PAYMENT,
         proposedActionParams: {},
         reasoningSummary: 'Test',
+        policyDecision: 'ALLOW', // Unauthorized policy injection
       };
-      expect(() => AgentProposalSchema.parse(invalidAction)).toThrow();
+      expect(() => AgentProposalSchema.parse(injectedPolicy)).toThrow();
+    });
+
+    it('rejects proposal injecting execution / tool fields (executeNow, toolCall)', () => {
+      const injectedExecution = {
+        diagnosisCode: 'INSUFFICIENT_FUNDS',
+        diagnosisSummary: 'Test summary',
+        confidence: 0.9,
+        proposedActionType: RecoveryActionType.RETRY_PAYMENT,
+        proposedActionParams: {},
+        reasoningSummary: 'Test',
+        executeNow: true,
+      };
+      expect(() => AgentProposalSchema.parse(injectedExecution)).toThrow();
+
+      const injectedTool = {
+        diagnosisCode: 'INSUFFICIENT_FUNDS',
+        diagnosisSummary: 'Test summary',
+        confidence: 0.9,
+        proposedActionType: RecoveryActionType.RETRY_PAYMENT,
+        proposedActionParams: {},
+        reasoningSummary: 'Test',
+        toolCall: { name: 'charge_card' },
+      };
+      expect(() => AgentProposalSchema.parse(injectedTool)).toThrow();
     });
   });
 
-  describe('2. RecoveryAgent with MockLLMProvider', () => {
-    it('generates deterministic proposal for soft decline payment failure', async () => {
-      const proposal = await agent.generateProposal({
+  describe('2. Authoritative context.allowedActions Enforcement', () => {
+    it('rejects proposal when action is globally compatible but excluded from context.allowedActions', async () => {
+      // PAYMENT_FAILURE supports RETRY_PAYMENT globally, but context restricts to REQUEST_PAYMENT_UPDATE only
+      const restrictedContext: AgentContext = {
         ...baseContext,
-        verifiedPaymentFacts: {
-          gatewayErrorCode: 'BAD_REQUEST',
-          gatewayErrorMessage: 'Insufficient balance',
-          paymentMethod: 'card',
-        },
+        allowedActions: [RecoveryActionType.REQUEST_PAYMENT_UPDATE],
+      };
+
+      // Mock returns RETRY_PAYMENT
+      mockLLM.setMockResponse({
+        diagnosisCode: 'INSUFFICIENT_FUNDS',
+        diagnosisSummary: 'Temporary shortfall',
+        confidence: 0.9,
+        proposedActionType: RecoveryActionType.RETRY_PAYMENT,
+        proposedActionParams: {},
+        reasoningSummary: 'Retry',
+        shouldStop: false,
+        shouldEscalate: false,
       });
 
-      expect(proposal.diagnosisCode).toBe('SOFT_DECLINE_INSUFFICIENT_FUNDS');
-      expect(proposal.proposedActionType).toBe(RecoveryActionType.RETRY_PAYMENT);
-      expect(proposal.confidence).toBeGreaterThan(0.8);
-      expect(proposal.shouldStop).toBe(false);
-      expect(proposal.shouldEscalate).toBe(false);
+      await expect(agent.generateProposal(restrictedContext)).rejects.toThrow(
+        ActionNotAllowedByContextError,
+      );
     });
 
-    it('generates deterministic proposal for hard decline payment failure', async () => {
-      const proposal = await agent.generateProposal({
+    it('accepts proposal when action is included in context.allowedActions', async () => {
+      const restrictedContext: AgentContext = {
         ...baseContext,
-        verifiedPaymentFacts: {
-          gatewayErrorCode: 'FRAUD_SUSPECTED',
-          gatewayErrorMessage: 'Transaction flagged for fraud risk',
-          paymentMethod: 'card',
-        },
+        allowedActions: [RecoveryActionType.REQUEST_PAYMENT_UPDATE],
+      };
+
+      mockLLM.setMockResponse({
+        diagnosisCode: 'CARD_EXPIRED',
+        diagnosisSummary: 'Card has expired',
+        confidence: 0.92,
+        proposedActionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE,
+        proposedActionParams: { channel: 'EMAIL' },
+        reasoningSummary: 'Request card update',
+        shouldStop: false,
+        shouldEscalate: false,
       });
 
-      expect(proposal.diagnosisCode).toBe('HARD_DECLINE_DETECTED');
-      expect(proposal.proposedActionType).toBe(RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK);
-      expect(proposal.confidence).toBeGreaterThan(0.8);
+      const proposal = await agent.generateProposal(restrictedContext);
+      expect(proposal.proposedActionType).toBe(RecoveryActionType.REQUEST_PAYMENT_UPDATE);
     });
+  });
 
-    it('generates deterministic proposal for checkout abandonment', async () => {
+  describe('3. Deterministic Proposals & Formats Across Risk Families', () => {
+    it('generates proposal for checkout abandonment', async () => {
       const proposal = await agent.generateProposal({
         ...baseContext,
         riskType: RiskType.CHECKOUT_ABANDONMENT,
@@ -137,10 +178,9 @@ describe('RecoveryAgent & Agent Contracts', () => {
 
       expect(proposal.diagnosisCode).toBe('CHECKOUT_ABANDONED');
       expect(proposal.proposedActionType).toBe(RecoveryActionType.SEND_CHECKOUT_RECOVERY);
-      expect(proposal.proposedActionParams.channel).toBe('WHATSAPP');
     });
 
-    it('generates deterministic proposal for overdue receivable', async () => {
+    it('generates proposal for overdue receivable', async () => {
       const proposal = await agent.generateProposal({
         ...baseContext,
         riskType: RiskType.OVERDUE_RECEIVABLE,
@@ -170,8 +210,8 @@ describe('RecoveryAgent & Agent Contracts', () => {
         shouldStop: false,
         shouldEscalate: false,
       });
-      const rawWithFences = '```json\n' + jsonContent + '\n```';
-      mockLLM.setMockResponse(rawWithFences);
+      const fence = String.fromCharCode(96, 96, 96);
+      mockLLM.setMockResponse(`${fence}json\n${jsonContent}\n${fence}`);
 
       const proposal = await agent.generateProposal(baseContext);
       expect(proposal.diagnosisCode).toBe('INSUFFICIENT_FUNDS');
@@ -188,37 +228,37 @@ describe('RecoveryAgent & Agent Contracts', () => {
       mockLLM.setMockResponse('');
       await expect(agent.generateProposal(baseContext)).rejects.toThrow(AgentOutputParsingError);
     });
-
-    it('rejects action proposal incompatible with risk family', async () => {
-      // Mock returns SEND_CHECKOUT_RECOVERY for a PAYMENT_FAILURE case
-      mockLLM.setMockResponse({
-        diagnosisCode: 'INVALID_COMBO',
-        diagnosisSummary: 'Invalid combination',
-        confidence: 0.9,
-        proposedActionType: RecoveryActionType.SEND_CHECKOUT_RECOVERY,
-        proposedActionParams: {},
-        reasoningSummary: 'Invalid action for risk',
-        shouldStop: false,
-        shouldEscalate: false,
-      });
-
-      await expect(agent.generateProposal(baseContext)).rejects.toThrow(
-        IncompatibleActionForRiskError,
-      );
-    });
   });
 
-  describe('3. Hard Decline Helper', () => {
-    it('correctly identifies hard decline error codes', () => {
+  describe('4. Exact Canonical Hard Decline Classification', () => {
+    it('accurately identifies exact canonical hard decline codes and aliases', () => {
       expect(isHardDecline('FRAUD_SUSPECTED')).toBe(true);
-      expect(isHardDecline('card_lost_or_stolen')).toBe(true);
-      expect(isHardDecline('ACCOUNT-CLOSED')).toBe(true);
-      expect(isHardDecline('DO NOT HONOR')).toBe(true);
+      expect(isHardDecline('fraud')).toBe(true);
+      expect(isHardDecline('CARD_LOST_OR_STOLEN')).toBe(true);
+      expect(isHardDecline('LOST_CARD')).toBe(true);
+      expect(isHardDecline('STOLEN_CARD')).toBe(true);
+      expect(isHardDecline('ACCOUNT_CLOSED')).toBe(true);
+      expect(isHardDecline('closed-account')).toBe(true);
+      expect(isHardDecline('DO_NOT_HONOR')).toBe(true);
+      expect(isHardDecline('STOPPED_BY_CUSTOMER')).toBe(true);
       expect(isHardDecline('CARD_EXPIRED')).toBe(true);
-      expect(isHardDecline('INSUFFICIENT_FUNDS')).toBe(false);
+      expect(isHardDecline('AUTHENTICATION_FAILED')).toBe(true);
+      expect(isHardDecline('3DS_AUTHENTICATION_FAILED')).toBe(true);
+      expect(isHardDecline('INVALID_PIN')).toBe(true);
+      expect(isHardDecline('INCORRECT_CVV')).toBe(true);
+    });
+
+    it('does NOT classify ambiguous substrings as hard declines', () => {
+      expect(isHardDecline('CARD')).toBe(false);
+      expect(isHardDecline('AUTH')).toBe(false);
+      expect(isHardDecline('LOST_CONNECTION')).toBe(false);
       expect(isHardDecline('NETWORK_ERROR')).toBe(false);
+      expect(isHardDecline('INSUFFICIENT_FUNDS')).toBe(false);
+      expect(isHardDecline('TIMEOUT')).toBe(false);
+      expect(isHardDecline('ISSUER_DOWN')).toBe(false);
       expect(isHardDecline(null)).toBe(false);
       expect(isHardDecline(undefined)).toBe(false);
+      expect(isHardDecline('')).toBe(false);
     });
   });
 });

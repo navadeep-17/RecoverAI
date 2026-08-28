@@ -702,22 +702,53 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       expect(logsB.some((l) => l.id === audit.id)).toBe(false);
     });
 
-    it('creates and manages merchant policy configuration', async () => {
+    it('creates and manages merchant policy configuration with isolated quiet hours and recovery window', async () => {
       if (!dbAvailable) return;
 
-      const config = await policyConfigRepo.getOrCreateConfig(merchantAId);
-      expect(config.merchantId).toBe(merchantAId);
-      expect(config.maxRetriesPerCase).toBe(3);
+      const configA = await policyConfigRepo.getOrCreateConfig(merchantAId);
+      expect(configA.merchantId).toBe(merchantAId);
+      expect(configA.maxRetriesPerCase).toBe(3);
+      expect(configA.maxActionsPerCase).toBe(5);
+      expect(configA.quietHoursStart).toBe(21);
+      expect(configA.quietHoursEnd).toBe(9);
+      expect(configA.quietHoursTimezone).toBe('Asia/Kolkata');
+      expect(configA.maxRecoveryWindowDays).toBe(30);
+      expect(configA.overdueGracePeriodDays).toBe(3);
 
-      const updated = await policyConfigRepo.updateConfig(merchantAId, {
+      // Update Merchant A with custom safety policies
+      const updatedA = await policyConfigRepo.updateConfig(merchantAId, {
         maxRetriesPerCase: 5,
+        maxActionsPerCase: 8,
         reviewFirstMode: true,
         highValueThreshold: '75000.00',
+        quietHoursStart: 22,
+        quietHoursEnd: 8,
+        quietHoursTimezone: 'America/New_York',
+        maxRecoveryWindowDays: 45,
+        overdueGracePeriodDays: 5,
       });
 
-      expect(updated.maxRetriesPerCase).toBe(5);
-      expect(updated.reviewFirstMode).toBe(true);
-      expect(updated.highValueThreshold.toString()).toBe('75000');
+      expect(updatedA.maxRetriesPerCase).toBe(5);
+      expect(updatedA.maxActionsPerCase).toBe(8);
+      expect(updatedA.reviewFirstMode).toBe(true);
+      expect(updatedA.highValueThreshold.toString()).toBe('75000');
+      expect(updatedA.quietHoursStart).toBe(22);
+      expect(updatedA.quietHoursEnd).toBe(8);
+      expect(updatedA.quietHoursTimezone).toBe('America/New_York');
+      expect(updatedA.maxRecoveryWindowDays).toBe(45);
+      expect(updatedA.overdueGracePeriodDays).toBe(5);
+
+      // Verify Merchant B policy configuration is completely isolated
+      const configB = await policyConfigRepo.getOrCreateConfig(merchantBId);
+      expect(configB.merchantId).toBe(merchantBId);
+      expect(configB.maxRetriesPerCase).toBe(3);
+      expect(configB.maxActionsPerCase).toBe(5);
+      expect(configB.reviewFirstMode).toBe(false);
+      expect(configB.quietHoursStart).toBe(21);
+      expect(configB.quietHoursEnd).toBe(9);
+      expect(configB.quietHoursTimezone).toBe('Asia/Kolkata');
+      expect(configB.maxRecoveryWindowDays).toBe(30);
+      expect(configB.overdueGracePeriodDays).toBe(3);
     });
   });
 });

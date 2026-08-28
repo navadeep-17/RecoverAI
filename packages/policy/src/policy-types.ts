@@ -29,8 +29,8 @@ export interface ActiveCommitmentRecord {
 
 export interface PolicyCustomerData {
   id: string;
-  contactConsent: boolean;
-  optedOut: boolean;
+  contactConsent?: boolean;
+  optedOut?: boolean;
   lastContactedAt?: Date | null;
 }
 
@@ -48,6 +48,7 @@ export interface PolicyCaseData {
 export interface PolicyConfigData {
   maxRetriesPerCase: number;
   maxContactsPerCase: number;
+  maxActionsPerCase: number;
   cooldownHoursBetweenActions: number;
   highValueThreshold: string; // Decimal string e.g. "50000.00"
   minConfidenceThreshold: number;
@@ -57,6 +58,7 @@ export interface PolicyConfigData {
   quietHoursEnd?: number;
   quietHoursTimezone?: string;
   maxRecoveryWindowDays?: number;
+  overdueGracePeriodDays?: number;
 }
 
 export interface PolicyExecutionContext {
@@ -75,7 +77,7 @@ export interface PolicyExecutionContext {
   priorActions: PriorActionRecord[];
   priorOutcomes: PriorOutcomeRecord[];
   activeCommitments?: ActiveCommitmentRecord[];
-  currentTime?: Date;
+  currentTime: Date; // Authoritative clock: strictly required for deterministic evaluation
 }
 
 export interface PolicyEvaluatedFacts {
@@ -85,6 +87,8 @@ export interface PolicyEvaluatedFacts {
   caseCurrency: string;
   riskType: RiskType;
   proposedActionType: RecoveryActionType;
+  totalActionsCount: number;
+  maxActionsAllowed: number;
   retryCount: number;
   maxRetriesAllowed: number;
   contactCount: number;
@@ -95,6 +99,7 @@ export interface PolicyEvaluatedFacts {
   quietHoursLocalHour: number;
   customerOptedOut: boolean;
   customerContactConsent: boolean;
+  customerRecordPresent: boolean;
   isHardDecline: boolean;
   proposalConfidence: number | null;
   confidenceThreshold: number;

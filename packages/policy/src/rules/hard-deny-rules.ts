@@ -1,4 +1,4 @@
-import { PolicyDecision, CaseStatus, RecoveryActionType } from '@recoverai/shared';
+import { PolicyDecision, CaseStatus, RecoveryActionType, Money } from '@recoverai/shared';
 import { isActionCompatible, isHardDecline } from '@recoverai/core';
 import { IPolicyRule, RuleResult } from './rule.interface.js';
 import { PolicyExecutionContext, PolicyEvaluatedFacts } from '../policy-types.js';
@@ -68,7 +68,97 @@ export class CaseNeedsReviewRule implements IPolicyRule {
 }
 
 /**
- * 4. Action Compatibility Rule
+ * 4. Required Facts & Fail-Closed Validation Rule
+ * Fails closed when essential ground-truth facts are missing or unverified.
+ * Unknown is NOT permission.
+ */
+export class RequiredFactsRule implements IPolicyRule {
+  readonly name = 'RequiredFactsRule';
+  evaluate(context: PolicyExecutionContext): RuleResult | null {
+    // 1. Validate monetary facts using exact Money semantics
+    if (
+      !context.case.amountAtRisk ||
+      !context.case.currency ||
+      !Money.isValidDecimalString(context.case.amountAtRisk)
+    ) {
+      return {
+        decision: PolicyDecision.DENY,
+        reasonCode: PolicyReasonCodes.REQUIRED_FACTS_MISSING,
+        rationale: `Authoritative case amount ("${context.case.amountAtRisk}") or currency ("${context.case.currency}") is invalid or missing.`,
+        violation: 'MALFORMED_OR_MISSING_CASE_AMOUNT',
+      };
+    }
+
+    if (
+      !context.policyConfig.highValueThreshold ||
+      !Money.isValidDecimalString(context.policyConfig.highValueThreshold)
+    ) {
+      return {
+        decision: PolicyDecision.DENY,
+        reasonCode: PolicyReasonCodes.REQUIRED_FACTS_MISSING,
+        rationale: `Authoritative high-value review threshold ("${context.policyConfig.highValueThreshold}") is invalid or missing.`,
+        violation: 'MALFORMED_OR_MISSING_HIGH_VALUE_THRESHOLD',
+      };
+    }
+
+    // 2. For customer-facing communication actions: require verified customer, opt-out, and consent status
+    if (isCustomerCommunicationAction(context.proposedActionType)) {
+      if (!context.customer) {
+        return {
+          decision: PolicyDecision.DENY,
+          reasonCode: PolicyReasonCodes.REQUIRED_FACTS_MISSING,
+          rationale: 'Customer record is missing; outbound communication cannot proceed without verified customer identity.',
+          violation: 'MISSING_CUSTOMER_RECORD_FOR_COMMUNICATION',
+        };
+      }
+
+      if (context.customer.optedOut === undefined || typeof context.customer.optedOut !== 'boolean') {
+        return {
+          decision: PolicyDecision.DENY,
+          reasonCode: PolicyReasonCodes.REQUIRED_FACTS_MISSING,
+          rationale: 'Customer opt-out status is unknown or unverified; unknown status is not permission to contact.',
+          violation: 'UNKNOWN_CUSTOMER_OPT_OUT_STATUS',
+        };
+      }
+
+      if (context.customer.contactConsent === undefined || typeof context.customer.contactConsent !== 'boolean') {
+        return {
+          decision: PolicyDecision.DENY,
+          reasonCode: PolicyReasonCodes.REQUIRED_FACTS_MISSING,
+          rationale: 'Customer contact consent status is unknown or unverified; unknown consent is not permission to contact.',
+          violation: 'UNKNOWN_CUSTOMER_CONTACT_CONSENT_STATUS',
+        };
+      }
+    }
+
+    return null;
+  }
+}
+
+/**
+ * 5. Duplicate Action in Flight Rule
+ * Prevents double-scheduling identical actions while one is already pending.
+ */
+export class DuplicateActionRule implements IPolicyRule {
+  readonly name = 'DuplicateActionRule';
+  evaluate(context: PolicyExecutionContext): RuleResult | null {
+    const hasPendingDuplicate = context.priorActions.some(
+      (a) => a.actionType === context.proposedActionType && (a.status === 'PENDING' || a.status === 'RUNNING'),
+    );
+    if (hasPendingDuplicate) {
+      return {
+        decision: PolicyDecision.DENY,
+        reasonCode: PolicyReasonCodes.DUPLICATE_ACTION_IN_FLIGHT,
+        rationale: `An identical action of type "${context.proposedActionType}" is already pending or executing.`,
+        violation: 'DUPLICATE_ACTION_IN_FLIGHT',
+      };
+    }
+    return null;
+  }
+}
+
+/**
+ * 6. Action Compatibility Rule
  * The proposed action must be canonically compatible with the case's risk family.
  */
 export class ActionCompatibilityRule implements IPolicyRule {
@@ -87,7 +177,7 @@ export class ActionCompatibilityRule implements IPolicyRule {
 }
 
 /**
- * 5. Customer Opt-Out Rule
+ * 7. Customer Opt-Out Rule
  * Customers who opted out cannot receive customer-facing communication actions.
  */
 export class CustomerOptOutRule implements IPolicyRule {
@@ -109,7 +199,7 @@ export class CustomerOptOutRule implements IPolicyRule {
 }
 
 /**
- * 6. Contact Consent Rule
+ * 8. Contact Consent Rule
  * Outbound communication requires verified contact consent.
  */
 export class ContactConsentRule implements IPolicyRule {
@@ -132,8 +222,8 @@ export class ContactConsentRule implements IPolicyRule {
 }
 
 /**
- * 7. Hard Decline Blocks Payment Retry Rule
- * Permanent or security-related issuer declines (fraud, stolen card, closed account) forbid RETRY_PAYMENT.
+ * 9. Hard Decline Blocks Payment Retry Rule
+ * Exact canonical issuer declines (fraud, stolen card, closed account) forbid RETRY_PAYMENT.
  */
 export class HardDeclineRule implements IPolicyRule {
   readonly name = 'HardDeclineRule';
@@ -154,7 +244,7 @@ export class HardDeclineRule implements IPolicyRule {
 }
 
 /**
- * 8. Max Retries Rule
+ * 10. Max Retries Rule
  * Enforces merchant-configured maximum payment retries per case.
  */
 export class MaxRetriesRule implements IPolicyRule {
@@ -175,7 +265,7 @@ export class MaxRetriesRule implements IPolicyRule {
 }
 
 /**
- * 9. Max Contacts Rule
+ * 11. Max Contacts Rule
  * Enforces merchant-configured maximum customer contacts per case.
  */
 export class MaxContactsRule implements IPolicyRule {
@@ -196,13 +286,36 @@ export class MaxContactsRule implements IPolicyRule {
 }
 
 /**
- * 10. Cooldown Rule
+ * 12. Max Total Actions Rule
+ * Enforces merchant-configured maximum total recovery actions per case.
+ */
+export class MaxTotalActionsRule implements IPolicyRule {
+  readonly name = 'MaxTotalActionsRule';
+  evaluate(context: PolicyExecutionContext, facts: PolicyEvaluatedFacts): RuleResult | null {
+    if (
+      context.proposedActionType !== RecoveryActionType.STOP_RECOVERY &&
+      context.proposedActionType !== RecoveryActionType.ESCALATE_TO_HUMAN
+    ) {
+      if (facts.totalActionsCount >= context.policyConfig.maxActionsPerCase) {
+        return {
+          decision: PolicyDecision.DENY,
+          reasonCode: PolicyReasonCodes.MAX_ACTIONS_EXCEEDED,
+          rationale: `Case has reached maximum allowed total actions (${facts.totalActionsCount}/${context.policyConfig.maxActionsPerCase}).`,
+          violation: 'MAX_TOTAL_ACTIONS_EXCEEDED',
+        };
+      }
+    }
+    return null;
+  }
+}
+
+/**
+ * 13. Cooldown Rule
  * Enforces minimum quiet time between recovery actions to prevent spamming customers or payment rails.
  */
 export class CooldownRule implements IPolicyRule {
   readonly name = 'CooldownRule';
   evaluate(context: PolicyExecutionContext, facts: PolicyEvaluatedFacts): RuleResult | null {
-    // Exceptions: STOP_RECOVERY and ESCALATE_TO_HUMAN are never blocked by cooldown
     if (
       context.proposedActionType === RecoveryActionType.STOP_RECOVERY ||
       context.proposedActionType === RecoveryActionType.ESCALATE_TO_HUMAN
@@ -226,7 +339,7 @@ export class CooldownRule implements IPolicyRule {
 }
 
 /**
- * 11. Quiet Hours Rule
+ * 14. Quiet Hours Rule
  * Prohibits outbound customer messaging during nighttime quiet hours.
  */
 export class QuietHoursRule implements IPolicyRule {
@@ -245,29 +358,7 @@ export class QuietHoursRule implements IPolicyRule {
 }
 
 /**
- * 12. Duplicate Action in Flight Rule
- * Prevents double-scheduling identical actions while one is already pending.
- */
-export class DuplicateActionRule implements IPolicyRule {
-  readonly name = 'DuplicateActionRule';
-  evaluate(context: PolicyExecutionContext): RuleResult | null {
-    const hasPendingDuplicate = context.priorActions.some(
-      (a) => a.actionType === context.proposedActionType && (a.status === 'PENDING' || a.status === 'RUNNING'),
-    );
-    if (hasPendingDuplicate) {
-      return {
-        decision: PolicyDecision.DENY,
-        reasonCode: PolicyReasonCodes.DUPLICATE_ACTION_IN_FLIGHT,
-        rationale: `An identical action of type "${context.proposedActionType}" is already pending or executing.`,
-        violation: 'DUPLICATE_ACTION_IN_FLIGHT',
-      };
-    }
-    return null;
-  }
-}
-
-/**
- * 13. Expired Recovery Window Rule
+ * 15. Expired Recovery Window Rule
  * Denies recovery actions when the case has exceeded the maximum recovery window (e.g. 30 days).
  */
 export class ExpiredRecoveryWindowRule implements IPolicyRule {
@@ -277,7 +368,7 @@ export class ExpiredRecoveryWindowRule implements IPolicyRule {
       return null;
     }
 
-    const now = context.currentTime || new Date();
+    const now = context.currentTime;
     const maxDays = context.policyConfig.maxRecoveryWindowDays ?? 30;
     const ageMs = now.getTime() - context.case.openedAt.getTime();
     const ageDays = ageMs / (1000 * 60 * 60 * 24);

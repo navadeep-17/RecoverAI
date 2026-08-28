@@ -13,15 +13,17 @@ import {
   KillSwitchRule,
   TerminalCaseStateRule,
   CaseNeedsReviewRule,
+  RequiredFactsRule,
+  DuplicateActionRule,
   ActionCompatibilityRule,
   CustomerOptOutRule,
   ContactConsentRule,
   HardDeclineRule,
   MaxRetriesRule,
   MaxContactsRule,
+  MaxTotalActionsRule,
   CooldownRule,
   QuietHoursRule,
-  DuplicateActionRule,
   ExpiredRecoveryWindowRule,
 } from './rules/hard-deny-rules.js';
 import {
@@ -41,10 +43,11 @@ export class PolicyEngine implements IPolicyEngine {
     hardDenyRules?: IPolicyRule[];
     reviewRules?: IPolicyRule[];
   }) {
-        this.hardDenyRules = customRules?.hardDenyRules || [
+    this.hardDenyRules = customRules?.hardDenyRules || [
       new KillSwitchRule(),
       new TerminalCaseStateRule(),
       new CaseNeedsReviewRule(),
+      new RequiredFactsRule(),
       new DuplicateActionRule(),
       new ActionCompatibilityRule(),
       new CustomerOptOutRule(),
@@ -52,6 +55,7 @@ export class PolicyEngine implements IPolicyEngine {
       new HardDeclineRule(),
       new MaxRetriesRule(),
       new MaxContactsRule(),
+      new MaxTotalActionsRule(),
       new CooldownRule(),
       new QuietHoursRule(),
       new ExpiredRecoveryWindowRule(),
@@ -74,10 +78,12 @@ export class PolicyEngine implements IPolicyEngine {
    * 1. Deterministic pure domain logic; NEVER calls an LLM.
    * 2. Strict decision contract: ALLOW | DENY | REVIEW.
    * 3. Absolute DENY outranks REVIEW (human review cannot bypass hard safety stops).
-   * 4. Idempotent: identical inputs produce identical decisions and reason codes.
+   * 4. Idempotent: identical inputs and authoritative clock produce identical decisions and reason codes.
+   * 5. Exact Money semantics only; zero floating-point arithmetic.
+   * 6. Fails closed on missing or unverified ground truth facts.
    */
   evaluate(context: PolicyExecutionContext): PolicyEvaluationResult {
-    const evaluatedAt = context.currentTime || new Date();
+    const evaluatedAt = context.currentTime;
     const evaluatedFacts = this.computeEvaluatedFacts(context, evaluatedAt);
 
     // 1. Evaluate Hard DENY Rules in deterministic order
@@ -135,6 +141,8 @@ export class PolicyEngine implements IPolicyEngine {
     context: PolicyExecutionContext,
     now: Date,
   ): PolicyEvaluatedFacts {
+    const totalActionsCount = context.priorActions.length;
+
     // Retry count (count of executed RETRY_PAYMENT actions)
     const retryCount = context.priorActions.filter(
       (a) => a.actionType === RecoveryActionType.RETRY_PAYMENT,
@@ -164,15 +172,15 @@ export class PolicyEngine implements IPolicyEngine {
       endHour: context.policyConfig.quietHoursEnd,
     });
 
-    // High value calculation using exact Money comparison
+    // High value calculation using exact Money comparison only (no parseFloat fallback)
     let isHighValue = false;
-    try {
-      const caseMoney = Money.fromDecimalString(context.case.amountAtRisk);
-      const thresholdMoney = Money.fromDecimalString(context.policyConfig.highValueThreshold);
+    if (
+      Money.isValidDecimalString(context.case.amountAtRisk) &&
+      Money.isValidDecimalString(context.policyConfig.highValueThreshold)
+    ) {
+      const caseMoney = Money.fromDecimalString(context.case.amountAtRisk, context.case.currency || 'INR');
+      const thresholdMoney = Money.fromDecimalString(context.policyConfig.highValueThreshold, context.case.currency || 'INR');
       isHighValue = caseMoney.greaterThan(thresholdMoney) || caseMoney.equals(thresholdMoney);
-    } catch {
-      // Fallback
-      isHighValue = parseFloat(context.case.amountAtRisk) >= parseFloat(context.policyConfig.highValueThreshold);
     }
 
     // Consecutive failed actions
@@ -205,6 +213,8 @@ export class PolicyEngine implements IPolicyEngine {
       caseCurrency: context.case.currency,
       riskType: context.case.riskType,
       proposedActionType: context.proposedActionType,
+      totalActionsCount,
+      maxActionsAllowed: context.policyConfig.maxActionsPerCase,
       retryCount,
       maxRetriesAllowed: context.policyConfig.maxRetriesPerCase,
       contactCount,
@@ -214,7 +224,8 @@ export class PolicyEngine implements IPolicyEngine {
       inQuietHours: quietCheck.inQuietHours,
       quietHoursLocalHour: quietCheck.localHour,
       customerOptedOut: context.customer?.optedOut ?? false,
-      customerContactConsent: context.customer?.contactConsent ?? true,
+      customerContactConsent: context.customer?.contactConsent ?? false,
+      customerRecordPresent: context.customer !== null && context.customer !== undefined,
       isHardDecline: hardDecline,
       proposalConfidence: context.confidence ?? null,
       confidenceThreshold: context.policyConfig.minConfidenceThreshold,

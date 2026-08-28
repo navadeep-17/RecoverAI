@@ -2,12 +2,12 @@ import { z } from 'zod';
 import { RiskType, RecoveryActionType } from '@recoverai/shared';
 
 /**
- * Hard decline failure codes that indicate permanent or security-related failures.
+ * Exact canonical hard decline failure codes that indicate permanent or security-related failures.
  * In these situations, automatic payment retry must be blocked.
+ * NO arbitrary substring inference is used.
  */
-export const HARD_DECLINE_CODES = [
+export const CANONICAL_HARD_DECLINE_CODES = [
   'FRAUD_SUSPECTED',
-  'FRAUD',
   'CARD_LOST_OR_STOLEN',
   'LOST_CARD',
   'STOLEN_CARD',
@@ -19,41 +19,64 @@ export const HARD_DECLINE_CODES = [
   'CARD_EXPIRED',
   '3DS_AUTHENTICATION_FAILED',
   'AUTHENTICATION_FAILED',
+  'EXPIRED_CARD',
+  'STOLEN_OR_LOST_CARD',
+  'CUSTOMER_DISPUTE',
+  'PICK_UP_CARD',
+  'RESTRICTED_CARD',
 ] as const;
 
-export type HardDeclineCode = (typeof HARD_DECLINE_CODES)[number];
+export type HardDeclineCode = (typeof CANONICAL_HARD_DECLINE_CODES)[number];
+
+const CANONICAL_HARD_DECLINE_SET = new Set<string>(CANONICAL_HARD_DECLINE_CODES);
+
+const HARD_DECLINE_ALIAS_MAP: Record<string, HardDeclineCode> = {
+  FRAUD: 'FRAUD_SUSPECTED',
+  FRAUDULENT: 'FRAUD_SUSPECTED',
+  CARD_LOST: 'LOST_CARD',
+  CARD_STOLEN: 'STOLEN_CARD',
+  CLOSED_ACCOUNT: 'ACCOUNT_CLOSED',
+  CUSTOMER_STOPPED: 'STOPPED_BY_CUSTOMER',
+  CVV_FAIL: 'INCORRECT_CVV',
+  PIN_FAIL: 'INVALID_PIN',
+  AUTH_FAILED: 'AUTHENTICATION_FAILED',
+  THREE_DS_FAILED: '3DS_AUTHENTICATION_FAILED',
+};
 
 export function isHardDecline(code?: string | null): boolean {
-  if (!code) return false;
-  const normalized = code.toUpperCase().replace(/[-\s]+/g, '_');
-  return HARD_DECLINE_CODES.some((h) => normalized.includes(h) || h.includes(normalized));
+  if (!code || !code.trim()) return false;
+  const normalized = code.trim().toUpperCase().replace(/[-\s]+/g, '_');
+  return CANONICAL_HARD_DECLINE_SET.has(normalized) || HARD_DECLINE_ALIAS_MAP[normalized] !== undefined;
 }
 
 /**
- * Zod Schema for Structured Agent Proposals.
- * Proposes EXACTLY ONE next action with strict confidence bounds [0, 1].
+ * Strict Zod Schema for Structured Agent Proposals.
+ * - Proposes EXACTLY ONE next action with strict confidence bounds [0, 1].
+ * - .strict() rejects any unknown/injected extra fields (e.g. policyDecision, executeNow, toolCall).
  */
-export const AgentProposalSchema = z.object({
-  diagnosisCode: z.string().min(1, 'diagnosisCode is required'),
-  diagnosisSummary: z.string().min(1, 'diagnosisSummary is required'),
-  confidence: z.number().min(0, 'confidence must be >= 0').max(1, 'confidence must be <= 1'),
-  proposedActionType: z.nativeEnum(RecoveryActionType, {
-    errorMap: () => ({ message: 'Invalid or unsupported RecoveryActionType' }),
-  }),
-  proposedActionParams: z.record(z.unknown()).default({}),
-  reasoningSummary: z.string().min(1, 'reasoningSummary is required'),
-  followUpAfterSeconds: z.number().int().positive().nullable().optional(),
-  shouldStop: z.boolean().default(false),
-  shouldEscalate: z.boolean().default(false),
-});
+export const AgentProposalSchema = z
+  .object({
+    diagnosisCode: z.string().min(1, 'diagnosisCode is required'),
+    diagnosisSummary: z.string().min(1, 'diagnosisSummary is required'),
+    confidence: z.number().min(0, 'confidence must be >= 0').max(1, 'confidence must be <= 1'),
+    proposedActionType: z.nativeEnum(RecoveryActionType, {
+      errorMap: () => ({ message: 'Invalid or unsupported RecoveryActionType' }),
+    }),
+    proposedActionParams: z.record(z.unknown()).default({}),
+    reasoningSummary: z.string().min(1, 'reasoningSummary is required'),
+    followUpAfterSeconds: z.number().int().positive().nullable().optional(),
+    shouldStop: z.boolean().default(false),
+    shouldEscalate: z.boolean().default(false),
+  })
+  .strict();
 
 export type AgentProposal = z.infer<typeof AgentProposalSchema>;
 
 export interface VerifiedPaymentFacts {
   gatewayErrorCode?: string | null;
   gatewayErrorMessage?: string | null;
-  paymentMethod?: string | null; // e.g. 'card', 'upi', 'netbanking'
-  cardNetwork?: string | null; // e.g. 'Visa', 'Mastercard'
+  paymentMethod?: string | null;
+  cardNetwork?: string | null;
   cardLast4?: string | null;
   bankName?: string | null;
   retryAttemptNumber?: number;
@@ -84,7 +107,6 @@ export interface PriorOutcomeSummary {
 
 /**
  * Complete, verified, and authoritative context provided to the Recovery Agent.
- * The LLM only receives verified facts and does not determine ground truth.
  */
 export interface AgentContext {
   caseId: string;
@@ -104,6 +126,7 @@ export interface AgentContext {
   policySummary?: {
     maxRetries: number;
     maxContacts: number;
+    maxActions: number;
     cooldownHours: number;
     reviewFirstMode: boolean;
     highValueThreshold: string;
