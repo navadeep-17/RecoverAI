@@ -7,18 +7,29 @@ import {
   CustomerRepository,
   AuditRepository,
   PolicyConfigRepository,
+  CommitmentRepository,
   ActionExecutionStatus,
   CaseStatus,
   PolicyDecision,
   RecoveryActionType,
   RiskType,
 } from '../src/index.js';
-import { ActionExecutor, generateActionIdempotencyKey } from '@recoverai/core';
+import { ActionExecutor, generateActionIdempotencyKey, PolicyEvaluationResult } from '@recoverai/core';
 import { PolicyEngine } from '@recoverai/policy';
 import {
   ProviderRegistry,
   SimulatedRecoveryProvider,
 } from '@recoverai/integrations';
+
+/** Build a typed PolicyEvaluationResult for ALLOW decisions in tests. */
+function allowResult(): PolicyEvaluationResult {
+  return {
+    decision: PolicyDecision.ALLOW,
+    reasonCode: 'POLICY_ALLOWED',
+    rationale: 'Integration test allow',
+    evaluatedAt: new Date(),
+  };
+}
 
 describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
   let dbAvailable = false;
@@ -28,6 +39,7 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
   let customerRepo: CustomerRepository;
   let auditRepo: AuditRepository;
   let policyConfigRepo: PolicyConfigRepository;
+  let commitmentRepo: CommitmentRepository;
   let policyEngine: PolicyEngine;
   let simulatedProvider: SimulatedRecoveryProvider;
   let providerRegistry: ProviderRegistry;
@@ -47,6 +59,7 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
       customerRepo = new CustomerRepository();
       auditRepo = new AuditRepository();
       policyConfigRepo = new PolicyConfigRepository();
+      commitmentRepo = new CommitmentRepository();
       policyEngine = new PolicyEngine();
       simulatedProvider = new SimulatedRecoveryProvider();
       providerRegistry = new ProviderRegistry([simulatedProvider]);
@@ -58,11 +71,11 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
         customerRepo,
         auditRepo,
         policyConfigRepo,
+        commitmentRepo,
         policyEngine,
         providerRegistry,
         clock: () => new Date('2026-08-28T14:00:00+05:30'),
       });
-
 
       const mchA = await merchantRepo.createMerchant({
         name: 'Action Exec Merchant A',
@@ -88,13 +101,12 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
     }
   });
 
+  // ──────────────────────────────────────────────────────────────────────────
   it('proves Promise.all concurrent execution claims action atomically and calls provider exactly ONCE', async () => {
     if (!dbAvailable) return;
 
-    // Reset provider calls tracker
     simulatedProvider.dispatchedCalls = [];
 
-    // Create test customer & case
     const customer = await customerRepo.getOrCreateCustomer(merchantAId, {
       name: 'Concurrent Customer',
       email: `conc_${Date.now()}@example.com`,
@@ -110,12 +122,10 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
       contextJson: { verifiedPaymentFailureCode: 'BAD_REQUEST_ERROR' },
     });
 
-    // Authorize action
     const { action } = await actionExecutor.authorizeAndCreateAction(merchantAId, testCase.id, {
       actionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE,
       actionParams: { channel: 'WHATSAPP' },
-      policyDecision: PolicyDecision.ALLOW,
-      policyRationale: 'Low risk failure approved for dispatch',
+      policyEvaluation: allowResult(),
       attemptOrVersion: 'v1',
     });
 
@@ -149,24 +159,17 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
 
     // 5. Audit trail contains exactly ONE ACTION_DISPATCHED and ONE ACTION_SUCCEEDED
     const dispatchedAudits = await prisma.auditEvent.findMany({
-      where: {
-        merchantId: merchantAId,
-        caseId: testCase.id,
-        eventType: 'ACTION_DISPATCHED',
-      },
+      where: { merchantId: merchantAId, caseId: testCase.id, eventType: 'ACTION_DISPATCHED' },
     });
     expect(dispatchedAudits.length).toBe(1);
 
     const succeededAudits = await prisma.auditEvent.findMany({
-      where: {
-        merchantId: merchantAId,
-        caseId: testCase.id,
-        eventType: 'ACTION_SUCCEEDED',
-      },
+      where: { merchantId: merchantAId, caseId: testCase.id, eventType: 'ACTION_SUCCEEDED' },
     });
     expect(succeededAudits.length).toBe(1);
   });
 
+  // ──────────────────────────────────────────────────────────────────────────
   it('enforces strict tenant isolation: Merchant B cannot claim or execute Merchant A action', async () => {
     if (!dbAvailable) return;
 
@@ -181,24 +184,24 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
     const { action } = await actionExecutor.authorizeAndCreateAction(merchantAId, testCase.id, {
       actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
       actionParams: {},
-      policyDecision: PolicyDecision.ALLOW,
-      policyRationale: 'Approved for Merchant A',
+      policyEvaluation: allowResult(),
       attemptOrVersion: 'v1',
     });
 
     expect(action).toBeDefined();
 
-    // Merchant B attempts to execute Merchant A's action -> MUST fail
+    // Merchant B attempts to execute Merchant A's action — MUST fail
     await expect(actionExecutor.executeAction(merchantBId, action!.id)).rejects.toThrow(
       /not found or unauthorized/,
     );
 
-    // Verify action remains PENDING under Merchant A
+    // Action remains PENDING under Merchant A
     const freshAction = await actionRepo.getActionById(merchantAId, action!.id);
     expect(freshAction?.status).toBe(ActionExecutionStatus.PENDING);
   });
 
-  it('blocks execution when customer opted out or kill switch active via fresh revalidation in database', async () => {
+  // ──────────────────────────────────────────────────────────────────────────
+  it('blocks execution via fresh revalidation (claim first, then detect opt-out, CAS EXECUTING→CANCELLED)', async () => {
     if (!dbAvailable) return;
 
     const customer = await customerRepo.getOrCreateCustomer(merchantAId, {
@@ -219,29 +222,131 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
     const { action } = await actionExecutor.authorizeAndCreateAction(merchantAId, testCase.id, {
       actionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE,
       actionParams: { channel: 'WHATSAPP' },
-      policyDecision: PolicyDecision.ALLOW,
-      policyRationale: 'Initially allowed',
+      policyEvaluation: allowResult(),
       attemptOrVersion: 'v1',
     });
 
-    // Customer opts out in database
+    // Customer opts out in database between authorization and execution
     await prisma.customer.update({
       where: { id: customer.id },
       data: { optedOut: true },
     });
 
-    // Execution must be blocked by fresh policy revalidation
     const result = await actionExecutor.executeAction(merchantAId, action!.id);
 
+    // Fresh policy revalidation (after claim) detects opt-out → DENY → CANCELLED
     expect(result.executed).toBe(false);
     expect(result.blockedByPolicy).toBe(true);
     expect(result.policyDecision).toBe(PolicyDecision.DENY);
 
     const dbAction = await actionRepo.getActionById(merchantAId, action!.id);
+    // Claim happened, then CAS rolled back EXECUTING → CANCELLED
     expect(dbAction?.status).toBe(ActionExecutionStatus.CANCELLED);
   });
 
-  it('executes internal actions STOP_RECOVERY and ESCALATE_TO_HUMAN correctly in database', async () => {
+  // ──────────────────────────────────────────────────────────────────────────
+  it('idempotent authorization: same idempotency key twice creates exactly one RecoveryAction and one ACTION_AUTHORIZED audit', async () => {
+    if (!dbAvailable) return;
+
+    const testCase = await caseRepo.createCase(merchantAId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '2500.00',
+      currency: 'INR',
+      incidentKey: `${merchantAId}:IDEMP_AUTH:${Date.now()}`,
+      contextJson: { verifiedPaymentFailureCode: 'BAD_REQUEST_ERROR' },
+    });
+
+    const params = {
+      actionType: RecoveryActionType.SEND_CHECKOUT_RECOVERY,
+      actionParams: { channel: 'EMAIL' },
+      policyEvaluation: allowResult(),
+      attemptOrVersion: 'v1',
+    };
+
+    const first = await actionExecutor.authorizeAndCreateAction(merchantAId, testCase.id, params);
+    const second = await actionExecutor.authorizeAndCreateAction(merchantAId, testCase.id, params);
+
+    expect(first.authorized).toBe(true);
+    expect(second.authorized).toBe(true);
+
+    // Same action returned
+    expect(first.action?.id).toBe(second.action?.id);
+
+    // Only one RecoveryAction in DB for this idempotency key
+    const idempotencyKey = generateActionIdempotencyKey(
+      merchantAId,
+      testCase.id,
+      RecoveryActionType.SEND_CHECKOUT_RECOVERY,
+      'v1',
+    );
+    const actionsInDb = await prisma.recoveryAction.count({
+      where: { idempotencyKey },
+    });
+    expect(actionsInDb).toBe(1);
+
+    // Exactly one ACTION_AUTHORIZED audit
+    const authorizedAudits = await prisma.auditEvent.findMany({
+      where: {
+        merchantId: merchantAId,
+        caseId: testCase.id,
+        eventType: 'ACTION_AUTHORIZED',
+      },
+    });
+    expect(authorizedAudits.length).toBe(1);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('RECORD_PROMISE_TO_PAY: persists authoritative RecoveryCommitment in database', async () => {
+    if (!dbAvailable) return;
+
+    const customer = await customerRepo.getOrCreateCustomer(merchantAId, {
+      name: 'PTP Customer',
+      email: `ptp_${Date.now()}@example.com`,
+      contactConsent: true,
+    });
+
+    const testCase = await caseRepo.createCase(merchantAId, {
+      customerId: customer.id,
+      riskType: RiskType.OVERDUE_RECEIVABLE,
+      amountAtRisk: '8000.00',
+      currency: 'INR',
+      incidentKey: `${merchantAId}:PTP_TEST:${Date.now()}`,
+      contextJson: {},
+    });
+
+    const { action } = await actionExecutor.authorizeAndCreateAction(merchantAId, testCase.id, {
+      actionType: RecoveryActionType.RECORD_PROMISE_TO_PAY,
+      actionParams: {
+        promisedAmount: '8000.00',
+        promisedDate: '2026-09-15T00:00:00.000Z',
+        extractedFromText: 'Customer agreed to pay by 15th September',
+      },
+      policyEvaluation: allowResult(),
+      attemptOrVersion: 'v1',
+    });
+
+    const execResult = await actionExecutor.executeAction(merchantAId, action!.id);
+
+    expect(execResult.success).toBe(true);
+    expect(execResult.action?.status).toBe(ActionExecutionStatus.SUCCESS);
+
+    // Verify authoritative RecoveryCommitment exists in database
+    const commitments = await prisma.recoveryCommitment.findMany({
+      where: { caseId: testCase.id },
+    });
+    expect(commitments.length).toBe(1);
+    expect(commitments[0].status).toBe('PENDING');
+    expect(commitments[0].promisedAmount.toString()).toBe('8000.00');
+    expect(commitments[0].extractedFromText).toBe('Customer agreed to pay by 15th September');
+
+    // executionMetadata references the commitmentId
+    const dbAction = await actionRepo.getActionById(merchantAId, action!.id);
+    const meta = dbAction?.executionMetadata as Record<string, unknown> | null;
+    expect(meta?.commitmentId).toBe(commitments[0].id);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('executes internal actions STOP_RECOVERY correctly in database', async () => {
     if (!dbAvailable) return;
 
     const testCase = await caseRepo.createCase(merchantAId, {
@@ -252,14 +357,16 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
       contextJson: { verifiedPaymentFailureCode: 'BAD_REQUEST_ERROR' },
     });
 
-    // 1. Authorize and execute STOP_RECOVERY
-    const { action: stopAction } = await actionExecutor.authorizeAndCreateAction(merchantAId, testCase.id, {
-      actionType: RecoveryActionType.STOP_RECOVERY,
-      actionParams: { reason: 'User requested termination' },
-      policyDecision: PolicyDecision.ALLOW,
-      policyRationale: 'Stop allowed',
-      attemptOrVersion: 'v1',
-    });
+    const { action: stopAction } = await actionExecutor.authorizeAndCreateAction(
+      merchantAId,
+      testCase.id,
+      {
+        actionType: RecoveryActionType.STOP_RECOVERY,
+        actionParams: { reason: 'User requested termination' },
+        policyEvaluation: allowResult(),
+        attemptOrVersion: 'v1',
+      },
+    );
 
     const stopResult = await actionExecutor.executeAction(merchantAId, stopAction!.id);
     expect(stopResult.executed).toBe(true);
@@ -267,5 +374,11 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
 
     const stoppedCase = await caseRepo.getCaseById(merchantAId, testCase.id);
     expect(stoppedCase?.status).toBe(CaseStatus.STOPPED);
+
+    // No ACTION_DISPATCHED audit for internal action
+    const dispatchedAudits = await prisma.auditEvent.findMany({
+      where: { merchantId: merchantAId, caseId: testCase.id, eventType: 'ACTION_DISPATCHED' },
+    });
+    expect(dispatchedAudits.length).toBe(0);
   });
 });

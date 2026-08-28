@@ -182,4 +182,57 @@ export class ActionRepository {
       },
     });
   }
+
+  /**
+   * Atomically transitions an action from expectedStatus → nextStatus.
+   *
+   * This is the authoritative CAS helper for all status state transitions
+   * that must not race with concurrent workers. Returns true if the
+   * transition was applied (count=1), false if the action was already
+   * in a different state (lost the CAS race).
+   *
+   * Usage: revalidation rollback from EXECUTING → CANCELLED.
+   */
+  async transitionActionStatus(
+    merchantId: string,
+    actionId: string,
+    expectedStatus: ActionExecutionStatus,
+    nextStatus: ActionExecutionStatus,
+    extras?: {
+      errorMessage?: string;
+      executionMetadata?: Record<string, unknown>;
+    },
+  ): Promise<{ transitioned: boolean; action: RecoveryAction | null }> {
+    const updateResult = await prisma.recoveryAction.updateMany({
+      where: {
+        id: actionId,
+        status: expectedStatus,
+        case: { merchantId },
+      },
+      data: {
+        status: nextStatus,
+        errorMessage: extras?.errorMessage,
+        executionMetadata: extras?.executionMetadata as Prisma.InputJsonValue,
+        updatedAt: new Date(),
+        executedAt:
+          nextStatus === ActionExecutionStatus.SUCCESS ||
+          nextStatus === ActionExecutionStatus.FAILED ||
+          nextStatus === ActionExecutionStatus.CANCELLED
+            ? new Date()
+            : undefined,
+      },
+    });
+
+    if (updateResult.count === 1) {
+      const action = await prisma.recoveryAction.findUnique({
+        where: { id: actionId },
+      });
+      return { transitioned: true, action };
+    }
+
+    const action = await prisma.recoveryAction.findFirst({
+      where: { id: actionId, case: { merchantId } },
+    });
+    return { transitioned: false, action };
+  }
 }

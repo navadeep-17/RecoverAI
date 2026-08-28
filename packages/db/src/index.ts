@@ -9,3 +9,4 @@ export * from './repositories/policy-config-repository.js';
 export * from './repositories/human-review-repository.js';
 export * from './repositories/scheduled-job-repository.js';
 export * from './repositories/action-repository.js';
+export * from './repositories/commitment-repository.js';
