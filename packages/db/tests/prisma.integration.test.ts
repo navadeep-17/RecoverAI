@@ -16,7 +16,6 @@ describe('PostgreSQL + Prisma Real Integration Smoke Test', () => {
         await prisma.merchant.deleteMany({
           where: { slug: 'smoke-test-merchant' },
         });
-        await prisma.$disconnect();
       } catch (err) {
         console.error('Prisma cleanup error:', err);
       }
@@ -45,10 +44,8 @@ describe('PostgreSQL + Prisma Real Integration Smoke Test', () => {
       return;
     }
 
-    // Clean up if existed
     await prisma.merchant.deleteMany({ where: { slug: 'smoke-test-merchant' } });
 
-    // Insert merchant
     const created = await prisma.merchant.create({
       data: {
         id: testMerchantId,
@@ -61,7 +58,6 @@ describe('PostgreSQL + Prisma Real Integration Smoke Test', () => {
     expect(created.id).toBe(testMerchantId);
     expect(created.name).toBe('Smoke Test Merchant');
 
-    // Query back
     const fetched = await prisma.merchant.findUnique({
       where: { id: testMerchantId },
     });

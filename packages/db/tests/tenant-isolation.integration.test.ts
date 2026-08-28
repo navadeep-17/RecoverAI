@@ -11,7 +11,6 @@ import {
 } from '../src/index.js';
 import {
   RiskType,
-  CaseStatus,
   EventSource,
   AuditActorType,
   RecoveryActionType,
@@ -60,7 +59,6 @@ describe('Tenant Isolation & Constraint Integrity Integration Tests', () => {
         await prisma.merchant.deleteMany({
           where: { id: { in: [merchantAId, merchantBId] } },
         });
-        await prisma.$disconnect();
       } catch (err) {
         console.error('Tenant test cleanup error:', err);
       }
