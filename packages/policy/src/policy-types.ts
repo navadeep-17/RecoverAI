@@ -3,8 +3,10 @@ import {
   RecoveryActionType,
   RiskType,
   CaseStatus,
+  Money,
 } from '@recoverai/shared';
 import { PolicyReasonCode } from './policy-reason-codes.js';
+import { isValidIanaTimezone } from './quiet-hours.js';
 
 export interface PriorActionRecord {
   actionType: RecoveryActionType;
@@ -29,7 +31,7 @@ export interface ActiveCommitmentRecord {
 
 export interface PolicyCustomerData {
   id: string;
-  contactConsent?: boolean;
+  contactConsent?: boolean | null; // null = unknown / unverified consent
   optedOut?: boolean;
   lastContactedAt?: Date | null;
 }
@@ -61,6 +63,54 @@ export interface PolicyConfigData {
   overdueGracePeriodDays?: number;
 }
 
+export function getPolicyConfigValidationError(config: PolicyConfigData): string | null {
+  if (!Number.isInteger(config.maxActionsPerCase) || config.maxActionsPerCase <= 0) {
+    return 'maxActionsPerCase must be an integer >= 1';
+  }
+  if (!Number.isInteger(config.maxRetriesPerCase) || config.maxRetriesPerCase < 0) {
+    return 'maxRetriesPerCase must be an integer >= 0';
+  }
+  if (!Number.isInteger(config.maxContactsPerCase) || config.maxContactsPerCase < 0) {
+    return 'maxContactsPerCase must be an integer >= 0';
+  }
+  if (typeof config.cooldownHoursBetweenActions !== 'number' || config.cooldownHoursBetweenActions < 0) {
+    return 'cooldownHoursBetweenActions must be a number >= 0';
+  }
+  if (typeof config.minConfidenceThreshold !== 'number' || config.minConfidenceThreshold < 0 || config.minConfidenceThreshold > 1) {
+    return 'minConfidenceThreshold must be a number between 0 and 1';
+  }
+  if (config.quietHoursStart !== undefined && (!Number.isInteger(config.quietHoursStart) || config.quietHoursStart < 0 || config.quietHoursStart > 23)) {
+    return 'quietHoursStart must be an integer between 0 and 23';
+  }
+  if (config.quietHoursEnd !== undefined && (!Number.isInteger(config.quietHoursEnd) || config.quietHoursEnd < 0 || config.quietHoursEnd > 23)) {
+    return 'quietHoursEnd must be an integer between 0 and 23';
+  }
+  if (config.quietHoursTimezone !== undefined && !isValidIanaTimezone(config.quietHoursTimezone)) {
+    return `quietHoursTimezone "${config.quietHoursTimezone}" is not a valid IANA timezone`;
+  }
+  if (config.maxRecoveryWindowDays !== undefined && (!Number.isInteger(config.maxRecoveryWindowDays) || config.maxRecoveryWindowDays <= 0)) {
+    return 'maxRecoveryWindowDays must be an integer >= 1';
+  }
+  if (config.overdueGracePeriodDays !== undefined && (!Number.isInteger(config.overdueGracePeriodDays) || config.overdueGracePeriodDays < 0)) {
+    return 'overdueGracePeriodDays must be an integer >= 0';
+  }
+  if (!Money.isValidDecimalString(config.highValueThreshold)) {
+    return 'highValueThreshold must be a valid exact decimal monetary string';
+  }
+  return null;
+}
+
+export interface VerifiedPaymentFacts {
+  gatewayErrorCode?: string | null;
+  gatewayErrorMessage?: string | null;
+  paymentMethod?: string | null;
+  cardNetwork?: string | null;
+  cardLast4?: string | null;
+  bankName?: string | null;
+  retryAttemptNumber?: number;
+  isRecurring?: boolean;
+}
+
 export interface PolicyExecutionContext {
   merchantId: string;
   killSwitchActive: boolean;
@@ -70,8 +120,10 @@ export interface PolicyExecutionContext {
   proposedActionType: RecoveryActionType;
   proposedActionParams?: Record<string, unknown>;
   confidence?: number;
-  diagnosisCode?: string;
+  diagnosisCode?: string; // AI interpretation (NOT authoritative for safety rules)
   diagnosisSummary?: string;
+  verifiedPaymentFailureCode?: string | null; // Authoritative ground-truth payment failure code from provider
+  verifiedPaymentFacts?: VerifiedPaymentFacts | null;
   shouldEscalate?: boolean;
   shouldStop?: boolean;
   priorActions: PriorActionRecord[];
@@ -98,8 +150,9 @@ export interface PolicyEvaluatedFacts {
   inQuietHours: boolean;
   quietHoursLocalHour: number;
   customerOptedOut: boolean;
-  customerContactConsent: boolean;
+  customerContactConsent: boolean | null;
   customerRecordPresent: boolean;
+  verifiedPaymentFailureCode: string | null;
   isHardDecline: boolean;
   proposalConfidence: number | null;
   confidenceThreshold: number;

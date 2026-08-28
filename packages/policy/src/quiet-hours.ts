@@ -14,11 +14,30 @@ export function isCustomerCommunicationAction(actionType: RecoveryActionType): b
   return OUTBOUND_COMMUNICATION_ACTIONS.includes(actionType);
 }
 
+export function isValidIanaTimezone(timezone: string): boolean {
+  if (!timezone || typeof timezone !== 'string' || !timezone.trim()) {
+    return false;
+  }
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: timezone.trim() });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export class InvalidQuietHoursConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidQuietHoursConfigurationError';
+  }
+}
+
 export interface QuietHoursCheckParams {
   currentTime: Date;
-  timezone?: string; // e.g. 'Asia/Kolkata' or 'UTC'
-  startHour?: number; // e.g. 21 (9 PM)
-  endHour?: number; // e.g. 9 (9 AM)
+  timezone?: string; // e.g. 'Asia/Kolkata'
+  startHour?: number; // integer 0..23 (e.g. 21 = 9 PM)
+  endHour?: number; // integer 0..23 (e.g. 9 = 9 AM)
 }
 
 export interface QuietHoursResult {
@@ -34,21 +53,24 @@ export function checkQuietHours(params: QuietHoursCheckParams): QuietHoursResult
   const startHour = params.startHour ?? 21; // 9:00 PM default
   const endHour = params.endHour ?? 9; // 9:00 AM default
 
-  let localHour: number;
-  try {
-    const formatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: timezone,
-      hour: 'numeric',
-      hourCycle: 'h23',
-    });
-    localHour = parseInt(formatter.format(params.currentTime), 10);
-    if (isNaN(localHour)) {
-      localHour = params.currentTime.getUTCHours();
-    }
-  } catch {
-    // Fallback if invalid timezone string is provided
-    localHour = params.currentTime.getUTCHours();
+  if (!isValidIanaTimezone(timezone)) {
+    throw new InvalidQuietHoursConfigurationError(`Invalid IANA timezone: "${timezone}". Quiet hours requires a valid timezone.`);
   }
+
+  if (!Number.isInteger(startHour) || startHour < 0 || startHour > 23) {
+    throw new InvalidQuietHoursConfigurationError(`quietHoursStart must be an integer between 0 and 23, received: ${startHour}`);
+  }
+
+  if (!Number.isInteger(endHour) || endHour < 0 || endHour > 23) {
+    throw new InvalidQuietHoursConfigurationError(`quietHoursEnd must be an integer between 0 and 23, received: ${endHour}`);
+  }
+
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hour: 'numeric',
+    hourCycle: 'h23',
+  });
+  const localHour = parseInt(formatter.format(params.currentTime), 10);
 
   let inQuietHours = false;
   if (startHour > endHour) {

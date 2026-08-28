@@ -120,7 +120,7 @@ model Customer {
   email             String?
   phone             String?
   name              String?
-  contactConsent    Boolean           @default(true)
+  contactConsent    Boolean?
   optedOut          Boolean           @default(false)
   lastContactedAt   DateTime?
   metadataJson      Json?

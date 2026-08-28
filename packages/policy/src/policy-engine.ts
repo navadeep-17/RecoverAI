@@ -165,12 +165,20 @@ export class PolicyEngine implements IPolicyEngine {
     }
 
     // Quiet hours
-    const quietCheck = checkQuietHours({
-      currentTime: now,
-      timezone: context.policyConfig.quietHoursTimezone,
-      startHour: context.policyConfig.quietHoursStart,
-      endHour: context.policyConfig.quietHoursEnd,
-    });
+    let inQuietHours = false;
+    let quietHoursLocalHour = 0;
+    try {
+      const quietCheck = checkQuietHours({
+        currentTime: now,
+        timezone: context.policyConfig.quietHoursTimezone,
+        startHour: context.policyConfig.quietHoursStart,
+        endHour: context.policyConfig.quietHoursEnd,
+      });
+      inQuietHours = quietCheck.inQuietHours;
+      quietHoursLocalHour = quietCheck.localHour;
+    } catch {
+      inQuietHours = false;
+    }
 
     // High value calculation using exact Money comparison only (no parseFloat fallback)
     let isHighValue = false;
@@ -204,7 +212,8 @@ export class PolicyEngine implements IPolicyEngine {
       );
     }
 
-    const hardDecline = isHardDecline(context.diagnosisCode || context.case.diagnosisCode);
+    const verifiedCode = context.verifiedPaymentFailureCode ?? context.verifiedPaymentFacts?.gatewayErrorCode ?? null;
+    const hardDecline = isHardDecline(verifiedCode);
 
     return {
       merchantKillSwitch: context.killSwitchActive,
@@ -221,11 +230,12 @@ export class PolicyEngine implements IPolicyEngine {
       maxContactsAllowed: context.policyConfig.maxContactsPerCase,
       hoursSinceLastAction,
       cooldownHoursRequired: context.policyConfig.cooldownHoursBetweenActions,
-      inQuietHours: quietCheck.inQuietHours,
-      quietHoursLocalHour: quietCheck.localHour,
+      inQuietHours,
+      quietHoursLocalHour,
       customerOptedOut: context.customer?.optedOut ?? false,
-      customerContactConsent: context.customer?.contactConsent ?? false,
+      customerContactConsent: context.customer?.contactConsent ?? null,
       customerRecordPresent: context.customer !== null && context.customer !== undefined,
+      verifiedPaymentFailureCode: verifiedCode,
       isHardDecline: hardDecline,
       proposalConfidence: context.confidence ?? null,
       confidenceThreshold: context.policyConfig.minConfidenceThreshold,

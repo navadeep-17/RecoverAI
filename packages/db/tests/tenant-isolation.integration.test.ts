@@ -750,5 +750,68 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       expect(configB.maxRecoveryWindowDays).toBe(30);
       expect(configB.overdueGracePeriodDays).toBe(3);
     });
+
+    it('rejects invalid policy configuration inputs in PolicyConfigRepository', async () => {
+      if (!dbAvailable) return;
+
+      // Invalid timezone
+      await expect(
+        policyConfigRepo.updateConfig(merchantAId, {
+          quietHoursTimezone: 'not-a-real-timezone',
+        }),
+      ).rejects.toThrow();
+
+      // Out of range start hour
+      await expect(
+        policyConfigRepo.updateConfig(merchantAId, {
+          quietHoursStart: 99,
+        }),
+      ).rejects.toThrow();
+
+      // Negative end hour
+      await expect(
+        policyConfigRepo.updateConfig(merchantAId, {
+          quietHoursEnd: -3,
+        }),
+      ).rejects.toThrow();
+
+      // maxActionsPerCase <= 0
+      await expect(
+        policyConfigRepo.updateConfig(merchantAId, {
+          maxActionsPerCase: 0,
+        }),
+      ).rejects.toThrow();
+
+      // Malformed decimal threshold
+      await expect(
+        policyConfigRepo.updateConfig(merchantAId, {
+          highValueThreshold: '100.555',
+        }),
+      ).rejects.toThrow();
+    });
+
+    it('preserves null/unknown contact consent in CustomerRepository and isolates consent updates', async () => {
+      if (!dbAvailable) return;
+
+      // Customer created with absent consent remains null
+      const custUnknown = await customerRepo.getOrCreateCustomer(merchantAId, {
+        externalCustomerId: 'cust_unknown_consent',
+        email: 'unknown_consent@example.com',
+      });
+      expect(custUnknown.contactConsent).toBeNull();
+
+      // Explicit set to false
+      const custDenied = await customerRepo.setContactConsent(merchantAId, custUnknown.id, false);
+      expect(custDenied.contactConsent).toBe(false);
+
+      // Explicit set to true
+      const custGranted = await customerRepo.setContactConsent(merchantAId, custUnknown.id, true);
+      expect(custGranted.contactConsent).toBe(true);
+
+      // Cross-tenant update rejection
+      await expect(
+        customerRepo.setContactConsent(merchantBId, custUnknown.id, false),
+      ).rejects.toThrow();
+    });
   });
 });

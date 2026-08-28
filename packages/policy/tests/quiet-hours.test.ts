@@ -59,6 +59,48 @@ describe('Quiet Hours Verification', () => {
       expect(result.inQuietHours).toBe(false);
       expect(result.localHour).toBe(10);
     });
+
+    it('throws InvalidQuietHoursConfigurationError on invalid IANA timezone without falling back to UTC', () => {
+      const date = new Date('2026-08-28T04:30:00.000Z');
+      expect(() =>
+        checkQuietHours({
+          currentTime: date,
+          timezone: 'not-a-valid-timezone',
+          startHour: 21,
+          endHour: 9,
+        }),
+      ).toThrow();
+    });
+
+    it('throws InvalidQuietHoursConfigurationError on out-of-range start or end hours', () => {
+      const date = new Date('2026-08-28T04:30:00.000Z');
+      expect(() =>
+        checkQuietHours({
+          currentTime: date,
+          timezone: 'Asia/Kolkata',
+          startHour: -1,
+          endHour: 9,
+        }),
+      ).toThrow();
+
+      expect(() =>
+        checkQuietHours({
+          currentTime: date,
+          timezone: 'Asia/Kolkata',
+          startHour: 24,
+          endHour: 9,
+        }),
+      ).toThrow();
+
+      expect(() =>
+        checkQuietHours({
+          currentTime: date,
+          timezone: 'Asia/Kolkata',
+          startHour: 21,
+          endHour: 25,
+        }),
+      ).toThrow();
+    });
   });
 
   describe('isCustomerCommunicationAction', () => {

@@ -1,7 +1,11 @@
 import { PolicyDecision, CaseStatus, RecoveryActionType, Money } from '@recoverai/shared';
 import { isActionCompatible, isHardDecline } from '@recoverai/core';
 import { IPolicyRule, RuleResult } from './rule.interface.js';
-import { PolicyExecutionContext, PolicyEvaluatedFacts } from '../policy-types.js';
+import {
+  PolicyExecutionContext,
+  PolicyEvaluatedFacts,
+  getPolicyConfigValidationError,
+} from '../policy-types.js';
 import { PolicyReasonCodes } from '../policy-reason-codes.js';
 import { isCustomerCommunicationAction } from '../quiet-hours.js';
 
@@ -101,7 +105,18 @@ export class RequiredFactsRule implements IPolicyRule {
       };
     }
 
-    // 2. For customer-facing communication actions: require verified customer, opt-out, and consent status
+    // 2. Validate policy configuration integrity (fail closed on invalid timezone/ranges)
+    const configError = getPolicyConfigValidationError(context.policyConfig);
+    if (configError) {
+      return {
+        decision: PolicyDecision.DENY,
+        reasonCode: PolicyReasonCodes.REQUIRED_FACTS_MISSING,
+        rationale: `Policy configuration is invalid: ${configError}`,
+        violation: 'INVALID_POLICY_CONFIGURATION',
+      };
+    }
+
+    // 3. For customer-facing communication actions: require verified customer, opt-out, and consent status
     if (isCustomerCommunicationAction(context.proposedActionType)) {
       if (!context.customer) {
         return {
@@ -121,11 +136,15 @@ export class RequiredFactsRule implements IPolicyRule {
         };
       }
 
-      if (context.customer.contactConsent === undefined || typeof context.customer.contactConsent !== 'boolean') {
+      if (
+        context.customer.contactConsent === null ||
+        context.customer.contactConsent === undefined ||
+        typeof context.customer.contactConsent !== 'boolean'
+      ) {
         return {
           decision: PolicyDecision.DENY,
           reasonCode: PolicyReasonCodes.REQUIRED_FACTS_MISSING,
-          rationale: 'Customer contact consent status is unknown or unverified; unknown consent is not permission to contact.',
+          rationale: 'Customer contact consent is unknown or unverified; unknown consent is not permission to contact.',
           violation: 'UNKNOWN_CUSTOMER_CONTACT_CONSENT_STATUS',
         };
       }
@@ -213,7 +232,7 @@ export class ContactConsentRule implements IPolicyRule {
       return {
         decision: PolicyDecision.DENY,
         reasonCode: PolicyReasonCodes.CONTACT_CONSENT_MISSING,
-        rationale: 'Customer contact consent is missing or withheld; outbound messaging is forbidden.',
+        rationale: 'Customer contact consent is explicitly withheld/false; outbound messaging is forbidden.',
         violation: 'MISSING_CONTACT_CONSENT',
       };
     }
@@ -223,18 +242,31 @@ export class ContactConsentRule implements IPolicyRule {
 
 /**
  * 9. Hard Decline Blocks Payment Retry Rule
- * Exact canonical issuer declines (fraud, stolen card, closed account) forbid RETRY_PAYMENT.
+ * Evaluates AUTHORITATIVE verified provider failure code (NEVER AI diagnosis).
+ * Missing verified failure code on RETRY_PAYMENT fails closed with REQUIRED_FACTS_MISSING.
  */
 export class HardDeclineRule implements IPolicyRule {
   readonly name = 'HardDeclineRule';
   evaluate(context: PolicyExecutionContext): RuleResult | null {
     if (context.proposedActionType === RecoveryActionType.RETRY_PAYMENT) {
-      const code = context.diagnosisCode || context.case.diagnosisCode;
-      if (isHardDecline(code)) {
+      const verifiedCode =
+        context.verifiedPaymentFailureCode ??
+        context.verifiedPaymentFacts?.gatewayErrorCode;
+
+      if (!verifiedCode || !verifiedCode.trim()) {
+        return {
+          decision: PolicyDecision.DENY,
+          reasonCode: PolicyReasonCodes.REQUIRED_FACTS_MISSING,
+          rationale: 'Verified payment gateway failure code is missing; payment retries require ground-truth provider failure facts.',
+          violation: 'MISSING_VERIFIED_PAYMENT_FAILURE_CODE',
+        };
+      }
+
+      if (isHardDecline(verifiedCode)) {
         return {
           decision: PolicyDecision.DENY,
           reasonCode: PolicyReasonCodes.HARD_DECLINE_BLOCKS_RETRY,
-          rationale: `Payment failed due to hard decline ("${code || 'HARD_DECLINE'}"); automatic payment retries are strictly prohibited.`,
+          rationale: `Payment failed due to verified hard decline ("${verifiedCode}"); automatic payment retries are strictly prohibited.`,
           violation: 'HARD_DECLINE_RETRY_PROHIBITED',
         };
       }

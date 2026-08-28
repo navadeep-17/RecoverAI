@@ -33,7 +33,7 @@ export class CustomerRepository {
         email: data.email,
         phone: data.phone,
         name: data.name,
-        contactConsent: data.contactConsent ?? true,
+        contactConsent: data.contactConsent !== undefined ? data.contactConsent : null,
       },
     });
   }
@@ -46,6 +46,17 @@ export class CustomerRepository {
     return prisma.customer.update({
       where: { id: customer.id },
       data: { lastContactedAt: timestamp },
+    });
+  }
+
+  async setContactConsent(merchantId: string, customerId: string, contactConsent: boolean | null): Promise<Customer> {
+    const customer = await prisma.customer.findFirstOrThrow({
+      where: { id: customerId, merchantId },
+    });
+
+    return prisma.customer.update({
+      where: { id: customer.id },
+      data: { contactConsent },
     });
   }
 
