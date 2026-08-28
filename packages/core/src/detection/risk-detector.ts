@@ -151,7 +151,7 @@ export class RiskDetector {
     const currency = (event.currency || 'INR').toUpperCase();
     const verifiedFailureCode = event.payment?.verifiedFailureCode || null;
 
-    const newCase = await this.caseRepo.createCase(merchantId, {
+    const { case: newCase, created } = await this.caseRepo.createCaseIdempotently(merchantId, {
       customerId,
       riskType: RiskType.PAYMENT_FAILURE,
       amountAtRisk,
@@ -174,8 +174,14 @@ export class RiskDetector {
       },
     });
 
-    // If concurrent create resolved to existing case
-    if (newCase.status !== CaseStatus.OPEN) {
+    if (!created) {
+      await this.auditRepo.record(merchantId, {
+        caseId: newCase.id,
+        eventType: 'DETECTION_SKIPPED_DUPLICATE',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { incidentKey, existingCaseId: newCase.id },
+        reasonCode: 'DUPLICATE_PAYMENT_FAILURE_INCIDENT',
+      });
       return {
         riskDetected: true,
         caseCreated: false,
@@ -264,7 +270,7 @@ export class RiskDetector {
     const currency = (event.currency || 'INR').toUpperCase();
     const verifiedFailureCode = event.payment?.verifiedFailureCode || null;
 
-    const newCase = await this.caseRepo.createCase(merchantId, {
+    const { case: newCase, created } = await this.caseRepo.createCaseIdempotently(merchantId, {
       customerId,
       riskType: RiskType.SUBSCRIPTION_FAILURE,
       amountAtRisk,
@@ -282,6 +288,25 @@ export class RiskDetector {
         metadata: event.metadata,
       },
     });
+
+    if (!created) {
+      await this.auditRepo.record(merchantId, {
+        caseId: newCase.id,
+        eventType: 'DETECTION_SKIPPED_DUPLICATE',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { incidentKey, existingCaseId: newCase.id },
+        reasonCode: 'DUPLICATE_SUBSCRIPTION_FAILURE_INCIDENT',
+      });
+      return {
+        riskDetected: true,
+        caseCreated: false,
+        caseId: newCase.id,
+        case: newCase,
+        riskType: RiskType.SUBSCRIPTION_FAILURE,
+        deduplicated: true,
+        reason: 'Concurrent creation resolved to existing incident case',
+      };
+    }
 
     await this.auditRepo.record(merchantId, {
       caseId: newCase.id,
@@ -525,7 +550,7 @@ export class RiskDetector {
     const amountAtRisk = (context?.amount as string) || '0.00';
     const currency = ((context?.currency as string) || 'INR').toUpperCase();
 
-    const newCase = await this.caseRepo.createCase(merchantId, {
+    const { case: newCase, created } = await this.caseRepo.createCaseIdempotently(merchantId, {
       customerId,
       riskType: RiskType.CHECKOUT_ABANDONMENT,
       amountAtRisk,
@@ -538,6 +563,25 @@ export class RiskDetector {
         metadata: context?.metadata,
       },
     });
+
+    if (!created) {
+      await this.auditRepo.record(merchantId, {
+        caseId: newCase.id,
+        eventType: 'DETECTION_SKIPPED_DUPLICATE',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { incidentKey, existingCaseId: newCase.id },
+        reasonCode: 'DUPLICATE_CHECKOUT_ABANDONMENT_INCIDENT',
+      });
+      return {
+        riskDetected: true,
+        caseCreated: false,
+        caseId: newCase.id,
+        case: newCase,
+        riskType: RiskType.CHECKOUT_ABANDONMENT,
+        deduplicated: true,
+        reason: 'Concurrent creation resolved to existing incident case',
+      };
+    }
 
     await this.auditRepo.record(merchantId, {
       caseId: newCase.id,
@@ -770,7 +814,7 @@ export class RiskDetector {
     const amountAtRisk = (context?.amount as string) || '0.00';
     const currency = ((context?.currency as string) || 'INR').toUpperCase();
 
-    const newCase = await this.caseRepo.createCase(merchantId, {
+    const { case: newCase, created } = await this.caseRepo.createCaseIdempotently(merchantId, {
       customerId,
       riskType: RiskType.OVERDUE_RECEIVABLE,
       amountAtRisk,
@@ -784,6 +828,25 @@ export class RiskDetector {
         metadata: context?.metadata,
       },
     });
+
+    if (!created) {
+      await this.auditRepo.record(merchantId, {
+        caseId: newCase.id,
+        eventType: 'DETECTION_SKIPPED_DUPLICATE',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { incidentKey, existingCaseId: newCase.id },
+        reasonCode: 'DUPLICATE_OVERDUE_RECEIVABLE_INCIDENT',
+      });
+      return {
+        riskDetected: true,
+        caseCreated: false,
+        caseId: newCase.id,
+        case: newCase,
+        riskType: RiskType.OVERDUE_RECEIVABLE,
+        deduplicated: true,
+        reason: 'Concurrent creation resolved to existing incident case',
+      };
+    }
 
     await this.auditRepo.record(merchantId, {
       caseId: newCase.id,

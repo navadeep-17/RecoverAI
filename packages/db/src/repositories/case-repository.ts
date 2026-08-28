@@ -67,8 +67,13 @@ export interface CaseTransitionOptions {
   nextEvaluationAt?: Date | null;
 }
 
+export interface CreateCaseResult {
+  case: RevenueRiskCase;
+  created: boolean;
+}
+
 export class CaseRepository {
-  async createCase(merchantId: string, params: CreateCaseParams): Promise<RevenueRiskCase> {
+  async createCaseIdempotently(merchantId: string, params: CreateCaseParams): Promise<CreateCaseResult> {
     // If customerId is provided, enforce customer-case tenant consistency
     if (params.customerId) {
       await prisma.customer.findFirstOrThrow({
@@ -93,7 +98,7 @@ export class CaseRepository {
     }
 
     try {
-      return await prisma.revenueRiskCase.create({
+      const insertedCase = await prisma.revenueRiskCase.create({
         data: {
           id: params.id,
           merchantId,
@@ -107,6 +112,10 @@ export class CaseRepository {
           nextEvaluationAt: params.nextEvaluationAt,
         },
       });
+      return {
+        case: insertedCase,
+        created: true,
+      };
     } catch (err: unknown) {
       if (
         err &&
@@ -115,7 +124,7 @@ export class CaseRepository {
         (err as { code: string }).code === 'P2002' &&
         params.incidentKey
       ) {
-        return prisma.revenueRiskCase.findUniqueOrThrow({
+        const existingIncidentCase = await prisma.revenueRiskCase.findUniqueOrThrow({
           where: {
             merchantId_incidentKey: {
               merchantId,
@@ -123,9 +132,18 @@ export class CaseRepository {
             },
           },
         });
+        return {
+          case: existingIncidentCase,
+          created: false,
+        };
       }
       throw err;
     }
+  }
+
+  async createCase(merchantId: string, params: CreateCaseParams): Promise<RevenueRiskCase> {
+    const result = await this.createCaseIdempotently(merchantId, params);
+    return result.case;
   }
 
   async getCaseById(merchantId: string, caseId: string): Promise<RevenueRiskCase | null> {

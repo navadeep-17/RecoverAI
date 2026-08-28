@@ -50,7 +50,17 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
     const inMemoryEvents: any[] = [];
 
     mockCaseRepo = {
-      createCase: vi.fn(async (mId: string, params: any) => {
+      createCaseIdempotently: vi.fn(async (mId: string, params: any) => {
+        if (params.incidentKey) {
+          for (const c of inMemoryCases.values()) {
+            if (
+              c.merchantId === mId &&
+              (c.incidentKey === params.incidentKey || c.contextJson?.incidentKey === params.incidentKey)
+            ) {
+              return { case: c, created: false };
+            }
+          }
+        }
         const id = params.id || `case_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
         const record = {
           id,
@@ -60,6 +70,7 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
           amountAtRisk: params.amountAtRisk,
           currency: params.currency || 'INR',
           status: CaseStatus.OPEN,
+          incidentKey: params.incidentKey,
           contextJson: params.contextJson,
           openedAt: new Date(),
           recoveredAmount: null,
@@ -68,7 +79,11 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
           updatedAt: new Date(),
         };
         inMemoryCases.set(id, record);
-        return record;
+        return { case: record, created: true };
+      }),
+      createCase: vi.fn(async (mId: string, params: any) => {
+        const res = await (mockCaseRepo as any).createCaseIdempotently(mId, params);
+        return res.case;
       }),
       compareAndSetStatus: vi.fn(async (mId: string, caseId: string, expected: CaseStatus, next: CaseStatus, opts: any) => {
         const existing = inMemoryCases.get(caseId);
@@ -654,6 +669,64 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
       expect(result.scheduledJobId).toBeUndefined();
       expect(scheduledJobs.length).toBe(0);
       expect(result.reason).toContain('Invalid overdueGracePeriodDays');
+    });
+
+    it('handles created vs existing case outcome explicitly without status inference', async () => {
+      const paymentId = 'pay_concurrent_unit_01';
+      const event1: NormalizedMerchantEvent = {
+        merchantId,
+        source: MerchantEventSource.RAZORPAY,
+        eventType: NormalizedEventType.PAYMENT_FAILED,
+        occurredAt: new Date(),
+        dedupeKey: `razorpay:${merchantId}:evt1:payment.failed`,
+        payment: {
+          paymentId,
+          verifiedFailureCode: 'BAD_REQUEST_ERROR',
+        },
+        amount: '1200.00',
+        currency: 'INR',
+      };
+
+      const event2: NormalizedMerchantEvent = {
+        merchantId,
+        source: MerchantEventSource.RAZORPAY,
+        eventType: NormalizedEventType.PAYMENT_FAILED,
+        occurredAt: new Date(),
+        dedupeKey: `razorpay:${merchantId}:evt2:payment.failed`,
+        payment: {
+          paymentId,
+          verifiedFailureCode: 'BAD_REQUEST_ERROR',
+        },
+        amount: '1200.00',
+        currency: 'INR',
+      };
+
+      // First delivery creates the case
+      const res1 = await riskDetector.handleNormalizedEvent(event1);
+      expect(res1.riskDetected).toBe(true);
+      expect(res1.caseCreated).toBe(true);
+      expect(res1.deduplicated).toBeFalsy();
+      expect(res1.caseId).toBeDefined();
+
+      // Second delivery for same incident resolves to existing case (created === false)
+      const res2 = await riskDetector.handleNormalizedEvent(event2);
+      expect(res2.riskDetected).toBe(true);
+      expect(res2.caseCreated).toBe(false);
+      expect(res2.deduplicated).toBe(true);
+      expect(res2.caseId).toBe(res1.caseId);
+
+      // Verify audit trail: exactly ONE RISK_DETECTED and ONE DETECTION_SKIPPED_DUPLICATE
+      const audits = (mockAuditRepo.record as any).mock.calls;
+      const riskDetectedCalls = audits.filter(
+        (call: any[]) => call[1].eventType === 'RISK_DETECTED' && call[1].caseId === res1.caseId,
+      );
+      const duplicateCalls = audits.filter(
+        (call: any[]) => call[1].eventType === 'DETECTION_SKIPPED_DUPLICATE' && call[1].caseId === res1.caseId,
+      );
+
+      expect(riskDetectedCalls.length).toBe(1);
+      expect(duplicateCalls.length).toBe(1);
+      expect(duplicateCalls[0][1].reasonCode).toBe('DUPLICATE_PAYMENT_FAILURE_INCIDENT');
     });
   });
 });
