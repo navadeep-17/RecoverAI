@@ -172,7 +172,7 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       ).rejects.toThrow(InvalidCaseStateTransitionError);
     });
 
-    it('enforces atomic optimistic concurrency (CAS) and rejects stale concurrent transitions', async () => {
+    it('enforces atomic optimistic concurrency (CAS) and throws CaseStateConflictError on stale concurrent modification', async () => {
       if (!dbAvailable) return;
 
       // 1. Initial state: OPEN
@@ -183,21 +183,21 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       });
       expect(c.status).toBe(CaseStatus.OPEN);
 
-      // 2. Simulate concurrent Worker A committing OPEN -> RECOVERED
-      const recovered = await caseRepo.updateCaseStatus(merchantAId, c.id, CaseStatus.RECOVERED, {
-        recoveredAmount: '3500.00',
-      });
-      expect(recovered.status).toBe(CaseStatus.RECOVERED);
+      // 2. Simulate concurrent Worker B changing the database row from OPEN -> WAITING
+      const waiting = await caseRepo.updateCaseStatus(merchantAId, c.id, CaseStatus.WAITING);
+      expect(waiting.status).toBe(CaseStatus.WAITING);
 
-      // 3. Stale concurrent operation attempted by another worker based on old OPEN snapshot
-      // Attempting to transition to WAITING fails because DB row is already RECOVERED
+      // 3. Worker A (holding stale expectedStatus: OPEN) attempts CAS update OPEN -> RECOVERED
+      // Because the row in the DB is now WAITING, updateMany affects 0 rows and throws CaseStateConflictError
       await expect(
-        caseRepo.updateCaseStatus(merchantAId, c.id, CaseStatus.WAITING),
-      ).rejects.toThrow(InvalidCaseStateTransitionError);
+        caseRepo.compareAndSetStatus(merchantAId, c.id, CaseStatus.OPEN, CaseStatus.RECOVERED, {
+          recoveredAmount: '3500.00',
+        }),
+      ).rejects.toThrow(CaseStateConflictError);
 
-      // 4. Verify persisted state remains securely RECOVERED
-      const finalCase = await caseRepo.getCaseById(merchantAId, c.id);
-      expect(finalCase?.status).toBe(CaseStatus.RECOVERED);
+      // 4. Verify newer database state is preserved (remains WAITING) and was not overwritten
+      const persistedCase = await caseRepo.getCaseById(merchantAId, c.id);
+      expect(persistedCase?.status).toBe(CaseStatus.WAITING);
     });
   });
 
@@ -310,7 +310,7 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       ).rejects.toThrow(InvalidMoneyError);
     });
 
-    it('enforces currency consistency between Money and explicit case currency', async () => {
+    it('enforces currency consistency between Money and explicit case currency at creation', async () => {
       if (!dbAvailable) return;
 
       // Money(INR) + currency INR -> ACCEPT
@@ -341,6 +341,66 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
           contextJson: {},
         }),
       ).rejects.toThrow(CurrencyMismatchError);
+    });
+
+    it('enforces currency consistency on updateCaseStatus recoveredAmount', async () => {
+      if (!dbAvailable) return;
+
+      const caseInr = await caseRepo.createCase(merchantAId, {
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: '2000.00',
+        currency: 'INR',
+        contextJson: {},
+      });
+      expect(caseInr.currency).toBe('INR');
+
+      // INR case + Money("100.00", USD) recoveredAmount -> REJECT
+      await expect(
+        caseRepo.updateCaseStatus(merchantAId, caseInr.id, CaseStatus.RECOVERED, {
+          recoveredAmount: Money.fromDecimalString('100.00', 'USD'),
+        }),
+      ).rejects.toThrow(CurrencyMismatchError);
+
+      // Verify case was not updated
+      const freshCase = await caseRepo.getCaseById(merchantAId, caseInr.id);
+      expect(freshCase?.status).toBe(CaseStatus.OPEN);
+      expect(freshCase?.recoveredAmount).toBeNull();
+
+      // INR case + Money("100.00", INR) recoveredAmount -> ACCEPT
+      const updated = await caseRepo.updateCaseStatus(merchantAId, caseInr.id, CaseStatus.RECOVERED, {
+        recoveredAmount: Money.fromDecimalString('100.00', 'INR'),
+      });
+      expect(updated.status).toBe(CaseStatus.RECOVERED);
+      expect(updated.recoveredAmount?.toString()).toBe('100');
+    });
+
+    it('enforces currency consistency on recordOutcome amountRecovered', async () => {
+      if (!dbAvailable) return;
+
+      const caseInr = await caseRepo.createCase(merchantAId, {
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: '5000.00',
+        currency: 'INR',
+        contextJson: {},
+      });
+
+      // INR case + Money("50.00", USD) RecoveryOutcome -> REJECT
+      await expect(
+        caseRepo.recordOutcome(merchantAId, caseInr.id, {
+          outcomeType: 'PAYMENT_RECEIVED',
+          amountRecovered: Money.fromDecimalString('50.00', 'USD'),
+        }),
+      ).rejects.toThrow(CurrencyMismatchError);
+
+      const outcomes = await prisma.recoveryOutcome.findMany({ where: { caseId: caseInr.id } });
+      expect(outcomes.length).toBe(0);
+
+      // INR case + Money("50.00", INR) RecoveryOutcome -> ACCEPT
+      const outcome = await caseRepo.recordOutcome(merchantAId, caseInr.id, {
+        outcomeType: 'PAYMENT_RECEIVED',
+        amountRecovered: Money.fromDecimalString('50.00', 'INR'),
+      });
+      expect(outcome.amountRecovered?.toString()).toBe('50');
     });
   });
 
@@ -614,7 +674,7 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       const updated = await policyConfigRepo.updateConfig(merchantAId, {
         maxRetriesPerCase: 5,
         reviewFirstMode: true,
-        highValueThreshold: Money.fromDecimalString('75000.00'),
+        highValueThreshold: '75000.00',
       });
 
       expect(updated.maxRetriesPerCase).toBe(5);

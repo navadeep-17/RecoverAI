@@ -1,6 +1,8 @@
 import { Prisma, PolicyConfig } from '@prisma/client';
 import { prisma } from '../client.js';
-import { ExactMonetaryInput, toPrismaDecimal } from './case-repository.js';
+import { toPrismaDecimal } from './case-repository.js';
+
+export type PolicyThresholdInput = string | Prisma.Decimal;
 
 export class PolicyConfigRepository {
   async getOrCreateConfig(merchantId: string): Promise<PolicyConfig> {
@@ -32,7 +34,7 @@ export class PolicyConfigRepository {
       maxRetriesPerCase: number;
       maxContactsPerCase: number;
       cooldownHoursBetweenActions: number;
-      highValueThreshold: ExactMonetaryInput;
+      highValueThreshold: PolicyThresholdInput;
       minConfidenceThreshold: number;
       reviewFirstMode: boolean;
       checkoutAbandonmentThresholdMinutes: number;

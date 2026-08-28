@@ -133,30 +133,42 @@ export class CaseRepository {
     });
   }
 
-  async updateCaseStatus(
+  /**
+   * Atomic Compare-And-Set (CAS) case status transition.
+   * Validates legal transition from expectedStatus -> nextStatus and updates only if
+   * the database row is still in expectedStatus under tenant scope.
+   */
+  async compareAndSetStatus(
     merchantId: string,
     caseId: string,
+    expectedStatus: CaseStatus,
     nextStatus: CaseStatus,
     options?: {
       recoveredAmount?: ExactMonetaryInput;
       resolvedAt?: Date;
       nextEvaluationAt?: Date | null;
+      caseCurrency?: string;
     },
   ): Promise<RevenueRiskCase> {
-    // 1. Assert tenant ownership and load current status
-    const currentCase = await prisma.revenueRiskCase.findFirstOrThrow({
-      where: { id: caseId, merchantId },
-    });
+    // 1. Enforce canonical domain state-machine transition validator
+    validateCaseTransition(expectedStatus, nextStatus, caseId);
 
-    // 2. Enforce canonical domain state-machine transition validator
-    validateCaseTransition(currentCase.status, nextStatus, caseId);
+    // 2. Validate recoveredAmount currency consistency if supplied as Money
+    if (options?.recoveredAmount instanceof Money) {
+      const caseCurrency = options.caseCurrency || (await this.getCaseCurrency(merchantId, caseId));
+      if (options.recoveredAmount.currency !== caseCurrency) {
+        throw new CurrencyMismatchError(
+          `Recovered amount currency "${options.recoveredAmount.currency}" does not match case currency "${caseCurrency}"`,
+        );
+      }
+    }
 
-    // 3. Perform atomic Compare-And-Set (CAS) update conditioned on current status
+    // 3. Perform atomic Compare-And-Set (CAS) update conditioned on expectedStatus
     const updateResult = await prisma.revenueRiskCase.updateMany({
       where: {
         id: caseId,
         merchantId,
-        status: currentCase.status, // Atomic CAS invariant
+        status: expectedStatus, // Atomic CAS invariant
       },
       data: {
         status: nextStatus,
@@ -171,9 +183,9 @@ export class CaseRepository {
     // 4. If affected row count is 0, a concurrent operation modified the case state
     if (updateResult.count === 0) {
       throw new CaseStateConflictError(
-        `Concurrent modification conflict on case ${caseId}: expected status was ${currentCase.status} but row was modified concurrently`,
+        `Concurrent modification conflict on case ${caseId}: expected status was ${expectedStatus} but row was modified concurrently`,
         caseId,
-        currentCase.status,
+        expectedStatus,
         nextStatus,
       );
     }
@@ -182,6 +194,35 @@ export class CaseRepository {
     return prisma.revenueRiskCase.findUniqueOrThrow({
       where: { id: caseId },
     });
+  }
+
+  async updateCaseStatus(
+    merchantId: string,
+    caseId: string,
+    nextStatus: CaseStatus,
+    options?: {
+      recoveredAmount?: ExactMonetaryInput;
+      resolvedAt?: Date;
+      nextEvaluationAt?: Date | null;
+    },
+  ): Promise<RevenueRiskCase> {
+    // Assert tenant ownership and load current status & currency
+    const currentCase = await prisma.revenueRiskCase.findFirstOrThrow({
+      where: { id: caseId, merchantId },
+    });
+
+    return this.compareAndSetStatus(merchantId, caseId, currentCase.status, nextStatus, {
+      ...options,
+      caseCurrency: currentCase.currency,
+    });
+  }
+
+  private async getCaseCurrency(merchantId: string, caseId: string): Promise<string> {
+    const record = await prisma.revenueRiskCase.findFirstOrThrow({
+      where: { id: caseId, merchantId },
+      select: { currency: true },
+    });
+    return record.currency;
   }
 
   async addPlanVersion(
@@ -277,10 +318,19 @@ export class CaseRepository {
       detailsJson?: Record<string, unknown>;
     },
   ): Promise<RecoveryOutcome> {
-    // Assert tenant ownership of parent case
-    await prisma.revenueRiskCase.findFirstOrThrow({
+    // Assert tenant ownership of parent case and load case currency
+    const parentCase = await prisma.revenueRiskCase.findFirstOrThrow({
       where: { id: caseId, merchantId },
     });
+
+    // Enforce currency consistency if amountRecovered is Money
+    if (data.amountRecovered instanceof Money) {
+      if (data.amountRecovered.currency !== parentCase.currency) {
+        throw new CurrencyMismatchError(
+          `RecoveryOutcome amountRecovered currency "${data.amountRecovered.currency}" does not match case currency "${parentCase.currency}"`,
+        );
+      }
+    }
 
     if (data.actionId) {
       await prisma.recoveryAction.findFirstOrThrow({
