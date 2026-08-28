@@ -10,6 +10,22 @@ export class HumanReviewRepository {
       reasonForReview: string;
     },
   ): Promise<HumanReview> {
+    // Assert tenant ownership of the case
+    await prisma.revenueRiskCase.findFirstOrThrow({
+      where: { id: data.caseId, merchantId },
+    });
+
+    // If actionId is supplied, assert that action belongs to this case and merchant
+    if (data.actionId) {
+      await prisma.recoveryAction.findFirstOrThrow({
+        where: {
+          id: data.actionId,
+          caseId: data.caseId,
+          case: { merchantId },
+        },
+      });
+    }
+
     return prisma.humanReview.create({
       data: {
         merchantId,
@@ -53,6 +69,11 @@ export class HumanReviewRepository {
     if (existing.status !== ReviewStatus.PENDING) {
       throw new Error(`Human review ${reviewId} has already been resolved with status ${existing.status}`);
     }
+
+    // Verify reviewer belongs to the same merchant
+    await prisma.user.findFirstOrThrow({
+      where: { id: data.reviewerId, merchantId },
+    });
 
     return prisma.humanReview.update({
       where: { id: reviewId },

@@ -11,6 +11,7 @@ import {
   ActionExecutionStatus,
 } from '@prisma/client';
 import { prisma } from '../client.js';
+import { validateCaseTransition } from '@recoverai/core';
 
 export interface CreateCaseParams {
   id?: string;
@@ -89,10 +90,13 @@ export class CaseRepository {
       nextEvaluationAt?: Date | null;
     },
   ): Promise<RevenueRiskCase> {
-    // Assert tenant ownership
-    await prisma.revenueRiskCase.findFirstOrThrow({
+    // Assert tenant ownership and fetch current status
+    const currentCase = await prisma.revenueRiskCase.findFirstOrThrow({
       where: { id: caseId, merchantId },
     });
+
+    // Enforce canonical domain state-machine transition validator
+    validateCaseTransition(currentCase.status, nextStatus, caseId);
 
     return prisma.revenueRiskCase.update({
       where: { id: caseId },
@@ -108,6 +112,7 @@ export class CaseRepository {
   }
 
   async addPlanVersion(
+    merchantId: string,
     caseId: string,
     data: {
       version: number;
@@ -122,6 +127,11 @@ export class CaseRepository {
       shouldEscalate?: boolean;
     },
   ): Promise<RecoveryPlanVersion> {
+    // Assert tenant ownership of parent case
+    await prisma.revenueRiskCase.findFirstOrThrow({
+      where: { id: caseId, merchantId },
+    });
+
     return prisma.recoveryPlanVersion.create({
       data: {
         caseId,
@@ -140,6 +150,7 @@ export class CaseRepository {
   }
 
   async recordAction(
+    merchantId: string,
     caseId: string,
     data: {
       planVersionId?: string;
@@ -154,6 +165,17 @@ export class CaseRepository {
       executionMetadata?: Record<string, unknown>;
     },
   ): Promise<RecoveryAction> {
+    // Assert tenant ownership of parent case
+    await prisma.revenueRiskCase.findFirstOrThrow({
+      where: { id: caseId, merchantId },
+    });
+
+    if (data.planVersionId) {
+      await prisma.recoveryPlanVersion.findFirstOrThrow({
+        where: { id: data.planVersionId, caseId },
+      });
+    }
+
     return prisma.recoveryAction.create({
       data: {
         caseId,
@@ -172,6 +194,7 @@ export class CaseRepository {
   }
 
   async recordOutcome(
+    merchantId: string,
     caseId: string,
     data: {
       actionId?: string;
@@ -181,6 +204,23 @@ export class CaseRepository {
       detailsJson?: Record<string, unknown>;
     },
   ): Promise<RecoveryOutcome> {
+    // Assert tenant ownership of parent case
+    await prisma.revenueRiskCase.findFirstOrThrow({
+      where: { id: caseId, merchantId },
+    });
+
+    if (data.actionId) {
+      await prisma.recoveryAction.findFirstOrThrow({
+        where: { id: data.actionId, caseId },
+      });
+    }
+
+    if (data.merchantEventId) {
+      await prisma.merchantEvent.findFirstOrThrow({
+        where: { id: data.merchantEventId, merchantId },
+      });
+    }
+
     return prisma.recoveryOutcome.create({
       data: {
         caseId,

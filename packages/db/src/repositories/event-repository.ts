@@ -33,8 +33,14 @@ export class EventRepository {
         'code' in err &&
         (err as { code: string }).code === 'P2002'
       ) {
+        // Enforce tenant-scoped duplicate recovery
         const existing = await prisma.merchantEvent.findUniqueOrThrow({
-          where: { dedupeKey: data.dedupeKey },
+          where: {
+            merchantId_dedupeKey: {
+              merchantId,
+              dedupeKey: data.dedupeKey,
+            },
+          },
         });
         return { created: false, event: existing };
       }

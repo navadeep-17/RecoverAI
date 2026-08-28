@@ -1,119 +1,136 @@
-/**
- * Safe monetary calculations using integer paise to avoid IEEE-754 floating-point errors.
- */
+export class InvalidMoneyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidMoneyError';
+  }
+}
+
+export class CurrencyMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CurrencyMismatchError';
+  }
+}
 
 export class Money {
-  private readonly amountInPaise: bigint;
-  public readonly currency: string;
+  private readonly _paise: bigint;
+  private readonly _currency: string;
 
-  constructor(amountInPaise: bigint | number | string, currency = 'INR') {
-    this.currency = currency.toUpperCase();
-    if (typeof amountInPaise === 'bigint') {
-      this.amountInPaise = amountInPaise;
-    } else if (typeof amountInPaise === 'number') {
-      if (!Number.isInteger(amountInPaise)) {
-        throw new Error(`Monetary amount in paise must be an integer, received: ${amountInPaise}`);
-      }
-      this.amountInPaise = BigInt(amountInPaise);
-    } else if (typeof amountInPaise === 'string') {
-      if (!/^-?\d+$/.test(amountInPaise)) {
-        throw new Error(`Invalid string representation of paise: ${amountInPaise}`);
-      }
-      this.amountInPaise = BigInt(amountInPaise);
-    } else {
-      throw new Error('Unsupported paise amount type');
+  private constructor(paise: bigint, currency = 'INR') {
+    if (paise < 0n) {
+      throw new InvalidMoneyError('Monetary amounts in RecoverAI must be non-negative');
     }
+    this._paise = paise;
+    this._currency = currency.toUpperCase();
   }
 
-  /**
-   * Create Money from decimal rupees (e.g. "14999.50" or 14999)
-   */
-  static fromRupees(rupees: number | string, currency = 'INR'): Money {
-    if (typeof rupees === 'number') {
-      if (isNaN(rupees) || !isFinite(rupees)) {
-        throw new Error(`Invalid rupee amount: ${rupees}`);
+  get currency(): string {
+    return this._currency;
+  }
+
+  static fromPaise(paise: number | bigint, currency = 'INR'): Money {
+    if (typeof paise === 'number') {
+      if (!Number.isInteger(paise)) {
+        throw new InvalidMoneyError(`Paise must be an integer, received float: ${paise}`);
       }
-      const paise = Math.round(rupees * 100);
-      return new Money(paise, currency);
+      if (!Number.isSafeInteger(paise)) {
+        throw new InvalidMoneyError(`Paise exceeds safe integer limit: ${paise}`);
+      }
+      if (paise < 0) {
+        throw new InvalidMoneyError(`Paise cannot be negative, received: ${paise}`);
+      }
+      return new Money(BigInt(paise), currency);
+    }
+    if (paise < 0n) {
+      throw new InvalidMoneyError('Paise cannot be negative');
+    }
+    return new Money(paise, currency);
+  }
+
+  static fromDecimalString(amountStr: string, currency = 'INR'): Money {
+    const trimmed = amountStr.trim();
+    if (!trimmed) {
+      throw new InvalidMoneyError('Monetary amount string cannot be empty');
     }
 
-    const trimmed = rupees.trim();
-    if (!/^-?\d+(\.\d{1,2})?$/.test(trimmed)) {
-      throw new Error(`Invalid decimal rupee string: ${rupees}`);
+    const decimalRegex = /^([0-9]+)(?:.([0-9]{1,2}))?$/;
+    const match = decimalRegex.exec(trimmed);
+
+    if (!match) {
+      throw new InvalidMoneyError(
+        `Invalid monetary decimal string: "${trimmed}". Must be non-negative with at most 2 decimal places.`,
+      );
     }
 
-    const [integerPart, fractionalPart = ''] = trimmed.split('.');
-    const paddedFraction = (fractionalPart + '00').slice(0, 2);
-    const sign = integerPart.startsWith('-') ? -1n : 1n;
-    const absInteger = BigInt(integerPart.replace('-', ''));
-    const totalPaise = sign * (absInteger * 100n + BigInt(paddedFraction));
+    const wholePart = BigInt(match[1]);
+    const fractionPart = match[2] || '';
+    const paddedFraction = fractionPart.padEnd(2, '0');
+    const paisePart = BigInt(paddedFraction);
 
+    const totalPaise = wholePart * 100n + paisePart;
     return new Money(totalPaise, currency);
   }
 
-  get paise(): bigint {
-    return this.amountInPaise;
+  toPaise(): bigint {
+    return this._paise;
   }
 
-  get paiseNumber(): number {
-    return Number(this.amountInPaise);
+  toPaiseNumber(): number {
+    if (this._paise > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new InvalidMoneyError('Paise amount exceeds JavaScript MAX_SAFE_INTEGER');
+    }
+    return Number(this._paise);
   }
 
-  /**
-   * Returns exact decimal rupee string (e.g. "14999.00")
-   */
   toDecimalString(): string {
-    const isNegative = this.amountInPaise < 0n;
-    const absPaise = isNegative ? -this.amountInPaise : this.amountInPaise;
-    const rupees = absPaise / 100n;
-    const remainder = absPaise % 100n;
-    const formattedFraction = remainder.toString().padStart(2, '0');
-    return `${isNegative ? '-' : ''}${rupees.toString()}.${formattedFraction}`;
+    const whole = this._paise / 100n;
+    const fraction = this._paise % 100n;
+    return `${whole}.${fraction.toString().padStart(2, '0')}`;
   }
 
-  /**
-   * Formats for display (e.g. ₹14,999.00)
-   */
   toFormattedString(): string {
-    const dec = parseFloat(this.toDecimalString());
-    return new Intl.NumberFormat('en-IN', {
-      style: 'currency',
-      currency: this.currency,
+    const dec = this.toDecimalString();
+    const symbol = this._currency === 'INR' ? '₹' : `${this._currency} `;
+    return `${symbol}${Number(dec).toLocaleString('en-IN', {
       minimumFractionDigits: 2,
-    }).format(dec);
+      maximumFractionDigits: 2,
+    })}`;
   }
 
   add(other: Money): Money {
-    this.assertMatchingCurrency(other);
-    return new Money(this.amountInPaise + other.amountInPaise, this.currency);
+    this.assertSameCurrency(other);
+    return new Money(this._paise + other._paise, this._currency);
   }
 
   subtract(other: Money): Money {
-    this.assertMatchingCurrency(other);
-    return new Money(this.amountInPaise - other.amountInPaise, this.currency);
+    this.assertSameCurrency(other);
+    if (this._paise < other._paise) {
+      throw new InvalidMoneyError(
+        `Cannot subtract ${other.toDecimalString()} from ${this.toDecimalString()}: negative result not allowed`,
+      );
+    }
+    return new Money(this._paise - other._paise, this._currency);
   }
 
-  isGreaterThan(other: Money): boolean {
-    this.assertMatchingCurrency(other);
-    return this.amountInPaise > other.amountInPaise;
+  equals(other: Money): boolean {
+    return this._currency === other._currency && this._paise === other._paise;
   }
 
-  isLessThan(other: Money): boolean {
-    this.assertMatchingCurrency(other);
-    return this.amountInPaise < other.amountInPaise;
+  greaterThan(other: Money): boolean {
+    this.assertSameCurrency(other);
+    return this._paise > other._paise;
   }
 
-  isZero(): boolean {
-    return this.amountInPaise === 0n;
+  lessThan(other: Money): boolean {
+    this.assertSameCurrency(other);
+    return this._paise < other._paise;
   }
 
-  isPositive(): boolean {
-    return this.amountInPaise > 0n;
-  }
-
-  private assertMatchingCurrency(other: Money): void {
-    if (this.currency !== other.currency) {
-      throw new Error(`Currency mismatch: ${this.currency} vs ${other.currency}`);
+  private assertSameCurrency(other: Money): void {
+    if (this._currency !== other._currency) {
+      throw new CurrencyMismatchError(
+        `Cannot operate between currencies ${this._currency} and ${other._currency}`,
+      );
     }
   }
 }

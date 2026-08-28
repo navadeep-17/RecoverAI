@@ -143,12 +143,13 @@ model MerchantEvent {
   type            String
   occurredAt      DateTime
   receivedAt      DateTime          @default(now())
-  dedupeKey       String            @unique
+  dedupeKey       String
   payloadJson     Json
 
   merchant        Merchant          @relation(fields: [merchantId], references: [id], onDelete: Cascade)
   outcomes        RecoveryOutcome[]
 
+  @@unique([merchantId, dedupeKey])
   @@index([merchantId, type])
   @@map("merchant_events")
 }
