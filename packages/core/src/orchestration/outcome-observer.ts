@@ -424,9 +424,10 @@ export class OutcomeObserver {
           if (!hasScheduledJob) {
             // Repair the missing schedule for THIS specific commitment!
             try {
-              await this.jobScheduler.schedule({
+              const schedResult = await this.jobScheduler.schedule({
                 merchantId,
                 caseId,
+                jobKey: `promise-check:${pendingCommitment.id}`,
                 jobType: 'PROMISE_TO_PAY_CHECK',
                 scheduledFor: pendingCommitment.promisedDate,
                 payloadJson: {
@@ -438,16 +439,18 @@ export class OutcomeObserver {
                 },
               });
 
-              await this.auditRepo.record(merchantId, {
-                caseId,
-                eventType: 'SCHEDULING_REPAIRED',
-                actorType: AuditActorType.SYSTEM,
-                inputSummaryJson: {
-                  commitmentId: pendingCommitment.id,
-                  messageId,
-                },
-                reasonCode: 'PROMISE_TIMER_SCHEDULE_REPAIRED',
-              });
+              if (schedResult.created !== false) {
+                await this.auditRepo.record(merchantId, {
+                  caseId,
+                  eventType: 'SCHEDULING_REPAIRED',
+                  actorType: AuditActorType.SYSTEM,
+                  inputSummaryJson: {
+                    commitmentId: pendingCommitment.id,
+                    messageId,
+                  },
+                  reasonCode: 'PROMISE_TIMER_SCHEDULE_REPAIRED',
+                });
+              }
 
               return {
                 observed: true,
@@ -486,6 +489,7 @@ export class OutcomeObserver {
         await this.jobScheduler.schedule({
           merchantId,
           caseId,
+          jobKey: `promise-check:${commitment.id}`,
           jobType: 'PROMISE_TO_PAY_CHECK',
           scheduledFor: promisedDate,
           payloadJson: {
@@ -747,6 +751,7 @@ export class OutcomeObserver {
             await this.jobScheduler.schedule({
               merchantId,
               caseId,
+              jobKey: `promise-check:${commitment.id}:rescheduled`,
               jobType: 'PROMISE_TO_PAY_CHECK',
               scheduledFor: commitment.promisedDate,
               payloadJson: {

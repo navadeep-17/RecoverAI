@@ -79,15 +79,19 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       const triggerRepo = new TriggerRepository();
       const jobScheduler = {
         schedule: async (params: any) => {
-          const job = await scheduledJobRepo.createJob(params.merchantId, {
+          const { created, job } = await scheduledJobRepo.createJob(params.merchantId, {
             caseId: params.caseId,
+            jobKey: params.jobKey,
             jobType: params.jobType,
             scheduledFor: params.scheduledFor,
             payloadJson: params.payloadJson,
           });
+          if (!created) {
+            return { id: job.id, pgBossJobId: job.pgBossJobId || undefined, created: false };
+          }
           const pgBossJobId = `pgboss_${job.id}`;
           await scheduledJobRepo.updateJobStatus(params.merchantId, job.id, 'SCHEDULED', pgBossJobId);
-          return { id: job.id, pgBossJobId };
+          return { id: job.id, pgBossJobId, created: true };
         },
       };
 
@@ -671,7 +675,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     });
 
     // 2. Create authoritative ScheduledJob in DB
-    const job = await scheduledJobRepo.createJob(merchantId, {
+    const { job } = await scheduledJobRepo.createJob(merchantId, {
       caseId: testCase.id,
       jobType: 'PROMISE_TO_PAY_CHECK',
       scheduledFor: futureDate,
@@ -821,7 +825,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     });
 
     // ScheduledJob in DB points explicitly to Commitment A
-    const job = await scheduledJobRepo.createJob(merchantId, {
+    const { job } = await scheduledJobRepo.createJob(merchantId, {
       caseId: testCase.id,
       jobType: 'PROMISE_TO_PAY_CHECK',
       scheduledFor: pastDate,
@@ -910,6 +914,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     });
     expect(jobsInDb.length).toBe(1);
     expect((jobsInDb[0].payloadJson as any)?.commitmentId).toBe(commitmentsInDb[0].id);
+    expect(jobsInDb[0].jobKey).toBe(`promise-check:${commitmentsInDb[0].id}`);
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -1051,7 +1056,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       extractedFromText: 'Pay 50000 later',
     });
 
-    const earlyJob = await scheduledJobRepo.createJob(merchantId, {
+    const { job: earlyJob } = await scheduledJobRepo.createJob(merchantId, {
       caseId: testCase.id,
       jobType: 'PROMISE_TO_PAY_CHECK',
       scheduledFor: new Date(Date.now() - 1000), // premature dispatch
@@ -1092,7 +1097,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     expect(jobs.length).toBeGreaterThanOrEqual(1);
 
     // 2. Due timer fires at or after futureDate
-    const dueJob = await scheduledJobRepo.createJob(merchantId, {
+    const { job: dueJob } = await scheduledJobRepo.createJob(merchantId, {
       caseId: testCase.id,
       jobType: 'PROMISE_TO_PAY_CHECK',
       scheduledFor: futureDate,

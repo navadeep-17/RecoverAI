@@ -172,7 +172,7 @@ describe('OutcomeObserver Unit Tests', () => {
       createJob: vi.fn(async (_mId: string, data: any) => {
         const job = { id: `job_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`, merchantId: _mId, ...data, status: 'SCHEDULED' };
         inMemoryScheduledJobs.set(job.id, job);
-        return job;
+        return { created: true, job };
       }),
     };
 
@@ -184,7 +184,7 @@ describe('OutcomeObserver Unit Tests', () => {
           status: 'SCHEDULED',
         };
         inMemoryScheduledJobs.set(job.id, job);
-        return job;
+        return { id: job.id, created: true };
       }),
     };
 

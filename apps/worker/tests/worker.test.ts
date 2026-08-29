@@ -44,7 +44,7 @@ describe('RecoveryWorkerService Unit Tests', () => {
           status: 'PENDING_DISPATCH',
           ...params,
         };
-        return jobRecord;
+        return { created: true, job: jobRecord };
       },
       updateJobStatus: async (merchantId: string, jobId: string, status: string, pgBossJobId?: string) => {
         jobRecord.status = status;
@@ -65,8 +65,8 @@ describe('RecoveryWorkerService Unit Tests', () => {
     const result = await scheduler.schedule({
       merchantId: 'mch_01',
       jobType: 'CHECKOUT_ABANDONMENT_CHECK',
-      scheduledFor: new Date(Date.now() + 1800000),
-      payloadJson: { test: true },
+      scheduledFor: new Date(Date.now() + 60000),
+      payloadJson: { checkoutId: 'chk_123' },
     });
 
     expect(result.id).toBe('job_local_01');
@@ -91,7 +91,7 @@ describe('RecoveryWorkerService Unit Tests', () => {
           status: 'PENDING_DISPATCH',
           ...params,
         };
-        return jobRecord;
+        return { created: true, job: jobRecord };
       },
       updateJobStatus: async (merchantId: string, jobId: string, status: string) => {
         jobRecord.status = status;

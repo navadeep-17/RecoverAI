@@ -9,21 +9,24 @@ export class PgBossJobScheduler implements IJobScheduler {
     private scheduledJobRepo: ScheduledJobRepository,
   ) {}
 
-  async schedule(params: ScheduleJobParams): Promise<{ id: string; pgBossJobId: string }> {
-    // 1. Persist ScheduledJob row in PostgreSQL with initial PENDING_DISPATCH status
-    const jobRecord = await this.scheduledJobRepo.createJob(params.merchantId, {
+  async schedule(params: ScheduleJobParams): Promise<{ id: string; pgBossJobId?: string; created: boolean }> {
+    // 1. Persist ScheduledJob row in PostgreSQL idempotently
+    const { created, job: jobRecord } = await this.scheduledJobRepo.createJob(params.merchantId, {
       caseId: params.caseId,
+      jobKey: params.jobKey,
       jobType: params.jobType,
       scheduledFor: params.scheduledFor,
       payloadJson: params.payloadJson,
     });
 
-    // Explicitly record initial status PENDING_DISPATCH
-    await this.scheduledJobRepo.updateJobStatus(
-      params.merchantId,
-      jobRecord.id,
-      'PENDING_DISPATCH',
-    );
+    // If another concurrent caller already created this ScheduledJob, return the existing authoritative job
+    if (!created) {
+      return {
+        id: jobRecord.id,
+        pgBossJobId: jobRecord.pgBossJobId || undefined,
+        created: false,
+      };
+    }
 
     // 2. Schedule with pg-boss using startAfter delay
     const now = Date.now();
@@ -40,6 +43,7 @@ export class PgBossJobScheduler implements IJobScheduler {
         },
         {
           startAfter: diffSeconds,
+          singletonKey: params.jobKey || undefined,
         },
       );
 
@@ -55,7 +59,7 @@ export class PgBossJobScheduler implements IJobScheduler {
         pgBossJobId,
       );
 
-      return { id: jobRecord.id, pgBossJobId };
+      return { id: jobRecord.id, pgBossJobId, created: true };
     } catch (err: unknown) {
       // 4. On failure, mark DB record as FAILED and fail closed
       await this.scheduledJobRepo.updateJobStatus(

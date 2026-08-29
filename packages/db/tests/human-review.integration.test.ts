@@ -197,12 +197,12 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
 
   // Helper to create customer and case in DB
   async function createTestCase(mId: string, overrides: Partial<Prisma.RevenueRiskCaseCreateInput> = {}) {
-    const customer = await customerRepo.createCustomer(mId, {
+    const customer = await customerRepo.getOrCreateCustomer(mId, {
+      externalCustomerId: `cust_ext_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       name: 'Integration Customer',
       email: `cust_${Date.now()}_${Math.random().toString(36).substring(2, 6)}@example.com`,
       phone: '+919876543210',
       contactConsent: true,
-      optedOut: false,
     });
 
     const c = await caseRepo.createCase(mId, {

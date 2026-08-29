@@ -394,6 +394,7 @@ model ScheduledJob {
   id             String          @id @default(uuid())
   merchantId     String
   caseId         String?
+  jobKey         String?
   jobType        String
   pgBossJobId    String?
   scheduledFor   DateTime
@@ -405,6 +406,7 @@ model ScheduledJob {
   merchant       Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
   case           RevenueRiskCase? @relation(fields: [caseId], references: [id], onDelete: SetNull)
 
+  @@unique([merchantId, jobKey])
   @@index([merchantId, status])
   @@index([caseId])
   @@index([scheduledFor, status])

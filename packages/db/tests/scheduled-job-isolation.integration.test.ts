@@ -53,7 +53,7 @@ describe('ScheduledJob Tenant Isolation & Lifecycle Integration Tests', () => {
     if (!dbAvailable) return;
 
     const scheduledFor = new Date(Date.now() + 30 * 60 * 1000);
-    const jobA = await scheduledJobRepo.createJob(merchantAId, {
+    const { job: jobA } = await scheduledJobRepo.createJob(merchantAId, {
       jobType: 'CHECKOUT_ABANDONMENT_CHECK',
       scheduledFor,
       payloadJson: { checkoutSessionId: 'sess_iso_1' },
@@ -86,7 +86,7 @@ describe('ScheduledJob Tenant Isolation & Lifecycle Integration Tests', () => {
   it('rejects cross-tenant scheduled job status updates', async () => {
     if (!dbAvailable) return;
 
-    const jobA = await scheduledJobRepo.createJob(merchantAId, {
+    const { job: jobA } = await scheduledJobRepo.createJob(merchantAId, {
       jobType: 'INVOICE_OVERDUE_CHECK',
       scheduledFor: new Date(Date.now() + 60 * 60 * 1000),
       payloadJson: { invoiceId: 'inv_iso_1' },

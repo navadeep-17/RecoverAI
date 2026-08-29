@@ -3,28 +3,59 @@ import { prisma } from '../client.js';
 
 export interface CreateScheduledJobParams {
   caseId?: string;
+  jobKey?: string;
   jobType: string;
   scheduledFor: Date;
   payloadJson: Record<string, unknown>;
   pgBossJobId?: string;
 }
 
+export interface CreateScheduledJobResult {
+  created: boolean;
+  job: ScheduledJob;
+}
+
 export class ScheduledJobRepository {
   async createJob(
     merchantId: string,
     params: CreateScheduledJobParams,
-  ): Promise<ScheduledJob> {
-    return prisma.scheduledJob.create({
-      data: {
-        merchantId,
-        caseId: params.caseId,
-        jobType: params.jobType,
-        pgBossJobId: params.pgBossJobId,
-        scheduledFor: params.scheduledFor,
-        status: 'PENDING_DISPATCH',
-        payloadJson: params.payloadJson as Prisma.InputJsonValue,
-      },
-    });
+  ): Promise<CreateScheduledJobResult> {
+    try {
+      const job = await prisma.scheduledJob.create({
+        data: {
+          merchantId,
+          caseId: params.caseId,
+          jobKey: params.jobKey || null,
+          jobType: params.jobType,
+          pgBossJobId: params.pgBossJobId,
+          scheduledFor: params.scheduledFor,
+          status: 'PENDING_DISPATCH',
+          payloadJson: params.payloadJson as Prisma.InputJsonValue,
+        },
+      });
+      return { created: true, job };
+    } catch (err: unknown) {
+      if (
+        params.jobKey &&
+        err &&
+        typeof err === 'object' &&
+        'code' in err &&
+        (err as { code: string }).code === 'P2002'
+      ) {
+        const existing = await prisma.scheduledJob.findUnique({
+          where: {
+            merchantId_jobKey: {
+              merchantId,
+              jobKey: params.jobKey,
+            },
+          },
+        });
+        if (existing) {
+          return { created: false, job: existing };
+        }
+      }
+      throw err;
+    }
   }
 
   async getJobById(merchantId: string, jobId: string): Promise<ScheduledJob | null> {
