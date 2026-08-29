@@ -102,11 +102,13 @@ describe('pg-boss Real Integration Smoke Test', () => {
     });
     const merchantId = mch.id;
 
+    const paymentId = `pay_pgboss_${Date.now()}`;
     const testCase = await caseRepo.createCase(merchantId, {
       riskType: RiskType.PAYMENT_FAILURE,
       amountAtRisk: '9999.00',
       currency: 'INR',
-      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_pgboss_${Date.now()}`,
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'BAD_REQUEST_ERROR' },
     });
 
     const passedDate = new Date(Date.now() - 5000); // 5s in the past so timer is eligible

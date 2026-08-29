@@ -74,19 +74,6 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       simulatedProvider = new SimulatedRecoveryProvider();
       providerRegistry = new ProviderRegistry([simulatedProvider]);
 
-      actionExecutor = new ActionExecutor({
-        actionRepo,
-        caseRepo,
-        merchantRepo,
-        customerRepo,
-        auditRepo,
-        policyConfigRepo,
-        commitmentRepo,
-        policyEngine,
-        providerRegistry,
-        clock: () => new Date('2026-08-28T14:00:00+05:30'),
-      });
-
       const scheduledJobRepo = new ScheduledJobRepository();
       const triggerRepo = new TriggerRepository();
       const jobScheduler = {
@@ -102,6 +89,20 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
           return { id: job.id, pgBossJobId };
         },
       };
+
+      actionExecutor = new ActionExecutor({
+        actionRepo,
+        caseRepo,
+        merchantRepo,
+        customerRepo,
+        auditRepo,
+        policyConfigRepo,
+        commitmentRepo,
+        policyEngine,
+        providerRegistry,
+        jobScheduler,
+        clock: () => new Date('2026-08-28T14:00:00+05:30'),
+      });
 
       orchestrator = new RecoveryOrchestrator({
         caseRepo,
@@ -168,7 +169,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       amountAtRisk: '14999.00',
       currency: 'INR',
       incidentKey: `${merchantId}:SUBSCRIPTION_FAILURE:${paymentId}`,
-      contextJson: { verifiedPaymentFailureCode: 'CARD_EXPIRED' },
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'CARD_EXPIRED' },
     });
 
     // 2. Iteration 1: Agent diagnoses expired card -> proposes REQUEST_PAYMENT_UPDATE
@@ -206,6 +207,14 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       },
     };
 
+    const persistedMethodRecord = await eventRepo.recordEvent(merchantId, {
+      source: MerchantEventSource.MERCHANT,
+      eventType: NormalizedEventType.PAYMENT_METHOD_UPDATED,
+      externalEventId: `ext_method_${paymentId}`,
+      payloadJson: methodUpdatedEvent,
+      occurredAt: new Date(),
+    });
+
     // When observer wakes orchestrator, configure LLM to propose RETRY_PAYMENT for iteration 2
     mockLLM.setMockResponse({
       diagnosisCode: 'CARD_CREDENTIALS_UPDATED',
@@ -219,7 +228,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       shouldEscalate: false,
     });
 
-    const observationResult = await observer.observeMerchantEvent(methodUpdatedEvent);
+    const observationResult = await observer.observeMerchantEvent(methodUpdatedEvent, persistedMethodRecord.id);
 
     expect(observationResult.observed).toBe(true);
     expect(observationResult.replanTriggered).toBe(true);
@@ -244,7 +253,15 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       },
     };
 
-    const successObsResult = await observer.observeMerchantEvent(successEvent);
+    const persistedSuccessRecord = await eventRepo.recordEvent(merchantId, {
+      source: MerchantEventSource.RAZORPAY,
+      eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+      externalEventId: `ext_succ_${paymentId}`,
+      payloadJson: successEvent,
+      occurredAt: new Date(),
+    });
+
+    const successObsResult = await observer.observeMerchantEvent(successEvent, persistedSuccessRecord.id);
 
     expect(successObsResult.observed).toBe(true);
     expect(successObsResult.caseResolved).toBe(true);
@@ -253,7 +270,8 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     // Verify case in DB is RECOVERED with exact ₹14,999.00
     const finalDbCase = await caseRepo.getCaseById(merchantId, testCase.id);
     expect(finalDbCase?.status).toBe(CaseStatus.RECOVERED);
-    expect(finalDbCase?.recoveredAmount?.toString()).toBe('14999.00');
+    expect(finalDbCase?.recoveredAmount).toBeDefined();
+    expect(new prisma.Prisma.Decimal(finalDbCase!.recoveredAmount!).equals(new prisma.Prisma.Decimal('14999.00'))).toBe(true);
 
     // Verify authoritative RecoveryOutcome was recorded
     const outcomes = await outcomeRepo.listOutcomesByCase(merchantId, testCase.id);
@@ -305,7 +323,15 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       },
     };
 
-    const obsResult = await observer.observeMerchantEvent(checkoutCompletedEvent);
+    const persistedCheckoutRecord = await eventRepo.recordEvent(merchantId, {
+      source: MerchantEventSource.MERCHANT,
+      eventType: NormalizedEventType.CHECKOUT_COMPLETED,
+      externalEventId: `ext_chk_${checkoutSessionId}`,
+      payloadJson: checkoutCompletedEvent,
+      occurredAt: new Date(),
+    });
+
+    const obsResult = await observer.observeMerchantEvent(checkoutCompletedEvent, persistedCheckoutRecord.id);
 
     expect(obsResult.observed).toBe(true);
     expect(obsResult.caseResolved).toBe(true);
@@ -314,7 +340,8 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     // Verify case in database is RECOVERED with exact ₹8,499.00
     const finalDbCase = await caseRepo.getCaseById(merchantId, testCase.id);
     expect(finalDbCase?.status).toBe(CaseStatus.RECOVERED);
-    expect(finalDbCase?.recoveredAmount?.toString()).toBe('8499.00');
+    expect(finalDbCase?.recoveredAmount).toBeDefined();
+    expect(new prisma.Prisma.Decimal(finalDbCase!.recoveredAmount!).equals(new prisma.Prisma.Decimal('8499.00'))).toBe(true);
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -374,9 +401,15 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const commitments = await commitmentRepo.getActiveCommitmentsForCase(merchantId, testCase.id);
     expect(commitments.length).toBe(1);
     expect(commitments[0].status).toBe('PENDING');
-    expect(commitments[0].promisedAmount.toString()).toBe('85000.00');
+    expect(new prisma.Prisma.Decimal(commitments[0].promisedAmount).equals(new prisma.Prisma.Decimal('85000.00'))).toBe(true);
 
-    // 3. Friday timer fires and case is still unpaid -> commitment marked BROKEN -> wakes orchestrator
+    // 3. Retrieve authoritative ScheduledJob created by observeCustomerReply
+    const scheduledJobRepo = new ScheduledJobRepository();
+    const caseJobs = await scheduledJobRepo.listJobsByCase(merchantId, testCase.id);
+    expect(caseJobs.length).toBeGreaterThan(0);
+    const promiseCheckJob = caseJobs.find((j) => j.jobType === 'PROMISE_TO_PAY_CHECK') || caseJobs[0];
+
+    // Friday timer fires and case is still unpaid -> commitment marked BROKEN -> wakes orchestrator
     mockLLM.setMockResponse({
       diagnosisCode: 'PROMISE_BROKEN_FOLLOWUP',
       diagnosisSummary: 'Promised date passed unpaid; try follow up reminder',
@@ -391,9 +424,10 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const timerResult = await observer.observeTimerFired({
       merchantId,
       caseId: testCase.id,
-      scheduledJobId: `job_flowb_timer_${Date.now()}`,
+      scheduledJobId: promiseCheckJob.id,
       timerType: 'PROMISE_TO_PAY_CHECK',
       payload: { commitmentId: commitments[0].id },
+      occurredAt: new Date(Date.now() + 86400000 * 7),
     });
 
     expect(timerResult.observed).toBe(true);
@@ -424,7 +458,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       amountAtRisk: '5000.00',
       currency: 'INR',
       incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
-      contextJson: { verifiedPaymentFailureCode: 'BAD_REQUEST' },
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'BAD_REQUEST' },
     });
 
     const paymentEvent: any = {
@@ -440,19 +474,28 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       },
     };
 
+    const sharedEventRecord = await eventRepo.recordEvent(merchantId, {
+      source: MerchantEventSource.RAZORPAY,
+      eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+      externalEventId: `ext_conc_${paymentId}`,
+      payloadJson: paymentEvent,
+      occurredAt: new Date(),
+    });
+
     // Concurrently observe the exact same payment event across 5 workers
     const results = await Promise.all([
-      observer.observeMerchantEvent(paymentEvent, 'shared_event_db_id'),
-      observer.observeMerchantEvent(paymentEvent, 'shared_event_db_id'),
-      observer.observeMerchantEvent(paymentEvent, 'shared_event_db_id'),
-      observer.observeMerchantEvent(paymentEvent, 'shared_event_db_id'),
-      observer.observeMerchantEvent(paymentEvent, 'shared_event_db_id'),
+      observer.observeMerchantEvent(paymentEvent, sharedEventRecord.id),
+      observer.observeMerchantEvent(paymentEvent, sharedEventRecord.id),
+      observer.observeMerchantEvent(paymentEvent, sharedEventRecord.id),
+      observer.observeMerchantEvent(paymentEvent, sharedEventRecord.id),
+      observer.observeMerchantEvent(paymentEvent, sharedEventRecord.id),
     ]);
 
     // Case is RECOVERED
     const finalCase = await caseRepo.getCaseById(merchantId, testCase.id);
     expect(finalCase?.status).toBe(CaseStatus.RECOVERED);
-    expect(finalCase?.recoveredAmount?.toString()).toBe('5000.00');
+    expect(finalCase?.recoveredAmount).toBeDefined();
+    expect(new prisma.Prisma.Decimal(finalCase!.recoveredAmount!).equals(new prisma.Prisma.Decimal('5000.00'))).toBe(true);
 
     // Exactly ONE outcome was recorded in database (no duplicate credit)
     const outcomesInDb = await outcomeRepo.listOutcomesByCase(merchantId, testCase.id);
@@ -469,12 +512,13 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   it('CONCURRENCY & IDEMPOTENCY: 5 concurrent replan wakes claim trigger atomically with exactly 1 agent proposal', async () => {
     if (!dbAvailable) return;
 
+    const paymentId = `pay_replan_${Date.now()}`;
     const testCase = await caseRepo.createCase(merchantId, {
       riskType: RiskType.PAYMENT_FAILURE,
       amountAtRisk: '3000.00',
       currency: 'INR',
-      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_replan_${Date.now()}`,
-      contextJson: { verifiedPaymentFailureCode: 'TEMPORARY_NETWORK_ERROR' },
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'TEMPORARY_NETWORK_ERROR' },
     });
 
     mockLLM.setMockResponse({
@@ -517,11 +561,13 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   it('CRASH RECOVERY: Trigger with expired lease is atomically reclaimed via DB CAS with attemptCount incremented', async () => {
     if (!dbAvailable) return;
 
+    const paymentId = `pay_crash_${Date.now()}`;
     const testCase = await caseRepo.createCase(merchantId, {
       riskType: RiskType.PAYMENT_FAILURE,
       amountAtRisk: '4000.00',
       currency: 'INR',
-      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_crash_${Date.now()}`,
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'BAD_REQUEST' },
     });
 
     const triggerRepo = new TriggerRepository();
@@ -577,11 +623,13 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   it('AUTHORITATIVE TIMERS: OutcomeObserver enforces PostgreSQL ScheduledJob existence, tenant boundary, and non-early delivery', async () => {
     if (!dbAvailable) return;
 
+    const paymentId = `pay_timer_auth_${Date.now()}`;
     const testCase = await caseRepo.createCase(merchantId, {
       riskType: RiskType.PAYMENT_FAILURE,
       amountAtRisk: '7500.00',
       currency: 'INR',
-      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_timer_auth_${Date.now()}`,
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'BAD_REQUEST' },
     });
 
     const scheduledJobRepo = new ScheduledJobRepository();
@@ -652,11 +700,13 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   it('LEASE FENCING: Stale worker with expired lease cannot complete trigger reclaimed by newer worker', async () => {
     if (!dbAvailable) return;
 
+    const paymentId = `pay_fencing_${Date.now()}`;
     const testCase = await caseRepo.createCase(merchantId, {
       riskType: RiskType.PAYMENT_FAILURE,
       amountAtRisk: '3000.00',
       currency: 'INR',
-      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_fencing_${Date.now()}`,
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'BAD_REQUEST' },
     });
 
     const triggerKey = `FENCING_TEST:${Date.now()}`;
@@ -716,11 +766,13 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   it('PAYLOAD AUTHORITY: Rejects timer if caller transport commitmentId does not match authoritative ScheduledJob commitmentId', async () => {
     if (!dbAvailable) return;
 
+    const paymentId = `pay_mismatch_${Date.now()}`;
     const testCase = await caseRepo.createCase(merchantId, {
       riskType: RiskType.PAYMENT_FAILURE,
       amountAtRisk: '8000.00',
       currency: 'INR',
-      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_mismatch_${Date.now()}`,
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'BAD_REQUEST' },
     });
 
     const scheduledJobRepo = new ScheduledJobRepository();

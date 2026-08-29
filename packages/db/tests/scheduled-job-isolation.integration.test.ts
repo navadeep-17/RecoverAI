@@ -62,7 +62,7 @@ describe('ScheduledJob Tenant Isolation & Lifecycle Integration Tests', () => {
 
     expect(jobA.id).toBeDefined();
     expect(jobA.merchantId).toBe(merchantAId);
-    expect(jobA.status).toBe('SCHEDULED');
+    expect(jobA.status).toBe('PENDING_DISPATCH');
 
     // Merchant A can query the job
     const fetchedA = await scheduledJobRepo.getJobById(merchantAId, jobA.id);

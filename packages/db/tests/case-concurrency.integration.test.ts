@@ -36,13 +36,13 @@ describe("Case Concurrent Creation & Unique Incident Key Invariants", () => {
       auditRepo = new AuditRepository();
       policyConfigRepo = new PolicyConfigRepository();
 
-      riskDetector = new RiskDetector({
+      riskDetector = new RiskDetector(
         caseRepo,
-        eventRepo,
         customerRepo,
-        auditRepo,
         policyConfigRepo,
-      });
+        auditRepo,
+        eventRepo,
+      );
 
       const mchA = await merchantRepo.createMerchant({
         name: 'Merchant Case Concurrency A',
@@ -182,6 +182,7 @@ describe("Case Concurrent Creation & Unique Incident Key Invariants", () => {
       amountAtRisk: '500.00',
       currency: 'INR',
       incidentKey: sharedIncidentKey,
+      contextJson: { incidentKey: sharedIncidentKey },
     });
 
     const resB = await caseRepo.createCaseIdempotently(merchantBId, {
@@ -189,6 +190,7 @@ describe("Case Concurrent Creation & Unique Incident Key Invariants", () => {
       amountAtRisk: '500.00',
       currency: 'INR',
       incidentKey: sharedIncidentKey,
+      contextJson: { incidentKey: sharedIncidentKey },
     });
 
     expect(resA.created).toBe(true);

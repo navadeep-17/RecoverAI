@@ -850,6 +850,10 @@ export class OutcomeObserver {
       const paymentIncidentKey = generateIncidentKey(merchantId, RiskType.PAYMENT_FAILURE, paymentId);
       const c = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, paymentIncidentKey);
       if (c) return c;
+
+      const subPaymentIncidentKey = generateIncidentKey(merchantId, RiskType.SUBSCRIPTION_FAILURE, paymentId);
+      const cSub = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, subPaymentIncidentKey);
+      if (cSub) return cSub;
     }
 
     if (subscriptionId) {
