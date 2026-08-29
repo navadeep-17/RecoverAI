@@ -1,4 +1,4 @@
-﻿-- AlterTable
+-- AlterTable
 ALTER TABLE "human_reviews" ADD COLUMN "reviewKey" TEXT;
 
 -- CreateIndex
