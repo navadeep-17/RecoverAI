@@ -762,23 +762,33 @@ export class OutcomeObserver {
         reasonCode: 'PROMISE_DATE_EXPIRED_UNPAID',
       });
 
-      // Wake orchestrator to replan / escalate
-      let replanTriggered = false;
-      if (this.orchestrator && (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING)) {
-        await this.orchestrator.runIteration(merchantId, caseId, {
-          triggerKey: `TIMER:${scheduledJobId}`,
-          triggerType: 'TIMER_FIRED',
-          scheduledJobId,
-        });
-        replanTriggered = true;
+      // Transition case to NEEDS_REVIEW
+      if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
+        await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
       }
+
+      // Emit canonical CASE_ESCALATED audit with reasonCode BROKEN_PROMISE_TO_PAY
+      await this.auditRepo.record(merchantId, {
+        caseId,
+        eventType: 'CASE_ESCALATED',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: {
+          commitmentId,
+          scheduledJobId,
+          caseId,
+          promisedDate: commitment.promisedDate.toISOString(),
+          promisedAmount: commitment.promisedAmount.toString(),
+          outcomeId: outcomeResult.outcome.id,
+        },
+        reasonCode: 'BROKEN_PROMISE_TO_PAY',
+      });
 
       return {
         observed: true,
         outcome: outcomeResult.outcome,
         caseId,
-        caseStatus: matchedCase.status,
-        replanTriggered,
+        caseStatus: CaseStatus.NEEDS_REVIEW,
+        replanTriggered: false,
       };
     }
 
@@ -841,14 +851,24 @@ export class OutcomeObserver {
     merchantId: string,
     event: NormalizedMerchantEvent,
   ): Promise<RevenueRiskCase | null> {
-    const rawEvent = event as Record<string, unknown>;
-    const rawPayment = (rawEvent.payment as Record<string, unknown>) || {};
-    const paymentId = (event.payment?.paymentId || rawPayment.paymentId || rawEvent.paymentId) as string | undefined;
-    const subscriptionId = (event.payment?.subscriptionId || rawPayment.subscriptionId || rawEvent.subscriptionId) as string | undefined;
-    const checkoutSessionId = (event.checkout?.checkoutSessionId || (rawEvent.checkout as Record<string, unknown>)?.checkoutSessionId || rawEvent.checkoutSessionId) as string | undefined;
-    const invoiceId = (event.invoice?.invoiceId || (rawEvent.invoice as Record<string, unknown>)?.invoiceId || rawEvent.invoiceId) as string | undefined;
+    const raw = event as unknown as Record<string, unknown>;
+
+    const paymentObj =
+      raw.payment && typeof raw.payment === 'object'
+        ? (raw.payment as Record<string, unknown>)
+        : undefined;
+
+    const paymentId =
+      typeof raw.paymentId === 'string'
+        ? raw.paymentId
+        : typeof paymentObj?.paymentId === 'string'
+          ? (paymentObj.paymentId as string)
+          : undefined;
 
     if (paymentId) {
+      const byPayment = await this.caseRepo.findActiveCaseByPaymentId(merchantId, paymentId);
+      if (byPayment) return byPayment;
+
       const paymentIncidentKey = generateIncidentKey(merchantId, RiskType.PAYMENT_FAILURE, paymentId);
       const c = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, paymentIncidentKey);
       if (c) return c;
@@ -856,11 +876,14 @@ export class OutcomeObserver {
       const subPaymentIncidentKey = generateIncidentKey(merchantId, RiskType.SUBSCRIPTION_FAILURE, paymentId);
       const cSub = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, subPaymentIncidentKey);
       if (cSub) return cSub;
-
-      // Context-aware payment correlation
-      const cByPayment = await this.caseRepo.findActiveCaseByPaymentId(merchantId, paymentId);
-      if (cByPayment) return cByPayment;
     }
+
+    const subscriptionId =
+      typeof raw.subscriptionId === 'string'
+        ? raw.subscriptionId
+        : typeof paymentObj?.subscriptionId === 'string'
+          ? (paymentObj.subscriptionId as string)
+          : undefined;
 
     if (subscriptionId) {
       const subIncidentKey = generateIncidentKey(merchantId, RiskType.SUBSCRIPTION_FAILURE, subscriptionId);
@@ -868,11 +891,35 @@ export class OutcomeObserver {
       if (c) return c;
     }
 
+    const checkoutObj =
+      raw.checkout && typeof raw.checkout === 'object'
+        ? (raw.checkout as Record<string, unknown>)
+        : undefined;
+
+    const checkoutSessionId =
+      typeof raw.checkoutSessionId === 'string'
+        ? raw.checkoutSessionId
+        : typeof checkoutObj?.checkoutSessionId === 'string'
+          ? (checkoutObj.checkoutSessionId as string)
+          : undefined;
+
     if (checkoutSessionId) {
       const checkoutIncidentKey = generateIncidentKey(merchantId, RiskType.CHECKOUT_ABANDONMENT, checkoutSessionId);
       const c = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, checkoutIncidentKey);
       if (c) return c;
     }
+
+    const invoiceObj =
+      raw.invoice && typeof raw.invoice === 'object'
+        ? (raw.invoice as Record<string, unknown>)
+        : undefined;
+
+    const invoiceId =
+      typeof raw.invoiceId === 'string'
+        ? raw.invoiceId
+        : typeof invoiceObj?.invoiceId === 'string'
+          ? (invoiceObj.invoiceId as string)
+          : undefined;
 
     if (invoiceId) {
       const invoiceIncidentKey = generateIncidentKey(merchantId, RiskType.OVERDUE_RECEIVABLE, invoiceId);

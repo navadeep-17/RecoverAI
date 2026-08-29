@@ -59,6 +59,13 @@ describe('OutcomeObserver Unit Tests', () => {
           (c) => c.incidentKey === incidentKey,
         ) || null;
       }),
+      findActiveCaseByPaymentId: vi.fn(async (_mId: string, paymentId: string) => {
+        return Array.from(inMemoryCases.values()).find(
+          (c) =>
+            c.incidentKey?.includes(paymentId) ||
+            c.contextJson?.paymentId === paymentId,
+        ) || null;
+      }),
       compareAndSetStatus: vi.fn(
         async (_mId: string, cId: string, expected: CaseStatus, next: CaseStatus, options?: any) => {
           const c = inMemoryCases.get(cId);
@@ -445,7 +452,7 @@ describe('OutcomeObserver Unit Tests', () => {
       expect(inMemoryAudits.some((a) => a.eventType === 'PROMISE_WITHOUT_DATE_RECEIVED')).toBe(true);
     });
 
-    it('PROMISE_TO_PAY_CHECK timer on unpaid case marks commitment BROKEN and wakes orchestrator', async () => {
+    it('PROMISE_TO_PAY_CHECK timer on unpaid case marks commitment BROKEN, transitions to NEEDS_REVIEW, and emits CASE_ESCALATED audit', async () => {
       // Create pending commitment whose promisedDate has passed relative to test clock (2026-08-28T14:00:00+05:30)
       inMemoryCommitments.set('cmt_01', {
         id: 'cmt_01',
@@ -473,6 +480,7 @@ describe('OutcomeObserver Unit Tests', () => {
       });
 
       expect(result.observed).toBe(true);
+      expect(result.caseStatus).toBe(CaseStatus.NEEDS_REVIEW);
       expect(mockCommitmentRepo.updateCommitmentStatus).toHaveBeenCalledWith(
         merchantId,
         caseId,
@@ -481,11 +489,8 @@ describe('OutcomeObserver Unit Tests', () => {
       );
 
       expect(inMemoryOutcomes.some((o) => o.outcomeType === 'PROMISE_TO_PAY_BROKEN')).toBe(true);
-      expect(mockOrchestrator.runIteration).toHaveBeenCalledWith(
-        merchantId,
-        caseId,
-        expect.objectContaining({ triggerType: 'TIMER_FIRED' }),
-      );
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.NEEDS_REVIEW);
+      expect(inMemoryAudits.some((a) => a.eventType === 'CASE_ESCALATED' && a.reasonCode === 'BROKEN_PROMISE_TO_PAY')).toBe(true);
     });
 
     it('early timer delivery is rejected without breaking commitment', async () => {
@@ -706,6 +711,82 @@ describe('OutcomeObserver Unit Tests', () => {
           }),
         }),
       );
+    });
+
+    it('correlates SUBSCRIPTION_FAILURE case by payment.paymentId and resolves case on PAYMENT_SUCCEEDED', async () => {
+      const subPaymentId = 'pay_sub_test_999';
+      const subCaseId = 'case_sub_test_999';
+
+      inMemoryCases.set(subCaseId, {
+        id: subCaseId,
+        merchantId,
+        customerId,
+        riskType: RiskType.SUBSCRIPTION_FAILURE,
+        amountAtRisk: { toString: () => '14999.00' },
+        currency: 'INR',
+        status: CaseStatus.WAITING,
+        incidentKey: `${merchantId}:SUBSCRIPTION_FAILURE:${subPaymentId}`,
+        contextJson: { paymentId: subPaymentId },
+      });
+
+      const successEvent: any = {
+        eventId: 'evt_succ_sub_999',
+        merchantId,
+        source: MerchantEventSource.RAZORPAY,
+        eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+        occurredAt: new Date(),
+        amount: '14999.00',
+        currency: 'INR',
+        payment: {
+          paymentId: subPaymentId,
+        },
+      };
+
+      const result = await observer.observeMerchantEvent(successEvent, 'merchant_evt_999');
+
+      expect(result.observed).toBe(true);
+      expect(result.caseResolved).toBe(true);
+      expect(result.caseStatus).toBe(CaseStatus.RECOVERED);
+
+      const resolvedCase = inMemoryCases.get(subCaseId);
+      expect(resolvedCase.status).toBe(CaseStatus.RECOVERED);
+    });
+
+    it('emits CASE_ESCALATED audit event when PROMISE_TO_PAY_CHECK timer marks commitment BROKEN', async () => {
+      const pJobId = 'job_promise_broken_01';
+      const pCmtId = 'cmt_broken_01';
+
+      inMemoryCommitments.set(pCmtId, {
+        id: pCmtId,
+        caseId,
+        merchantId,
+        status: 'PENDING',
+        promisedAmount: { toString: () => '85000.00' },
+        promisedDate: new Date(Date.now() - 3600000), // in the past
+      });
+
+      inMemoryScheduledJobs.set(pJobId, {
+        id: pJobId,
+        merchantId,
+        caseId,
+        jobType: 'PROMISE_TO_PAY_CHECK',
+        payloadJson: { commitmentId: pCmtId },
+      });
+
+      const timerResult = await observer.observeTimerFired({
+        merchantId,
+        caseId,
+        scheduledJobId: pJobId,
+        timerType: 'PROMISE_TO_PAY_CHECK',
+        occurredAt: new Date(),
+      });
+
+      expect(timerResult.observed).toBe(true);
+      expect(timerResult.caseStatus).toBe(CaseStatus.NEEDS_REVIEW);
+
+      const escalatedAudit = inMemoryAudits.find((a) => a.eventType === 'CASE_ESCALATED');
+      expect(escalatedAudit).toBeDefined();
+      expect(escalatedAudit.reasonCode).toBe('BROKEN_PROMISE_TO_PAY');
     });
   });
 });
