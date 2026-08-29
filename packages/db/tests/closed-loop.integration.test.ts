@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { Prisma } from '@prisma/client';
 import {
   prisma,
   ActionRepository,
@@ -273,7 +274,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const finalDbCase = await caseRepo.getCaseById(merchantId, testCase.id);
     expect(finalDbCase?.status).toBe(CaseStatus.RECOVERED);
     expect(finalDbCase?.recoveredAmount).toBeDefined();
-    expect(new prisma.Prisma.Decimal(finalDbCase!.recoveredAmount!).equals(new prisma.Prisma.Decimal('14999.00'))).toBe(true);
+    expect(new Prisma.Decimal(finalDbCase!.recoveredAmount!).equals(new Prisma.Decimal('14999.00'))).toBe(true);
 
     // Verify authoritative RecoveryOutcome was recorded
     const outcomes = await outcomeRepo.listOutcomesByCase(merchantId, testCase.id);
@@ -352,7 +353,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const finalDbCase = await caseRepo.getCaseById(merchantId, testCase.id);
     expect(finalDbCase?.status).toBe(CaseStatus.RECOVERED);
     expect(finalDbCase?.recoveredAmount).toBeDefined();
-    expect(new prisma.Prisma.Decimal(finalDbCase!.recoveredAmount!).equals(new prisma.Prisma.Decimal('8499.00'))).toBe(true);
+    expect(new Prisma.Decimal(finalDbCase!.recoveredAmount!).equals(new Prisma.Decimal('8499.00'))).toBe(true);
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -419,7 +420,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const commitments = await commitmentRepo.getActiveCommitmentsForCase(merchantId, testCase.id);
     expect(commitments.length).toBe(1);
     expect(commitments[0].status).toBe('PENDING');
-    expect(new prisma.Prisma.Decimal(commitments[0].promisedAmount).equals(new prisma.Prisma.Decimal('85000.00'))).toBe(true);
+    expect(commitments[0].promisedAmount.equals(new Prisma.Decimal('85000.00'))).toBe(true);
 
     // 3. Retrieve authoritative ScheduledJob created by observeCustomerReply
     const scheduledJobRepo = new ScheduledJobRepository();
@@ -514,7 +515,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const finalCase = await caseRepo.getCaseById(merchantId, testCase.id);
     expect(finalCase?.status).toBe(CaseStatus.RECOVERED);
     expect(finalCase?.recoveredAmount).toBeDefined();
-    expect(new prisma.Prisma.Decimal(finalCase!.recoveredAmount!).equals(new prisma.Prisma.Decimal('5000.00'))).toBe(true);
+    expect(new Prisma.Decimal(finalCase!.recoveredAmount!).equals(new Prisma.Decimal('5000.00'))).toBe(true);
 
     // Exactly ONE outcome was recorded in database (no duplicate credit)
     const outcomesInDb = await outcomeRepo.listOutcomesByCase(merchantId, testCase.id);

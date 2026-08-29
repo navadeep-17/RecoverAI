@@ -841,10 +841,12 @@ export class OutcomeObserver {
     merchantId: string,
     event: NormalizedMerchantEvent,
   ): Promise<RevenueRiskCase | null> {
-    const paymentId = event.payment?.paymentId;
-    const subscriptionId = event.payment?.subscriptionId;
-    const checkoutSessionId = event.checkout?.checkoutSessionId;
-    const invoiceId = event.invoice?.invoiceId;
+    const rawEvent = event as Record<string, unknown>;
+    const rawPayment = (rawEvent.payment as Record<string, unknown>) || {};
+    const paymentId = (event.payment?.paymentId || rawPayment.paymentId || rawEvent.paymentId) as string | undefined;
+    const subscriptionId = (event.payment?.subscriptionId || rawPayment.subscriptionId || rawEvent.subscriptionId) as string | undefined;
+    const checkoutSessionId = (event.checkout?.checkoutSessionId || (rawEvent.checkout as Record<string, unknown>)?.checkoutSessionId || rawEvent.checkoutSessionId) as string | undefined;
+    const invoiceId = (event.invoice?.invoiceId || (rawEvent.invoice as Record<string, unknown>)?.invoiceId || rawEvent.invoiceId) as string | undefined;
 
     if (paymentId) {
       const paymentIncidentKey = generateIncidentKey(merchantId, RiskType.PAYMENT_FAILURE, paymentId);
@@ -854,6 +856,10 @@ export class OutcomeObserver {
       const subPaymentIncidentKey = generateIncidentKey(merchantId, RiskType.SUBSCRIPTION_FAILURE, paymentId);
       const cSub = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, subPaymentIncidentKey);
       if (cSub) return cSub;
+
+      // Context-aware payment correlation
+      const cByPayment = await this.caseRepo.findActiveCaseByPaymentId(merchantId, paymentId);
+      if (cByPayment) return cByPayment;
     }
 
     if (subscriptionId) {

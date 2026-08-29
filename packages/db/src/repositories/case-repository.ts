@@ -452,4 +452,31 @@ export class CaseRepository {
       },
     });
   }
+
+  async findActiveCaseByPaymentId(
+    merchantId: string,
+    paymentId: string,
+  ): Promise<RevenueRiskCase | null> {
+    return prisma.revenueRiskCase.findFirst({
+      where: {
+        merchantId,
+        status: {
+          in: [CaseStatus.OPEN, CaseStatus.WAITING, CaseStatus.NEEDS_REVIEW],
+        },
+        OR: [
+          { incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}` },
+          { incidentKey: `${merchantId}:SUBSCRIPTION_FAILURE:${paymentId}` },
+          {
+            contextJson: {
+              path: ['paymentId'],
+              equals: paymentId,
+            },
+          },
+        ],
+      },
+      include: {
+        customer: true,
+      },
+    });
+  }
 }
