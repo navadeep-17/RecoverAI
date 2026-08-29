@@ -85,6 +85,7 @@ describe('HumanReviewService Unit Tests', () => {
       planVersions: [
         {
           id: planVersionId,
+          caseId,
           version: 1,
           diagnosisCode: 'CARD_DECLINED',
           diagnosisSummary: 'Card declined due to temporary bank error',
@@ -215,7 +216,7 @@ describe('HumanReviewService Unit Tests', () => {
           status: params.status || ActionExecutionStatus.PENDING,
           providerName: null,
           externalActionId: null,
-          executionMetadata: null,
+          executionMetadata: params.executionMetadata || null,
           errorMessage: null,
           executedAt: null,
           createdAt: new Date(),
@@ -258,6 +259,16 @@ describe('HumanReviewService Unit Tests', () => {
           return { transitioned: true, action };
         },
       ),
+      bindApprovedReview: vi.fn(async (_mId: string, actId: string, rId: string) => {
+        const action = inMemoryActions.get(actId);
+        if (!action || action.status !== ActionExecutionStatus.PENDING) return null;
+        action.policyDecision = PolicyDecision.ALLOW;
+        action.executionMetadata = {
+          executionSource: 'HUMAN_REVIEW_APPROVAL',
+          reviewId: rId,
+        };
+        return action;
+      }),
       hasCompletedSuccessfulAction: vi.fn(async () => false),
       findActionByIdempotencyKey: vi.fn(async () => null),
     };
@@ -317,6 +328,7 @@ describe('HumanReviewService Unit Tests', () => {
       caseRepo: mockCaseRepo,
       customerRepo: mockCustomerRepo,
       merchantRepo: mockMerchantRepo,
+      humanReviewRepo: mockReviewRepo,
       auditRepo: mockAuditRepo,
       policyConfigRepo: mockPolicyConfigRepo,
       policyEngine,
@@ -391,6 +403,7 @@ describe('HumanReviewService Unit Tests', () => {
 
     expect(approval.approved).toBe(true);
     expect(approval.review?.status).toBe(ReviewStatus.APPROVED);
+    expect(approval.error).toBeUndefined();
     expect(approval.executionResult?.success).toBe(true);
     expect(approval.action?.status).toBe(ActionExecutionStatus.SUCCESS);
 

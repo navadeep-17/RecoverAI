@@ -87,6 +87,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         caseRepo,
         customerRepo,
         merchantRepo,
+        humanReviewRepo: reviewRepo,
         auditRepo,
         policyConfigRepo,
         commitmentRepo,
@@ -409,7 +410,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         evaluatedAt: new Date(),
         violations: [],
       },
-      executionSource: 'HUMAN_REVIEW_APPROVAL',
+      reviewId: resolvedReview.id,
     });
 
     expect(authResult.authorized).toBe(true);
@@ -420,9 +421,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     await customerRepo.setContactConsent(merchantAId, customer.id, false);
 
     // ActionExecutor claims and runs fresh policy revalidation
-    const executionResult = await actionExecutor.executeAction(merchantAId, authResult.action!.id, {
-      executionSource: 'HUMAN_REVIEW_APPROVAL',
-    });
+    const executionResult = await actionExecutor.executeAction(merchantAId, authResult.action!.id);
 
     // Fresh revalidation detects customer opted out -> blocks execution
     expect(executionResult.executed).toBe(false);

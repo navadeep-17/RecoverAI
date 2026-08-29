@@ -517,7 +517,7 @@ export class HumanReviewService {
       actionParams: proposedActionParams,
       policyEvaluation,
       attemptOrVersion: review.planVersion ? review.planVersion.version : 1,
-      executionSource: 'HUMAN_REVIEW_APPROVAL',
+      reviewId: updatedReview.id,
     });
 
     if (!authResult.authorized || !authResult.action) {
@@ -528,9 +528,7 @@ export class HumanReviewService {
       };
     }
 
-    const executionResult = await this.actionExecutor.executeAction(merchantId, authResult.action.id, {
-      executionSource: 'HUMAN_REVIEW_APPROVAL',
-    });
+    const executionResult = await this.actionExecutor.executeAction(merchantId, authResult.action.id);
 
     return {
       approved: true,

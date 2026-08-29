@@ -169,6 +169,39 @@ export class ActionRepository {
   }
 
   /**
+   * Binds an existing PENDING action to an authoritative approved review.
+   * This is used for reviews that point directly at RecoveryAction.actionId;
+   * no second action is created.
+   */
+  async bindApprovedReview(
+    merchantId: string,
+    actionId: string,
+    reviewId: string,
+  ): Promise<RecoveryAction | null> {
+    const updateResult = await prisma.recoveryAction.updateMany({
+      where: {
+        id: actionId,
+        status: ActionExecutionStatus.PENDING,
+        case: { merchantId },
+      },
+      data: {
+        policyDecision: PolicyDecision.ALLOW,
+        executionMetadata: {
+          executionSource: 'HUMAN_REVIEW_APPROVAL',
+          reviewId,
+        },
+        updatedAt: new Date(),
+      },
+    });
+
+    if (updateResult.count !== 1) {
+      return null;
+    }
+
+    return this.getActionById(merchantId, actionId);
+  }
+
+  /**
    * Finds an action by idempotency key scoped to merchant tenant.
    */
   async findActionByIdempotencyKey(

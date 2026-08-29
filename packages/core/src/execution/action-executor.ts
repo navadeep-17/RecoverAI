@@ -5,6 +5,7 @@ import {
   PolicyDecision,
   RecoveryAction,
   RecoveryActionType,
+  ReviewStatus,
 } from '@prisma/client';
 import {
   ActionRepository,
@@ -15,6 +16,7 @@ import {
   MerchantRepository,
   PolicyConfigRepository,
   CaseWithRelations,
+  HumanReviewRepository,
 } from '@recoverai/db';
 import {
   IPolicyEngine,
@@ -28,7 +30,7 @@ import {
   ProviderExecutionOutcome,
   ProviderRegistry,
 } from './provider-interface.js';
-import { ActionExecutionError } from '@recoverai/shared';
+import { ActionExecutionError, jsonStructurallyEqual } from '@recoverai/shared';
 import { IJobScheduler } from '../detection/job-scheduler-interface.js';
 import { generateActionIdempotencyKey } from './idempotency-generator.js';
 
@@ -47,6 +49,8 @@ export interface ActionExecutorOptions {
    * Absent merchantRepo causes the executor to fail closed (never fail open).
    */
   merchantRepo: MerchantRepository;
+  /** Required whenever a persisted action claims human-review authority. */
+  humanReviewRepo?: HumanReviewRepository;
   /**
    * CommitmentRepository for authoritative RECORD_PROMISE_TO_PAY persistence.
    * If absent, RECORD_PROMISE_TO_PAY will fail safely (action marked FAILED).
@@ -76,7 +80,8 @@ export interface AuthorizeActionParams {
    */
   policyEvaluation: PolicyEvaluationResult;
   attemptOrVersion?: string | number;
-  executionSource?: PolicyExecutionSource;
+  /** Authoritative persisted review whose approval may satisfy only REVIEW gates. */
+  reviewId?: string;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -108,6 +113,7 @@ export class ActionExecutor {
   private auditRepo: AuditRepository;
   /** MANDATORY: Absent merchantRepo fails closed. */
   private merchantRepo: MerchantRepository;
+  private humanReviewRepo?: HumanReviewRepository;
   private commitmentRepo?: CommitmentRepository;
   private policyEngine: IPolicyEngine;
   private providerRegistry: ProviderRegistry;
@@ -121,6 +127,7 @@ export class ActionExecutor {
     this.policyConfigRepo = options.policyConfigRepo;
     this.auditRepo = options.auditRepo;
     this.merchantRepo = options.merchantRepo;
+    this.humanReviewRepo = options.humanReviewRepo;
     this.commitmentRepo = options.commitmentRepo;
     this.policyEngine = options.policyEngine;
     this.providerRegistry = options.providerRegistry;
@@ -146,6 +153,24 @@ export class ActionExecutor {
     params: AuthorizeActionParams,
   ): Promise<{ action: RecoveryAction | null; authorized: boolean; reason?: string }> {
     const { policyEvaluation } = params;
+
+    let approvedReviewId: string | undefined;
+    let actionBoundAction: RecoveryAction | null = null;
+    if (params.reviewId) {
+      const authority = await this.validateReviewAuthorityForAuthorization(
+        merchantId,
+        caseId,
+        params.reviewId,
+        params.planVersionId,
+        params.actionType,
+        params.actionParams,
+      );
+      if (!authority.valid) {
+        return { action: null, authorized: false, reason: authority.reason };
+      }
+      approvedReviewId = params.reviewId;
+      actionBoundAction = authority.actionBoundAction;
+    }
     const idempotencyKey = generateActionIdempotencyKey(
       merchantId,
       caseId,
@@ -174,7 +199,7 @@ export class ActionExecutor {
       return { action: null, authorized: false, reason: policyEvaluation.rationale };
     }
 
-    if (policyEvaluation.decision === PolicyDecision.REVIEW) {
+    if (policyEvaluation.decision === PolicyDecision.REVIEW && !approvedReviewId) {
       await this.auditRepo.record(merchantId, {
         caseId,
         eventType: 'ACTION_BLOCKED_BY_POLICY',
@@ -195,9 +220,42 @@ export class ActionExecutor {
       return { action: null, authorized: false, reason: policyEvaluation.rationale };
     }
 
+    if (actionBoundAction && approvedReviewId) {
+      const boundAction = await this.actionRepo.bindApprovedReview(
+        merchantId,
+        actionBoundAction.id,
+        approvedReviewId,
+      );
+      return boundAction
+        ? { action: boundAction, authorized: true }
+        : { action: null, authorized: false, reason: 'Reviewed action is no longer pending' };
+    }
+
     // PolicyDecision is ALLOW — check idempotency first
     const existing = await this.actionRepo.findActionByIdempotencyKey(merchantId, idempotencyKey);
     if (existing) {
+      if (approvedReviewId) {
+        if (
+          existing.caseId !== caseId ||
+          existing.planVersionId !== params.planVersionId ||
+          existing.actionType !== params.actionType ||
+          !jsonStructurallyEqual(existing.actionParams, params.actionParams)
+        ) {
+          return {
+            action: null,
+            authorized: false,
+            reason: 'Existing idempotent action does not exactly match the reviewed proposal',
+          };
+        }
+        const boundExisting = await this.actionRepo.bindApprovedReview(
+          merchantId,
+          existing.id,
+          approvedReviewId,
+        );
+        return boundExisting
+          ? { action: boundExisting, authorized: true }
+          : { action: null, authorized: false, reason: 'Reviewed action is no longer pending' };
+      }
       // Idempotent return: same logical authorization retry → return existing action
       // Do NOT emit a duplicate ACTION_AUTHORIZED audit
       return { action: existing, authorized: true };
@@ -212,7 +270,9 @@ export class ActionExecutor {
       policyDecision: PolicyDecision.ALLOW,
       policyRationale: policyEvaluation.rationale,
       status: ActionExecutionStatus.PENDING,
-      executionMetadata: params.executionSource ? { executionSource: params.executionSource } : undefined,
+      executionMetadata: approvedReviewId
+        ? { executionSource: 'HUMAN_REVIEW_APPROVAL', reviewId: approvedReviewId }
+        : undefined,
     });
 
     await this.auditRepo.record(merchantId, {
@@ -259,7 +319,6 @@ export class ActionExecutor {
   async executeAction(
     merchantId: string,
     actionId: string,
-    options?: { executionSource?: PolicyExecutionSource },
   ): Promise<ActionExecutionResult> {
     // ── Step 1: Verify tenant ownership ──────────────────────────────────────
     const action = await this.actionRepo.getActionById(merchantId, actionId);
@@ -287,6 +346,35 @@ export class ActionExecutor {
         alreadyClaimed: true,
         action: claimResult.action,
       };
+    }
+
+    // Reload the authoritative action after the atomic claim. Do not rely on
+    // caller data or the pre-claim snapshot for security-relevant fields.
+    let freshAction: RecoveryAction | null;
+    try {
+      freshAction = await this.actionRepo.getActionById(merchantId, actionId);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      return await this.failActionSafely(
+        merchantId,
+        actionId,
+        action.caseId,
+        action.actionType,
+        action.idempotencyKey,
+        `Authoritative action reload failed after claim; failing closed: ${errMsg}`,
+        'ACTION_AUTHORITY_UNAVAILABLE',
+      );
+    }
+    if (!freshAction || freshAction.status !== ActionExecutionStatus.EXECUTING) {
+      return await this.failActionSafely(
+        merchantId,
+        actionId,
+        action.caseId,
+        action.actionType,
+        action.idempotencyKey,
+        'Authoritative action unavailable after claim; failing closed.',
+        'ACTION_AUTHORITY_UNAVAILABLE',
+      );
     }
 
     // Record the claim immediately
@@ -335,25 +423,48 @@ export class ActionExecutor {
       );
     }
 
-    const caseRecord = await this.caseRepo.getCaseById(merchantId, action.caseId);
+    let caseRecord: CaseWithRelations | null;
+    try {
+      caseRecord = await this.caseRepo.getCaseById(merchantId, freshAction.caseId);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      return await this.failActionSafely(
+        merchantId,
+        actionId,
+        freshAction.caseId,
+        freshAction.actionType,
+        freshAction.idempotencyKey,
+        `RevenueRiskCase reload failed; failing closed: ${errMsg}`,
+        'CASE_UNAVAILABLE',
+      );
+    }
     if (!caseRecord) {
       return await this.failActionSafely(
         merchantId,
         actionId,
-        action.caseId,
-        action.actionType,
-        action.idempotencyKey,
-        `RevenueRiskCase "${action.caseId}" not found for merchant "${merchantId}"`,
+        freshAction.caseId,
+        freshAction.actionType,
+        freshAction.idempotencyKey,
+        `RevenueRiskCase "${freshAction.caseId}" not found for merchant "${merchantId}"`,
         'CASE_NOT_FOUND',
       );
     }
 
     const policyConfig = await this.policyConfigRepo.getOrCreateConfig(merchantId);
 
-    const executionSource: PolicyExecutionSource =
-      options?.executionSource ||
-      ((action.executionMetadata as Record<string, unknown> | null)?.executionSource as PolicyExecutionSource) ||
-      'AUTONOMOUS';
+    const authority = await this.validateExecutionAuthority(merchantId, caseRecord, freshAction);
+    if (!authority.valid) {
+      return await this.failActionSafely(
+        merchantId,
+        actionId,
+        freshAction.caseId,
+        freshAction.actionType,
+        freshAction.idempotencyKey,
+        authority.reason,
+        'INVALID_HUMAN_REVIEW_AUTHORITY',
+      );
+    }
+    const executionSource: PolicyExecutionSource = authority.executionSource;
 
     // ── Step 5: Fresh Policy Revalidation — only the claim owner revalidates ──
     const freshContext: PolicyExecutionContext = {
@@ -396,8 +507,8 @@ export class ActionExecutor {
             lastContactedAt: caseRecord.customer.lastContactedAt,
           }
         : null,
-      proposedActionType: action.actionType,
-      proposedActionParams: action.actionParams as Record<string, unknown>,
+      proposedActionType: freshAction.actionType,
+      proposedActionParams: freshAction.actionParams as Record<string, unknown>,
       verifiedPaymentFailureCode:
         typeof (caseRecord.contextJson as Record<string, unknown> | null)
           ?.verifiedPaymentFailureCode === 'string'
@@ -672,6 +783,133 @@ export class ActionExecutor {
 
       throw new ActionExecutionError(actionId, action.actionType, errMsg, err);
     }
+  }
+
+  private async validateReviewAuthorityForAuthorization(
+    merchantId: string,
+    caseId: string,
+    reviewId: string,
+    planVersionId: string | undefined,
+    actionType: RecoveryActionType,
+    actionParams: Record<string, unknown>,
+  ): Promise<{ valid: true; actionBoundAction: RecoveryAction | null } | { valid: false; reason: string }> {
+    if (!this.humanReviewRepo) {
+      return { valid: false, reason: 'Human review repository unavailable; failing closed' };
+    }
+
+    let review;
+    try {
+      review = await this.humanReviewRepo.getReviewById(merchantId, reviewId);
+    } catch {
+      return { valid: false, reason: 'Approved human review not found for merchant' };
+    }
+
+    if (!review || review.status !== ReviewStatus.APPROVED || review.merchantId !== merchantId || review.caseId !== caseId) {
+      return { valid: false, reason: 'Human review is not an approved authority for this merchant and case' };
+    }
+
+    if (review.actionId) {
+      const reviewedAction = review.action ?? await this.actionRepo.getActionById(merchantId, review.actionId);
+      if (
+        !reviewedAction ||
+        reviewedAction.id !== review.actionId ||
+        reviewedAction.caseId !== caseId ||
+        reviewedAction.actionType !== actionType ||
+        !jsonStructurallyEqual(reviewedAction.actionParams, actionParams)
+      ) {
+        return { valid: false, reason: 'Requested action does not exactly match the action-bound review' };
+      }
+      return { valid: true, actionBoundAction: reviewedAction };
+    }
+
+    if (!review.planVersionId || review.planVersionId !== planVersionId || !review.planVersion) {
+      return { valid: false, reason: 'Human review is not bound to the requested authoritative plan version' };
+    }
+
+    const authoritativeCase = await this.caseRepo.getCaseById(merchantId, caseId);
+    if (!authoritativeCase) {
+      return { valid: false, reason: 'Authoritative review case not found' };
+    }
+    const latestPlan = authoritativeCase.planVersions?.[0];
+    if (!latestPlan || latestPlan.id !== review.planVersionId) {
+      return { valid: false, reason: 'Human review proposal has been superseded' };
+    }
+    if (
+      review.planVersion.caseId !== caseId ||
+      review.planVersion.proposedActionType !== actionType ||
+      !jsonStructurallyEqual(review.planVersion.proposedActionParams, actionParams)
+    ) {
+      return { valid: false, reason: 'Requested action does not exactly match the reviewed plan proposal' };
+    }
+
+    return { valid: true, actionBoundAction: null };
+  }
+
+  private async validateExecutionAuthority(
+    merchantId: string,
+    caseRecord: CaseWithRelations,
+    action: RecoveryAction,
+  ): Promise<{ valid: true; executionSource: PolicyExecutionSource } | { valid: false; reason: string }> {
+    const metadata = action.executionMetadata;
+    if (metadata === null || metadata === undefined) {
+      return { valid: true, executionSource: 'AUTONOMOUS' };
+    }
+    if (typeof metadata !== 'object' || Array.isArray(metadata)) {
+      return { valid: false, reason: 'Malformed action execution metadata' };
+    }
+
+    const source = (metadata as Record<string, unknown>).executionSource;
+    if (source === undefined || source === 'AUTONOMOUS') {
+      return { valid: true, executionSource: 'AUTONOMOUS' };
+    }
+    if (source !== 'HUMAN_REVIEW_APPROVAL') {
+      return { valid: false, reason: 'Unknown action execution authority' };
+    }
+
+    const reviewId = (metadata as Record<string, unknown>).reviewId;
+    if (typeof reviewId !== 'string' || reviewId.length === 0 || !this.humanReviewRepo) {
+      return { valid: false, reason: 'Malformed HUMAN_REVIEW_APPROVAL metadata' };
+    }
+
+    let review;
+    try {
+      review = await this.humanReviewRepo.getReviewById(merchantId, reviewId);
+    } catch {
+      return { valid: false, reason: 'Authoritative approved review not found' };
+    }
+    if (
+      !review ||
+      review.status !== ReviewStatus.APPROVED ||
+      review.merchantId !== merchantId ||
+      review.caseId !== action.caseId ||
+      caseRecord.id !== action.caseId
+    ) {
+      return { valid: false, reason: 'Review is not approved for the action merchant and case' };
+    }
+
+    if (review.actionId) {
+      if (review.actionId !== action.id) {
+        return { valid: false, reason: 'Action-bound review does not authorize this action' };
+      }
+      return { valid: true, executionSource: 'HUMAN_REVIEW_APPROVAL' };
+    }
+
+    if (!review.planVersionId || action.planVersionId !== review.planVersionId || !review.planVersion) {
+      return { valid: false, reason: 'Plan-bound review does not authorize this action plan' };
+    }
+    const latestPlan = caseRecord.planVersions?.[0];
+    if (!latestPlan || latestPlan.id !== review.planVersionId) {
+      return { valid: false, reason: 'Reviewed plan has been superseded' };
+    }
+    if (
+      review.planVersion.caseId !== action.caseId ||
+      review.planVersion.proposedActionType !== action.actionType ||
+      !jsonStructurallyEqual(review.planVersion.proposedActionParams, action.actionParams)
+    ) {
+      return { valid: false, reason: 'Action does not exactly match the authoritative reviewed plan proposal' };
+    }
+
+    return { valid: true, executionSource: 'HUMAN_REVIEW_APPROVAL' };
   }
 
   // ────────────────────────────────────────────────────────────────────────────

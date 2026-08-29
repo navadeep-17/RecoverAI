@@ -7,3 +7,4 @@ export * from './money.js';
 export * from './case-state-machine.js';
 export * from './events.js';
 export * from './errors.js';
+export * from './json-structural-equality.js';
