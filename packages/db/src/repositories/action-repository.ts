@@ -216,6 +216,24 @@ export class ActionRepository {
     });
   }
 
+  /** Finds only a completed Razorpay payment-link action owned by this merchant. */
+  async findSuccessfulPaymentLinkAction(
+    merchantId: string,
+    providerName: string,
+    externalActionId: string,
+  ): Promise<RecoveryAction | null> {
+    return prisma.recoveryAction.findFirst({
+      where: {
+        providerName,
+        externalActionId,
+        actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+        status: ActionExecutionStatus.SUCCESS,
+        case: { merchantId },
+      },
+      include: { case: true },
+    });
+  }
+
   /**
    * Atomically transitions an action from expectedStatus → nextStatus.
    *

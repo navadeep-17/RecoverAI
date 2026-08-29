@@ -57,6 +57,14 @@ export interface ObserveTimerFiredParams {
   occurredAt?: Date;
 }
 
+/** Correlation evidence read from the authoritative RecoveryAction, never webhook notes. */
+export interface AuthoritativeActionCorrelation {
+  actionId: string;
+  caseId: string;
+  providerName: string;
+  externalActionId: string;
+}
+
 export interface OutcomeObserverOptions {
   caseRepo: CaseRepository;
   actionRepo: ActionRepository;
@@ -115,11 +123,16 @@ export class OutcomeObserver {
   async observeMerchantEvent(
     event: NormalizedMerchantEvent,
     merchantEventId?: string,
+    authoritativeActionCorrelation?: AuthoritativeActionCorrelation,
   ): Promise<ObservationResult> {
     const merchantId = event.merchantId;
 
-    // 1. Strict business entity correlation (no fallback to externalEventId)
-    const matchedCase = await this.correlateEventToCase(merchantId, event);
+    // 1. Strict business entity correlation (no fallback to externalEventId).
+    // Payment-link outcomes may use a provider link ID, but only after it has
+    // been resolved from a persisted tenant-scoped RecoveryAction.
+    const matchedCase = authoritativeActionCorrelation
+      ? await this.correlateAuthoritativeAction(merchantId, authoritativeActionCorrelation)
+      : await this.correlateEventToCase(merchantId, event);
     if (!matchedCase) {
       return {
         observed: false,
@@ -207,6 +220,22 @@ export class OutcomeObserver {
       caseStatus: matchedCase.status,
       reason: `Event type "${event.eventType}" observed without state transition`,
     };
+  }
+
+  private async correlateAuthoritativeAction(
+    merchantId: string,
+    correlation: AuthoritativeActionCorrelation,
+  ): Promise<RevenueRiskCase | null> {
+    const action = await this.actionRepo.getActionById(merchantId, correlation.actionId);
+    if (
+      !action ||
+      action.caseId !== correlation.caseId ||
+      action.providerName !== correlation.providerName ||
+      action.externalActionId !== correlation.externalActionId
+    ) {
+      return null;
+    }
+    return this.caseRepo.getCaseById(merchantId, correlation.caseId);
   }
 
   /**

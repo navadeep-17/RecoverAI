@@ -12,7 +12,7 @@ import {
   CommitmentRepository,
 } from '@recoverai/db';
 import { RiskDetector, OutcomeObserver, EventIngestionService } from '@recoverai/core';
-import { RazorpayEventNormalizer } from '@recoverai/integrations';
+import { RazorpayEventNormalizer, RazorpayPaymentLinkProvider } from '@recoverai/integrations';
 import { PgBossJobScheduler } from './scheduler.js';
 
 export interface RecoveryWorkerConfig {
@@ -129,8 +129,27 @@ export class RecoveryWorkerService {
         JSON.parse(receipt.rawPayload),
         receipt.externalEventId || undefined,
       );
-      const ingested = await this.eventIngestionService.ingestEvent(normalized);
-      await this.outcomeObserver.observeMerchantEvent(normalized, ingested.event.id);
+      const paymentLinkId = (normalized.metadata as Record<string, unknown> | null)?.razorpayPaymentLinkId;
+      const paymentLinkSuccess = normalized.eventType === 'PAYMENT_SUCCEEDED' && typeof paymentLinkId === 'string';
+      const ingested = await this.eventIngestionService.ingestEvent(normalized, { skipRiskDetection: paymentLinkSuccess });
+      if (paymentLinkSuccess) {
+        const actionRepo = new ActionRepository();
+        const action = await actionRepo.findSuccessfulPaymentLinkAction(
+          data.merchantId,
+          new RazorpayPaymentLinkProvider().providerName,
+          paymentLinkId,
+        );
+        if (action) {
+          await this.outcomeObserver.observeMerchantEvent(normalized, ingested.event.id, {
+            actionId: action.id,
+            caseId: action.caseId,
+            providerName: action.providerName!,
+            externalActionId: action.externalActionId!,
+          });
+        }
+      } else {
+        await this.outcomeObserver.observeMerchantEvent(normalized, ingested.event.id);
+      }
       await eventRepo.markWebhookProcessed(data.merchantId, 'RAZORPAY', receipt.dedupeKey);
     });
 

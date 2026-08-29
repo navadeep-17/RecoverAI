@@ -28,6 +28,7 @@ export interface RazorpayRawPayload {
         email?: string;
         contact?: string;
         customer_id?: string;
+        payment_link_id?: string;
         error_code?: string;
         error_description?: string;
         error_source?: string;
@@ -41,6 +42,16 @@ export interface RazorpayRawPayload {
         bank?: string;
         wallet?: string;
         vpa?: string;
+        created_at?: number;
+      };
+    };
+    payment_link?: {
+      entity?: {
+        id?: string;
+        amount?: number | string;
+        currency?: string;
+        status?: string;
+        reference_id?: string;
         created_at?: number;
       };
     };
@@ -113,11 +124,12 @@ export class RazorpayEventNormalizer {
     const paymentEntity = raw.payload?.payment?.entity;
     const subscriptionEntity = raw.payload?.subscription?.entity;
     const invoiceEntity = raw.payload?.invoice?.entity;
+    const paymentLinkEntity = raw.payload?.payment_link?.entity;
 
     let eventType: NormalizedEventType;
     if (eventName === 'payment.failed') {
       eventType = NormalizedEventType.PAYMENT_FAILED;
-    } else if (eventName === 'payment.captured' || eventName === 'payment.authorized') {
+    } else if (eventName === 'payment.captured' || eventName === 'payment_link.paid') {
       eventType = NormalizedEventType.PAYMENT_SUCCEEDED;
     } else if (eventName === 'subscription.charged' || eventName === 'subscription.activated') {
       eventType = NormalizedEventType.PAYMENT_SUCCEEDED;
@@ -138,6 +150,7 @@ export class RazorpayEventNormalizer {
 
     const externalEventId = explicitEventId || raw.id || raw.event_id || null;
     const paymentId = paymentEntity?.id || null;
+    const paymentLinkId = paymentEntity?.payment_link_id || paymentLinkEntity?.id || null;
     const invoiceId = invoiceEntity?.id || paymentEntity?.invoice_id || null;
 
     // Authoritative subscription extraction: only from subscription entity or invoice subscription_id (NEVER invoice_id)
@@ -164,6 +177,8 @@ export class RazorpayEventNormalizer {
       dedupeKey = `razorpay:${merchantId}:sub:${subscriptionId}:${eventName}`;
     } else if (invoiceId) {
       dedupeKey = `razorpay:${merchantId}:inv:${invoiceId}:${eventName}`;
+    } else if (paymentLinkId) {
+      dedupeKey = `razorpay:${merchantId}:link:${paymentLinkId}:${eventName}`;
     } else {
       throw new MissingEventIdentityError(eventName, 'externalEventId or entityId');
     }
@@ -173,9 +188,11 @@ export class RazorpayEventNormalizer {
       formattedAmount = formatPaiseToDecimalString(paymentEntity.amount);
     } else if (invoiceEntity?.amount !== undefined) {
       formattedAmount = formatPaiseToDecimalString(invoiceEntity.amount);
+    } else if (paymentLinkEntity?.amount !== undefined) {
+      formattedAmount = formatPaiseToDecimalString(paymentLinkEntity.amount);
     }
 
-    const rawCurrency = paymentEntity?.currency || invoiceEntity?.currency;
+    const rawCurrency = paymentEntity?.currency || invoiceEntity?.currency || paymentLinkEntity?.currency;
     const requiresMoney = eventType === NormalizedEventType.PAYMENT_FAILED ||
       eventType === NormalizedEventType.PAYMENT_SUCCEEDED ||
       eventType === NormalizedEventType.INVOICE_PAID;
@@ -227,6 +244,9 @@ export class RazorpayEventNormalizer {
         rawEventName: eventName,
         errorSource: paymentEntity?.error_source,
         errorStep: paymentEntity?.error_step,
+        // This is provider-supplied lookup evidence only. The worker resolves it
+        // against a tenant-scoped persisted RecoveryAction before any recovery.
+        razorpayPaymentLinkId: paymentLinkId,
       },
       rawPayload: raw as Record<string, unknown>,
     };

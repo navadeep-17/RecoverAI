@@ -213,6 +213,44 @@ describe('OutcomeObserver Unit Tests', () => {
 
   // ──────────────────────────────────────────────────────────────────────────
   describe('1. Authoritative Monetary Recovery', () => {
+    it('resolves a payment-link payment only when the persisted action correlation exactly matches', async () => {
+      mockActionRepo.getActionById.mockResolvedValue({
+        id: 'act_link_001', caseId, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_001',
+      });
+      const event: any = {
+        merchantId, source: MerchantEventSource.RAZORPAY, externalEventId: 'evt_link_paid',
+        eventType: NormalizedEventType.PAYMENT_SUCCEEDED, occurredAt: new Date(), amount: '14999.00', currency: 'INR',
+        payment: { paymentId: 'pay_link_001' }, metadata: { razorpayPaymentLinkId: 'plink_001' },
+      };
+
+      const result = await observer.observeMerchantEvent(event, 'merchant_evt_link_001', {
+        actionId: 'act_link_001', caseId, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_001',
+      });
+
+      expect(result.caseResolved).toBe(true);
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.RECOVERED);
+      expect(inMemoryOutcomes).toHaveLength(1);
+    });
+
+    it('rejects forged payment-link correlation before any recovery credit', async () => {
+      mockActionRepo.getActionById.mockResolvedValue({
+        id: 'act_link_001', caseId, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_other',
+      });
+      const event: any = {
+        merchantId, source: MerchantEventSource.RAZORPAY, externalEventId: 'evt_forged_link',
+        eventType: NormalizedEventType.PAYMENT_SUCCEEDED, occurredAt: new Date(), amount: '14999.00', currency: 'INR',
+        payment: { paymentId: 'pay_link_forged' },
+      };
+
+      const result = await observer.observeMerchantEvent(event, 'merchant_evt_forged', {
+        actionId: 'act_link_001', caseId, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_001',
+      });
+
+      expect(result.observed).toBe(false);
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
+      expect(inMemoryOutcomes).toHaveLength(0);
+    });
+
     it('authoritative PAYMENT_SUCCEEDED marks case RECOVERED with exact amount and currency', async () => {
       const paymentEvent: any = {
         eventId: 'evt_pay_01',

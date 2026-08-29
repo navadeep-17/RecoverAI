@@ -17,6 +17,11 @@ export interface IngestionResult {
   detectionResult: DetectionResult;
 }
 
+export interface EventIngestionOptions {
+  /** A separately authorized observer owns this event's state transition. */
+  skipRiskDetection?: boolean;
+}
+
 export class EventIngestionService {
   constructor(
     private eventRepo: EventRepository,
@@ -24,7 +29,7 @@ export class EventIngestionService {
     private riskDetector: RiskDetector,
   ) {}
 
-  async ingestEvent(eventInput: NormalizedMerchantEvent): Promise<IngestionResult> {
+  async ingestEvent(eventInput: NormalizedMerchantEvent, options: EventIngestionOptions = {}): Promise<IngestionResult> {
     // 1. Strict Schema & Domain Validation
     const validatedEvent = NormalizedMerchantEventSchema.parse(eventInput);
     const merchantId = validatedEvent.merchantId;
@@ -77,7 +82,17 @@ export class EventIngestionService {
       reasonCode: 'EVENT_INGESTION_SUCCESS',
     });
 
-    // 5. Deterministic Risk Detection
+    // 5. Deterministic Risk Detection. Payment-link success is intentionally
+    // withheld until the worker has resolved its link ID to a persisted action.
+    if (options.skipRiskDetection) {
+      return {
+        deduplicated: false,
+        created: true,
+        event,
+        detectionResult: { riskDetected: false, caseCreated: false, reason: 'Risk detection deferred to authoritative outcome correlation' },
+      };
+    }
+
     const detectionResult = await this.riskDetector.handleNormalizedEvent(validatedEvent);
 
     return {

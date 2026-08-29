@@ -4,6 +4,8 @@ import { RecoveryActionType } from '@recoverai/shared';
 import { ProviderExecutionOutcome } from '@recoverai/core';
 import { RazorpayPaymentLinkProvider } from '../src/providers/razorpay-payment-link-provider.js';
 import { RazorpayWebhookService } from '../src/razorpay-webhook-service.js';
+import { ProviderRegistry } from '../src/providers/provider-registry.js';
+import { RazorpayEventNormalizer } from '../src/normalizers/razorpay-normalizer.js';
 
 const merchantId = 'mch_rzp_test';
 const secret = 'webhook-secret-for-tests';
@@ -91,5 +93,17 @@ describe('Phase 7 Razorpay boundaries', () => {
     expect((await missing.execute(input)).outcome).toBe(ProviderExecutionOutcome.PERMANENT_FAILURE);
     const rejected = new RazorpayPaymentLinkProvider({ keyId: 'id', keySecret: 'secret', fetchImpl: vi.fn().mockResolvedValue(new Response('{}', { status: 500 })) });
     expect((await rejected.execute(input)).outcome).toBe(ProviderExecutionOutcome.RETRYABLE_FAILURE);
+  });
+
+  it('does not normalize payment.authorized as a payment-success recovery event', () => {
+    const raw = { id: 'evt_authorized', event: 'payment.authorized', payload: { payment: { entity: { id: 'pay_authorized', amount: 100, currency: 'INR' } } } };
+    expect(() => RazorpayEventNormalizer.normalize(merchantId, raw)).toThrow(/Unsupported Razorpay event/);
+  });
+
+  it('uses the real payment-link adapter only through explicit Test Mode runtime configuration', () => {
+    const configured = ProviderRegistry.forRuntime({ enabled: true, keyId: 'rzp_test_key', keySecret: 'secret' });
+    const safeDefault = ProviderRegistry.forRuntime({ enabled: false });
+    expect(configured.getProviderForAction(RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK)?.providerName).toBe('RAZORPAY_TEST_MODE_PAYMENT_LINKS');
+    expect(safeDefault.getProviderForAction(RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK)?.isSimulated).toBe(true);
   });
 });
