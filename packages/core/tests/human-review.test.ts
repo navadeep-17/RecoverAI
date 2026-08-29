@@ -100,6 +100,15 @@ describe('HumanReviewService Unit Tests', () => {
 
     mockReviewRepo = {
       createReview: vi.fn(async (mId: string, data: any) => {
+        const reviewKey = data.reviewKey || (
+          data.planVersionId ? `plan:${data.planVersionId}` : (data.actionId ? `action:${data.actionId}` : `case:${data.caseId}`)
+        );
+        const existing = Array.from(inMemoryReviews.values()).find(
+          (r) => r.merchantId === mId && r.caseId === data.caseId && r.reviewKey === reviewKey,
+        );
+        if (existing) {
+          return { created: false, review: existing };
+        }
         const id = `rev_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
         const review = {
           id,
@@ -107,6 +116,7 @@ describe('HumanReviewService Unit Tests', () => {
           caseId: data.caseId,
           planVersionId: data.planVersionId || null,
           actionId: data.actionId || null,
+          reviewKey,
           reasonForReview: data.reasonForReview,
           status: ReviewStatus.PENDING,
           reviewerId: null,
@@ -119,7 +129,7 @@ describe('HumanReviewService Unit Tests', () => {
           updatedAt: new Date(),
         };
         inMemoryReviews.set(id, review);
-        return review;
+        return { created: true, review };
       }),
       getReviewById: vi.fn(async (mId: string, rId: string) => {
         const rev = inMemoryReviews.get(rId);
@@ -369,7 +379,7 @@ describe('HumanReviewService Unit Tests', () => {
 
   // B. Approval Happy Path
   it('approves review, passes fresh policy revalidation, executes action, and records audits', async () => {
-    const review = await mockReviewRepo.createReview(merchantId, {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId,
       reasonForReview: 'Needs check',
@@ -402,7 +412,7 @@ describe('HumanReviewService Unit Tests', () => {
 
   // C. Hard Invariant Prevents Approval Override (Opt-Out & Kill Switch)
   it('blocks execution when customer opted out before approval with 0 provider calls', async () => {
-    const review = await mockReviewRepo.createReview(merchantId, {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId,
       reasonForReview: 'Needs check',
@@ -430,7 +440,7 @@ describe('HumanReviewService Unit Tests', () => {
   });
 
   it('blocks execution when kill switch is enabled before approval', async () => {
-    const review = await mockReviewRepo.createReview(merchantId, {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId,
       reasonForReview: 'Needs check',
@@ -450,7 +460,7 @@ describe('HumanReviewService Unit Tests', () => {
 
   // D. Stale Proposal Rejection
   it('fails safely with zero provider calls if case was replanned to a newer version', async () => {
-    const review = await mockReviewRepo.createReview(merchantId, {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId, // Bound to v1
       reasonForReview: 'Reviewing v1 proposal',
@@ -487,7 +497,7 @@ describe('HumanReviewService Unit Tests', () => {
 
   // E. Case Already Recovered / Stopped
   it('fails safely without executing if case was already recovered externally', async () => {
-    const review = await mockReviewRepo.createReview(merchantId, {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId,
       reasonForReview: 'Check',
@@ -513,7 +523,7 @@ describe('HumanReviewService Unit Tests', () => {
 
   // F. Rejection Reopens Case
   it('rejects review, audits REVIEW_REJECTED, and transitions case NEEDS_REVIEW -> OPEN', async () => {
-    const review = await mockReviewRepo.createReview(merchantId, {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId,
       reasonForReview: 'Needs human review',
@@ -544,7 +554,7 @@ describe('HumanReviewService Unit Tests', () => {
 
   // G. Human Takeover
   it('marks review TAKEN_OVER, audits REVIEW_TAKEN_OVER, and preserves case state', async () => {
-    const review = await mockReviewRepo.createReview(merchantId, {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId,
       reasonForReview: 'Needs VIP handling',
@@ -568,7 +578,7 @@ describe('HumanReviewService Unit Tests', () => {
 
   // H. Administrative Close
   it('closes review and stops case recovery when stopCase is true', async () => {
-    const review = await mockReviewRepo.createReview(merchantId, {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId,
       reasonForReview: 'Closing review',

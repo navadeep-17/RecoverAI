@@ -111,6 +111,8 @@ export interface VerifiedPaymentFacts {
   isRecurring?: boolean;
 }
 
+export type PolicyExecutionSource = 'AUTONOMOUS' | 'HUMAN_REVIEW_APPROVAL';
+
 export interface PolicyExecutionContext {
   merchantId: string;
   killSwitchActive: boolean;
@@ -130,6 +132,7 @@ export interface PolicyExecutionContext {
   priorOutcomes: PriorOutcomeRecord[];
   activeCommitments?: ActiveCommitmentRecord[];
   currentTime: Date; // Authoritative clock: strictly required for deterministic evaluation
+  executionSource?: PolicyExecutionSource;
 }
 
 export interface PolicyEvaluatedFacts {

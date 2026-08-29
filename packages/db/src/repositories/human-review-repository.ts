@@ -1,4 +1,5 @@
 import {
+  Prisma,
   HumanReview,
   ReviewStatus,
   PolicyDecision,
@@ -18,10 +19,15 @@ export type HumanReviewWithRelations = HumanReview & {
   reviewer?: User | null;
 };
 
+export interface CreateReviewResult {
+  created: boolean;
+  review: HumanReview;
+}
+
 export class HumanReviewRepository {
   /**
    * Creates a durable HumanReview idempotently bound to a case and authoritative proposal/version.
-   * If an active PENDING review already exists for this case/planVersion, returns the existing review.
+   * Catches unique constraint collisions (P2002 on [merchantId, caseId, reviewKey]) and returns existing review.
    */
   async createReview(
     merchantId: string,
@@ -29,9 +35,10 @@ export class HumanReviewRepository {
       caseId: string;
       planVersionId?: string;
       actionId?: string;
+      reviewKey?: string;
       reasonForReview: string;
     },
-  ): Promise<HumanReview> {
+  ): Promise<CreateReviewResult> {
     // Assert tenant ownership of the case
     await prisma.revenueRiskCase.findFirstOrThrow({
       where: { id: data.caseId, merchantId },
@@ -58,30 +65,39 @@ export class HumanReviewRepository {
       });
     }
 
-    // Check for an existing PENDING review for this case (and matching planVersionId if provided)
-    const existingPending = await prisma.humanReview.findFirst({
-      where: {
-        merchantId,
-        caseId: data.caseId,
-        status: ReviewStatus.PENDING,
-        ...(data.planVersionId ? { planVersionId: data.planVersionId } : {}),
-      },
-    });
+    const reviewKey = data.reviewKey || (
+      data.planVersionId
+        ? `plan:${data.planVersionId}`
+        : (data.actionId ? `action:${data.actionId}` : `case:${data.caseId}`)
+    );
 
-    if (existingPending) {
-      return existingPending;
+    try {
+      const review = await prisma.humanReview.create({
+        data: {
+          merchantId,
+          caseId: data.caseId,
+          planVersionId: data.planVersionId,
+          actionId: data.actionId,
+          reviewKey,
+          reasonForReview: data.reasonForReview,
+          status: ReviewStatus.PENDING,
+        },
+      });
+
+      return { created: true, review };
+    } catch (err: unknown) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        const existing = await prisma.humanReview.findFirstOrThrow({
+          where: {
+            merchantId,
+            caseId: data.caseId,
+            reviewKey,
+          },
+        });
+        return { created: false, review: existing };
+      }
+      throw err;
     }
-
-    return prisma.humanReview.create({
-      data: {
-        merchantId,
-        caseId: data.caseId,
-        planVersionId: data.planVersionId,
-        actionId: data.actionId,
-        reasonForReview: data.reasonForReview,
-        status: ReviewStatus.PENDING,
-      },
-    });
   }
 
   /**

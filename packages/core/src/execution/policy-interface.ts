@@ -60,6 +60,8 @@ export interface PolicyConfigData {
   overdueGracePeriodDays?: number;
 }
 
+export type PolicyExecutionSource = 'AUTONOMOUS' | 'HUMAN_REVIEW_APPROVAL';
+
 export interface PolicyExecutionContext {
   merchantId: string;
   killSwitchActive: boolean;
@@ -78,6 +80,7 @@ export interface PolicyExecutionContext {
   priorOutcomes: PriorOutcomeRecord[];
   activeCommitments?: ActiveCommitmentRecord[];
   currentTime: Date;
+  executionSource?: PolicyExecutionSource;
 }
 
 export interface PolicyEvaluationResult {

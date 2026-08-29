@@ -20,6 +20,7 @@ import {
   IPolicyEngine,
   PolicyEvaluationResult,
   PolicyExecutionContext,
+  PolicyExecutionSource,
 } from './policy-interface.js';
 import {
   ProviderActionInput,
@@ -75,6 +76,7 @@ export interface AuthorizeActionParams {
    */
   policyEvaluation: PolicyEvaluationResult;
   attemptOrVersion?: string | number;
+  executionSource?: PolicyExecutionSource;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -210,6 +212,7 @@ export class ActionExecutor {
       policyDecision: PolicyDecision.ALLOW,
       policyRationale: policyEvaluation.rationale,
       status: ActionExecutionStatus.PENDING,
+      executionMetadata: params.executionSource ? { executionSource: params.executionSource } : undefined,
     });
 
     await this.auditRepo.record(merchantId, {
@@ -253,7 +256,11 @@ export class ActionExecutor {
    *    - External: resolve provider, emit ACTION_DISPATCHED immediately before
    *      provider.execute(), handle result/failure/exception
    */
-  async executeAction(merchantId: string, actionId: string): Promise<ActionExecutionResult> {
+  async executeAction(
+    merchantId: string,
+    actionId: string,
+    options?: { executionSource?: PolicyExecutionSource },
+  ): Promise<ActionExecutionResult> {
     // ── Step 1: Verify tenant ownership ──────────────────────────────────────
     const action = await this.actionRepo.getActionById(merchantId, actionId);
     if (!action) {
@@ -343,6 +350,11 @@ export class ActionExecutor {
 
     const policyConfig = await this.policyConfigRepo.getOrCreateConfig(merchantId);
 
+    const executionSource: PolicyExecutionSource =
+      options?.executionSource ||
+      ((action.executionMetadata as Record<string, unknown> | null)?.executionSource as PolicyExecutionSource) ||
+      'AUTONOMOUS';
+
     // ── Step 5: Fresh Policy Revalidation — only the claim owner revalidates ──
     const freshContext: PolicyExecutionContext = {
       merchantId,
@@ -407,6 +419,7 @@ export class ActionExecutor {
         amountRecovered: o.amountRecovered?.toString(),
       })),
       currentTime: this.clock ? this.clock() : new Date(),
+      executionSource,
     };
 
     const revalidation = this.policyEngine.evaluate(freshContext);

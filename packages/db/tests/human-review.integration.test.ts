@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { Prisma, ReviewStatus, UserRole } from '@prisma/client';
+﻿import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { Prisma, ReviewStatus, Role } from '@prisma/client';
 import {
   prisma,
   checkDatabaseConnection,
@@ -57,8 +57,8 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
 
   const userAdminAId = 'usr_rev_admin_a_01';
   const userReviewerAId = 'usr_rev_reviewer_a_02';
-  const userMemberAId = 'usr_rev_member_a_03';
   const userAdminBId = 'usr_rev_admin_b_01';
+  const nonExistentUserId = 'usr_rev_unknown_99';
 
   beforeAll(async () => {
     try {
@@ -149,7 +149,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
             merchantId: merchantAId,
             email: `admin-a-${Date.now()}@example.com`,
             name: 'Admin A',
-            role: UserRole.MERCHANT_ADMIN,
+            role: Role.MERCHANT_ADMIN,
             passwordHash: 'hash_a_admin',
           },
           {
@@ -157,23 +157,15 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
             merchantId: merchantAId,
             email: `reviewer-a-${Date.now()}@example.com`,
             name: 'Reviewer A',
-            role: UserRole.REVIEWER,
+            role: Role.REVIEWER,
             passwordHash: 'hash_a_reviewer',
-          },
-          {
-            id: userMemberAId,
-            merchantId: merchantAId,
-            email: `member-a-${Date.now()}@example.com`,
-            name: 'Member A (Unauthorized)',
-            role: UserRole.MEMBER,
-            passwordHash: 'hash_a_member',
           },
           {
             id: userAdminBId,
             merchantId: merchantBId,
             email: `admin-b-${Date.now()}@example.com`,
             name: 'Admin B',
-            role: UserRole.MERCHANT_ADMIN,
+            role: Role.MERCHANT_ADMIN,
             passwordHash: 'hash_b_admin',
           },
         ],
@@ -184,6 +176,13 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
       await policyConfigRepo.getOrCreateConfig(merchantBId);
     } catch {
       dbAvailable = false;
+    }
+  });
+
+  beforeEach(() => {
+    if (simulatedProvider) {
+      simulatedProvider.dispatchedCalls = [];
+      simulatedProvider.setBehavior(null);
     }
   });
 
@@ -234,7 +233,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     return { customer, testCase: c, planVersion };
   }
 
-  // A. Review Creation
+  // A. Review Creation & DB Idempotency
   it('Scenario A: PolicyDecision.REVIEW triggers HumanReview creation with status PENDING, case to NEEDS_REVIEW, and audit REVIEW_REQUESTED', async () => {
     if (!dbAvailable) return;
 
@@ -260,8 +259,90 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(reviewAudit).toBeDefined();
   });
 
-  // B. Approval Happy Path
-  it('Scenario B: Reviewer approves pending review -> fresh policy ALLOW -> ActionExecutor executes -> review APPROVED -> audits correct', async () => {
+  // A2. 5-Way Concurrent DB Creation Proof
+  it('Scenario A2: 5 simultaneous requestReview calls converge on same review, 1 DB record, 1 audit, case in NEEDS_REVIEW', async () => {
+    if (!dbAvailable) return;
+
+    const { testCase, planVersion } = await createTestCase(merchantAId);
+
+    // Run 5 simultaneous review requests for the same merchant/case/planVersion
+    const results = await Promise.all([
+      reviewService.requestReview(merchantAId, testCase.id, {
+        planVersionId: planVersion.id,
+        reasonForReview: 'Concurrent request 1',
+      }),
+      reviewService.requestReview(merchantAId, testCase.id, {
+        planVersionId: planVersion.id,
+        reasonForReview: 'Concurrent request 2',
+      }),
+      reviewService.requestReview(merchantAId, testCase.id, {
+        planVersionId: planVersion.id,
+        reasonForReview: 'Concurrent request 3',
+      }),
+      reviewService.requestReview(merchantAId, testCase.id, {
+        planVersionId: planVersion.id,
+        reasonForReview: 'Concurrent request 4',
+      }),
+      reviewService.requestReview(merchantAId, testCase.id, {
+        planVersionId: planVersion.id,
+        reasonForReview: 'Concurrent request 5',
+      }),
+    ]);
+
+    // All 5 fulfilled
+    expect(results).toHaveLength(5);
+    const firstReviewId = results[0].review.id;
+
+    // All 5 converge on the exact same review.id
+    for (const res of results) {
+      expect(res.review.id).toBe(firstReviewId);
+      expect(res.review.status).toBe(ReviewStatus.PENDING);
+    }
+
+    // Exactly 1 review record in DB for this planVersion
+    const dbReviews = await prisma.humanReview.findMany({
+      where: { merchantId: merchantAId, caseId: testCase.id, planVersionId: planVersion.id },
+    });
+    expect(dbReviews).toHaveLength(1);
+    expect(dbReviews[0].id).toBe(firstReviewId);
+
+    // Exactly 1 REVIEW_REQUESTED audit recorded for this case
+    const audits = await auditRepo.listByCase(merchantAId, testCase.id);
+    const reviewAudits = audits.filter((a) => a.eventType === 'REVIEW_REQUESTED');
+    expect(reviewAudits).toHaveLength(1);
+
+    // Case is in NEEDS_REVIEW
+    const updatedCase = await caseRepo.getCaseById(merchantAId, testCase.id);
+    expect(updatedCase?.status).toBe(CaseStatus.NEEDS_REVIEW);
+
+    // Also prove a different planVersionId creates a distinct review
+    const planVersion2 = await prisma.recoveryPlanVersion.create({
+      data: {
+        merchantId: merchantAId,
+        caseId: testCase.id,
+        version: 2,
+        diagnosisCode: 'HARD_DECLINE',
+        diagnosisSummary: 'Card expired',
+        proposedActionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE,
+        proposedActionParams: {},
+        confidence: 0.9,
+        llmPrompt: 'test prompt v2',
+        llmResponse: 'test response v2',
+      },
+    });
+
+    const v2Result = await reviewService.requestReview(merchantAId, testCase.id, {
+      planVersionId: planVersion2.id,
+      reasonForReview: 'Distinct v2 review',
+    });
+
+    expect(v2Result.created).toBe(true);
+    expect(v2Result.review.id).not.toBe(firstReviewId);
+    expect(v2Result.review.planVersionId).toBe(planVersion2.id);
+  });
+
+  // B. Approval Happy Path & Double Revalidation
+  it('Scenario B: Reviewer approves pending review -> fresh policy ALLOW -> ActionExecutor executes -> review APPROVED -> provider called once', async () => {
     if (!dbAvailable) return;
 
     const { testCase, planVersion } = await createTestCase(merchantAId);
@@ -279,6 +360,9 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(approval.executionResult?.success).toBe(true);
     expect(approval.action?.status).toBe(ActionExecutionStatus.SUCCESS);
 
+    // Provider called exactly once
+    expect(simulatedProvider.dispatchedCalls).toHaveLength(1);
+
     // Verify persisted review in DB
     const dbReview = await reviewRepo.getReviewById(merchantAId, req.review!.id);
     expect(dbReview.status).toBe(ReviewStatus.APPROVED);
@@ -292,37 +376,70 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(audits.some((a) => a.eventType === 'ACTION_DISPATCHED')).toBe(true);
   });
 
-  // C. Hard Invariant Prevents Approval Override (Opt-Out)
-  it('Scenario C: Customer opts out while review is pending -> human approves -> fresh policy rejects (DENY) -> zero execution -> audit REVIEW_EXECUTION_BLOCKED', async () => {
+  // C. Safety Race: Opt-Out Before ActionExecutor Dispatch
+  it('Scenario C: Review approved -> before ActionExecutor dispatch customer opts out -> ActionExecutor revalidation DENY -> action CANCELLED -> 0 provider calls', async () => {
     if (!dbAvailable) return;
 
     const { customer, testCase, planVersion } = await createTestCase(merchantAId);
     const req = await reviewService.requestReview(merchantAId, testCase.id, {
       planVersionId: planVersion.id,
-      reasonForReview: 'Needs check',
+      reasonForReview: 'Pre-dispatch race test',
     });
 
-    // Customer opts out before human approves
+    // Human approves and authorizes action
+    // Step 1: Resolve review and authorize action in PENDING state
+    const resolvedReview = await reviewRepo.resolveReview(merchantAId, req.review!.id, {
+      reviewerId: userReviewerAId,
+      status: ReviewStatus.APPROVED,
+      expectedStatus: ReviewStatus.PENDING,
+      reviewDecision: 'APPROVED',
+      revalidatedPolicyDecision: PolicyDecision.ALLOW,
+    });
+
+    const authResult = await actionExecutor.authorizeAndCreateAction(merchantAId, testCase.id, {
+      planVersionId: planVersion.id,
+      actionType: planVersion.proposedActionType,
+      actionParams: planVersion.proposedActionParams as Record<string, unknown>,
+      policyEvaluation: {
+        decision: PolicyDecision.ALLOW,
+        reasonCode: 'VALID_POLICY',
+        rationale: 'Human approved',
+        evaluatedAt: new Date(),
+        violations: [],
+      },
+      executionSource: 'HUMAN_REVIEW_APPROVAL',
+    });
+
+    expect(authResult.authorized).toBe(true);
+    expect(authResult.action?.status).toBe(ActionExecutionStatus.PENDING);
+
+    // RACE CONDITION OCCURS: Customer opts out in DB before ActionExecutor.executeAction executes
     await customerRepo.updateConsent(merchantAId, customer.id, false, true);
 
-    const approval = await reviewService.approveReview(merchantAId, req.review!.id, userReviewerAId);
+    // ActionExecutor claims and runs fresh policy revalidation
+    const executionResult = await actionExecutor.executeAction(merchantAId, authResult.action!.id, {
+      executionSource: 'HUMAN_REVIEW_APPROVAL',
+    });
 
-    expect(approval.approved).toBe(false);
-    expect(approval.blockedByPolicy).toBe(true);
-    expect(approval.policyDecision).toBe(PolicyDecision.DENY);
-    expect(approval.policyReasonCode).toBe('CUSTOMER_OPTED_OUT');
+    // Fresh revalidation detects customer opted out -> blocks execution
+    expect(executionResult.executed).toBe(false);
+    expect(executionResult.blockedByPolicy).toBe(true);
+    expect(executionResult.policyDecision).toBe(PolicyDecision.DENY);
+    expect(executionResult.policyReasonCode).toBe('CUSTOMER_OPTED_OUT');
+    expect(executionResult.action.status).toBe(ActionExecutionStatus.CANCELLED);
 
-    // Verify ZERO actions executed in DB
-    const actions = await actionRepo.listActionsForCase(merchantAId, testCase.id);
-    expect(actions).toHaveLength(0);
+    // ZERO provider calls made
+    expect(simulatedProvider.dispatchedCalls).toHaveLength(0);
 
-    // Verify review remains PENDING
-    const dbReview = await reviewRepo.getReviewById(merchantAId, req.review!.id);
-    expect(dbReview.status).toBe(ReviewStatus.PENDING);
+    // Verify DB action status is CANCELLED
+    const dbAction = await actionRepo.getActionById(merchantAId, authResult.action!.id);
+    expect(dbAction?.status).toBe(ActionExecutionStatus.CANCELLED);
 
-    // Verify audit
+    // Verify ACTION_BLOCKED_BY_POLICY audit recorded
     const audits = await auditRepo.listByCase(merchantAId, testCase.id);
-    expect(audits.some((a) => a.eventType === 'REVIEW_EXECUTION_BLOCKED')).toBe(true);
+    const blockedAudit = audits.find((a) => a.eventType === 'ACTION_BLOCKED_BY_POLICY');
+    expect(blockedAudit).toBeDefined();
+    expect(blockedAudit?.reasonCode).toBe('CUSTOMER_OPTED_OUT');
   });
 
   // D. Stale Proposal Rejection
@@ -450,8 +567,8 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     ).rejects.toThrow();
   });
 
-  // H. Role Enforcement
-  it('Scenario H: User with unauthorized role (MEMBER) cannot resolve review', async () => {
+  // H. Role & Reviewer Membership Enforcement in DB
+  it('Scenario H: Non-existent or other-merchant reviewer cannot resolve review in DB', async () => {
     if (!dbAvailable) return;
 
     const { testCase, planVersion } = await createTestCase(merchantAId);
@@ -462,14 +579,14 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
 
     const reviewId = req.review!.id;
 
-    // User with MEMBER role attempts approval
+    // Non-existent user attempts approval
     await expect(
-      reviewService.approveReview(merchantAId, reviewId, userMemberAId),
+      reviewService.approveReview(merchantAId, reviewId, nonExistentUserId),
     ).rejects.toThrow(UnauthorizedReviewerError);
 
-    // User with MEMBER role attempts rejection
+    // Other-merchant user attempts rejection
     await expect(
-      reviewService.rejectReview(merchantAId, reviewId, userMemberAId, { reason: 'Unauthorized rejection' }),
+      reviewService.rejectReview(merchantAId, reviewId, userAdminBId, { reason: 'Cross merchant rejection' }),
     ).rejects.toThrow(UnauthorizedReviewerError);
 
     // Review remains PENDING in DB
@@ -477,32 +594,8 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(dbReview.status).toBe(ReviewStatus.PENDING);
   });
 
-  // I. Duplicate Review Prevention
-  it('Scenario I: Multiple review requests for same proposal/version do not create duplicate active reviews', async () => {
-    if (!dbAvailable) return;
-
-    const { testCase, planVersion } = await createTestCase(merchantAId);
-
-    // Request review twice with same caseId and planVersionId
-    const res1 = await reviewService.requestReview(merchantAId, testCase.id, {
-      planVersionId: planVersion.id,
-      reasonForReview: 'First request',
-    });
-
-    const res2 = await reviewService.requestReview(merchantAId, testCase.id, {
-      planVersionId: planVersion.id,
-      reasonForReview: 'Duplicate request',
-    });
-
-    expect(res1.review.id).toBe(res2.review.id);
-
-    // Verify DB count of reviews for this case
-    const allReviews = await reviewRepo.listReviews(merchantAId, { caseId: testCase.id });
-    expect(allReviews).toHaveLength(1);
-  });
-
-  // J. Take Over Case
-  it('Scenario J: Review taken over -> marked TAKEN_OVER -> audit written -> orchestrator halts autonomous processing', async () => {
+  // I. Take Over Case
+  it('Scenario I: Review taken over -> marked TAKEN_OVER -> audit written -> orchestrator halts autonomous processing', async () => {
     if (!dbAvailable) return;
 
     const { testCase, planVersion } = await createTestCase(merchantAId);

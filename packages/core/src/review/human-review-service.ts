@@ -137,10 +137,11 @@ export class HumanReviewService {
     data: {
       planVersionId?: string;
       actionId?: string;
+      reviewKey?: string;
       reasonForReview: string;
       actorType?: AuditActorType;
     },
-  ): Promise<{ created: boolean; review?: HumanReview | null; caseStatus: CaseStatus; reason?: string }> {
+  ): Promise<{ created: boolean; review: HumanReview | null; caseStatus: CaseStatus; reason?: string }> {
     const caseRecord = await this.caseRepo.getCaseById(merchantId, caseId);
     if (!caseRecord) {
       throw new Error(`Case "${caseId}" not found for merchant "${merchantId}"`);
@@ -162,33 +163,40 @@ export class HumanReviewService {
 
     // Transition case to NEEDS_REVIEW via CAS if not already there
     if (caseRecord.status === CaseStatus.OPEN || caseRecord.status === CaseStatus.WAITING) {
-      await this.caseRepo.compareAndSetStatus(merchantId, caseId, caseRecord.status, CaseStatus.NEEDS_REVIEW);
+      try {
+        await this.caseRepo.compareAndSetStatus(merchantId, caseId, caseRecord.status, CaseStatus.NEEDS_REVIEW);
+      } catch {
+        // Concurrency CAS loss is safe if another concurrent request already transitioned it
+      }
     }
 
     // Create durable review idempotently bound to proposal/version
-    const review = await this.humanReviewRepo.createReview(merchantId, {
+    const createResult = await this.humanReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId: data.planVersionId,
       actionId: data.actionId,
+      reviewKey: data.reviewKey,
       reasonForReview: data.reasonForReview,
     });
 
-    await this.auditRepo.record(merchantId, {
-      caseId,
-      eventType: 'REVIEW_REQUESTED',
-      actorType: data.actorType || AuditActorType.POLICY,
-      inputSummaryJson: {
-        reviewId: review.id,
-        planVersionId: data.planVersionId,
-        actionId: data.actionId,
-        reasonForReview: data.reasonForReview,
-      },
-      reasonCode: 'HUMAN_REVIEW_REQUESTED',
-    });
+    if (createResult.created) {
+      await this.auditRepo.record(merchantId, {
+        caseId,
+        eventType: 'REVIEW_REQUESTED',
+        actorType: data.actorType || AuditActorType.POLICY,
+        inputSummaryJson: {
+          reviewId: createResult.review.id,
+          planVersionId: data.planVersionId,
+          actionId: data.actionId,
+          reasonForReview: data.reasonForReview,
+        },
+        reasonCode: 'HUMAN_REVIEW_REQUESTED',
+      });
+    }
 
     return {
-      created: true,
-      review,
+      created: createResult.created,
+      review: createResult.review,
       caseStatus: CaseStatus.NEEDS_REVIEW,
     };
   }
@@ -376,7 +384,7 @@ export class HumanReviewService {
         riskType: caseRecord.riskType,
         amountAtRisk: caseRecord.amountAtRisk.toString(),
         currency: caseRecord.currency,
-        status: CaseStatus.OPEN,
+        status: caseRecord.status,
         openedAt: caseRecord.openedAt,
         diagnosisCode: boundPlanVersion ? boundPlanVersion.diagnosisCode : 'HUMAN_APPROVED',
       },
@@ -408,6 +416,7 @@ export class HumanReviewService {
         status: c.status,
       })),
       currentTime,
+      executionSource: 'HUMAN_REVIEW_APPROVAL',
     };
 
     const policyEvaluation = this.policyEngine.evaluate(policyExecutionContext);
@@ -501,11 +510,6 @@ export class HumanReviewService {
       reasonCode: 'POLICY_REVALIDATION_ALLOWED',
     });
 
-    // Transition case from NEEDS_REVIEW to OPEN for execution
-    if (caseRecord.status === CaseStatus.NEEDS_REVIEW) {
-      await this.caseRepo.compareAndSetStatus(merchantId, caseRecord.id, CaseStatus.NEEDS_REVIEW, CaseStatus.OPEN);
-    }
-
     // 8. Authorize and Execute Action via ActionExecutor
     const authResult = await this.actionExecutor.authorizeAndCreateAction(merchantId, caseRecord.id, {
       planVersionId: review.planVersionId || undefined,
@@ -513,6 +517,7 @@ export class HumanReviewService {
       actionParams: proposedActionParams,
       policyEvaluation,
       attemptOrVersion: review.planVersion ? review.planVersion.version : 1,
+      executionSource: 'HUMAN_REVIEW_APPROVAL',
     });
 
     if (!authResult.authorized || !authResult.action) {
@@ -523,7 +528,9 @@ export class HumanReviewService {
       };
     }
 
-    const executionResult = await this.actionExecutor.executeAction(merchantId, authResult.action.id);
+    const executionResult = await this.actionExecutor.executeAction(merchantId, authResult.action.id, {
+      executionSource: 'HUMAN_REVIEW_APPROVAL',
+    });
 
     return {
       approved: true,

@@ -656,25 +656,27 @@ export class RecoveryOrchestrator {
       await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
 
       if (this.humanReviewRepo) {
-        const review = await this.humanReviewRepo.createReview(merchantId, {
+        const createResult = await this.humanReviewRepo.createReview(merchantId, {
           caseId,
           planVersionId: planVersion.id,
           reasonForReview: policyEvaluation.rationale,
         });
 
-        await this.auditRepo.record(merchantId, {
-          caseId,
-          eventType: 'REVIEW_REQUESTED',
-          actorType: AuditActorType.POLICY,
-          inputSummaryJson: {
-            reviewId: review.id,
-            planVersionId: planVersion.id,
-            planVersion: planVersion.version,
-            reasonForReview: policyEvaluation.rationale,
+        if (createResult.created) {
+          await this.auditRepo.record(merchantId, {
+            caseId,
+            eventType: 'REVIEW_REQUESTED',
+            actorType: AuditActorType.POLICY,
+            inputSummaryJson: {
+              reviewId: createResult.review.id,
+              planVersionId: planVersion.id,
+              planVersion: planVersion.version,
+              reasonForReview: policyEvaluation.rationale,
+              reasonCode: policyEvaluation.reasonCode,
+            },
             reasonCode: policyEvaluation.reasonCode,
-          },
-          reasonCode: policyEvaluation.reasonCode,
-        });
+          });
+        }
       }
 
       await this.auditRepo.record(merchantId, {

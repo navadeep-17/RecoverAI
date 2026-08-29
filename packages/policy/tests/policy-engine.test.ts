@@ -97,14 +97,68 @@ describe('Deterministic PolicyEngine Specification & Invariant Tests', () => {
       }
     });
 
-    it('DENY: case is currently pending human review (NEEDS_REVIEW)', () => {
+    it('DENY: case is currently pending human review (NEEDS_REVIEW) in AUTONOMOUS mode', () => {
       const context = createBaseContext({
         case: { ...createBaseContext().case, status: CaseStatus.NEEDS_REVIEW },
+        executionSource: 'AUTONOMOUS',
       });
       const result = engine.evaluate(context);
 
       expect(result.decision).toBe(PolicyDecision.DENY);
       expect(result.reasonCode).toBe(PolicyReasonCodes.CASE_NEEDS_REVIEW);
+      expect(context.case.status).toBe(CaseStatus.NEEDS_REVIEW);
+    });
+
+    it('ALLOW: case in NEEDS_REVIEW permits execution when executionSource is HUMAN_REVIEW_APPROVAL and otherwise valid', () => {
+      const context = createBaseContext({
+        case: { ...createBaseContext().case, status: CaseStatus.NEEDS_REVIEW },
+        executionSource: 'HUMAN_REVIEW_APPROVAL',
+      });
+      const result = engine.evaluate(context);
+
+      expect(result.decision).toBe(PolicyDecision.ALLOW);
+      expect(context.case.status).toBe(CaseStatus.NEEDS_REVIEW);
+    });
+
+    it('DENY: HUMAN_REVIEW_APPROVAL does NOT bypass customer opt-out on NEEDS_REVIEW case', () => {
+      const context = createBaseContext({
+        case: { ...createBaseContext().case, status: CaseStatus.NEEDS_REVIEW },
+        customer: { id: 'cust_1', contactConsent: true, optedOut: true },
+        proposedActionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+        executionSource: 'HUMAN_REVIEW_APPROVAL',
+      });
+      const result = engine.evaluate(context);
+
+      expect(result.decision).toBe(PolicyDecision.DENY);
+      expect(result.reasonCode).toBe(PolicyReasonCodes.CUSTOMER_OPTED_OUT);
+      expect(context.case.status).toBe(CaseStatus.NEEDS_REVIEW);
+    });
+
+    it('DENY: HUMAN_REVIEW_APPROVAL does NOT bypass merchant kill switch on NEEDS_REVIEW case', () => {
+      const context = createBaseContext({
+        case: { ...createBaseContext().case, status: CaseStatus.NEEDS_REVIEW },
+        killSwitchActive: true,
+        executionSource: 'HUMAN_REVIEW_APPROVAL',
+      });
+      const result = engine.evaluate(context);
+
+      expect(result.decision).toBe(PolicyDecision.DENY);
+      expect(result.reasonCode).toBe(PolicyReasonCodes.KILL_SWITCH_ACTIVE);
+      expect(context.case.status).toBe(CaseStatus.NEEDS_REVIEW);
+    });
+
+    it('DENY: HUMAN_REVIEW_APPROVAL does NOT bypass hard decline rule on NEEDS_REVIEW case', () => {
+      const context = createBaseContext({
+        case: { ...createBaseContext().case, status: CaseStatus.NEEDS_REVIEW },
+        verifiedPaymentFailureCode: 'CARD_EXPIRED',
+        proposedActionType: RecoveryActionType.RETRY_PAYMENT,
+        executionSource: 'HUMAN_REVIEW_APPROVAL',
+      });
+      const result = engine.evaluate(context);
+
+      expect(result.decision).toBe(PolicyDecision.DENY);
+      expect(result.reasonCode).toBe(PolicyReasonCodes.HARD_DECLINE_BLOCKS_RETRY);
+      expect(context.case.status).toBe(CaseStatus.NEEDS_REVIEW);
     });
 
     it('DENY: customer record missing on customer communication action (REQUIRED_FACTS_MISSING)', () => {

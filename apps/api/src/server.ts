@@ -6,6 +6,7 @@ import { checkDatabaseConnection } from '@recoverai/db';
 
 import { HumanReviewService } from '@recoverai/core';
 import { reviewRoutes } from './routes/review-routes.js';
+import { authenticatePrincipalHook } from './auth/principal.js';
 
 export interface BuildServerOptions {
   checkDbConnection?: () => Promise<boolean>;
@@ -34,6 +35,9 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     origin: env.CORS_ORIGIN,
     credentials: true,
   });
+
+  app.decorateRequest('principal', null);
+  app.addHook('preHandler', authenticatePrincipalHook);
 
   // Request/Response logging & correlation header injection
   app.addHook('onRequest', async (req, reply) => {

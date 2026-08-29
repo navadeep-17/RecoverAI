@@ -1,32 +1,12 @@
-﻿import { FastifyInstance, FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify';
+import { FastifyInstance, FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { ReviewStatus } from '@prisma/client';
+import { ReviewStatus, Role } from '@prisma/client';
 import { HumanReviewService } from '@recoverai/core';
 import { ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
+import { requirePrincipal } from '../auth/principal.js';
 
 export interface ReviewRoutesOptions {
   reviewService: HumanReviewService;
-}
-
-interface AuthContext {
-  merchantId: string;
-  userId: string;
-  role?: string;
-}
-
-function extractAuthContext(req: FastifyRequest): AuthContext {
-  const merchantId = (req.headers['x-merchant-id'] as string) || (req.headers['x-tenant-id'] as string);
-  const userId = (req.headers['x-user-id'] as string) || (req.headers['x-reviewer-id'] as string);
-  const role = req.headers['x-user-role'] as string | undefined;
-
-  if (!merchantId || typeof merchantId !== 'string') {
-    throw new Error('UNAUTHORIZED_MERCHANT: Missing or invalid x-merchant-id header');
-  }
-  if (!userId || typeof userId !== 'string') {
-    throw new Error('UNAUTHORIZED_USER: Missing or invalid x-user-id header');
-  }
-
-  return { merchantId, userId, role };
 }
 
 export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
@@ -38,14 +18,14 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
   // 1. GET /reviews — List reviews for authenticated merchant
   app.get('/', async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const { merchantId } = extractAuthContext(req);
+      const principal = requirePrincipal(req);
       const querySchema = z.object({
         status: z.nativeEnum(ReviewStatus).optional(),
         caseId: z.string().optional(),
       });
       const query = querySchema.parse(req.query);
 
-      const reviews = await reviewService.listReviews(merchantId, query);
+      const reviews = await reviewService.listReviews(principal.merchantId, query);
       return reply.status(200).send({ reviews });
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -62,13 +42,13 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
   // 2. GET /reviews/:reviewId — Get single review details
   app.get('/:reviewId', async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const { merchantId } = extractAuthContext(req);
+      const principal = requirePrincipal(req);
       const paramsSchema = z.object({
         reviewId: z.string(),
       });
       const { reviewId } = paramsSchema.parse(req.params);
 
-      const review = await reviewService.getReviewById(merchantId, reviewId);
+      const review = await reviewService.getReviewById(principal.merchantId, reviewId);
       return reply.status(200).send({ review });
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -88,7 +68,11 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
   // 3. POST /reviews/:reviewId/approve — Approve review and execute proposal
   app.post('/:reviewId/approve', async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const { merchantId, userId } = extractAuthContext(req);
+      const principal = requirePrincipal(req);
+      if (principal.role !== Role.MERCHANT_ADMIN && principal.role !== Role.REVIEWER) {
+        return reply.status(403).send({ error: 'UNAUTHORIZED_ROLE: Insufficient permissions for review approval' });
+      }
+
       const paramsSchema = z.object({
         reviewId: z.string(),
       });
@@ -99,7 +83,7 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
       const { reviewId } = paramsSchema.parse(req.params);
       const body = bodySchema?.parse(req.body) || {};
 
-      const result = await reviewService.approveReview(merchantId, reviewId, userId, body);
+      const result = await reviewService.approveReview(principal.merchantId, reviewId, principal.userId, body);
 
       if (!result.approved) {
         if (result.stale) {
@@ -139,7 +123,11 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
   // 4. POST /reviews/:reviewId/reject — Reject review proposal
   app.post('/:reviewId/reject', async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const { merchantId, userId } = extractAuthContext(req);
+      const principal = requirePrincipal(req);
+      if (principal.role !== Role.MERCHANT_ADMIN && principal.role !== Role.REVIEWER) {
+        return reply.status(403).send({ error: 'UNAUTHORIZED_ROLE: Insufficient permissions for review rejection' });
+      }
+
       const paramsSchema = z.object({
         reviewId: z.string(),
       });
@@ -151,7 +139,7 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
       const { reviewId } = paramsSchema.parse(req.params);
       const body = bodySchema.parse(req.body);
 
-      const result = await reviewService.rejectReview(merchantId, reviewId, userId, body);
+      const result = await reviewService.rejectReview(principal.merchantId, reviewId, principal.userId, body);
       return reply.status(200).send(result);
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -180,7 +168,11 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
   // 5. POST /reviews/:reviewId/take-over — Human takes over case
   app.post('/:reviewId/take-over', async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const { merchantId, userId } = extractAuthContext(req);
+      const principal = requirePrincipal(req);
+      if (principal.role !== Role.MERCHANT_ADMIN && principal.role !== Role.REVIEWER) {
+        return reply.status(403).send({ error: 'UNAUTHORIZED_ROLE: Insufficient permissions for review takeover' });
+      }
+
       const paramsSchema = z.object({
         reviewId: z.string(),
       });
@@ -191,7 +183,7 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
       const { reviewId } = paramsSchema.parse(req.params);
       const body = bodySchema?.parse(req.body) || {};
 
-      const result = await reviewService.takeOverReview(merchantId, reviewId, userId, body);
+      const result = await reviewService.takeOverReview(principal.merchantId, reviewId, principal.userId, body);
       return reply.status(200).send(result);
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -217,7 +209,11 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
   // 6. POST /reviews/:reviewId/close — Close review and stop case recovery
   app.post('/:reviewId/close', async (req: FastifyRequest, reply: FastifyReply) => {
     try {
-      const { merchantId, userId } = extractAuthContext(req);
+      const principal = requirePrincipal(req);
+      if (principal.role !== Role.MERCHANT_ADMIN && principal.role !== Role.REVIEWER) {
+        return reply.status(403).send({ error: 'UNAUTHORIZED_ROLE: Insufficient permissions for review closure' });
+      }
+
       const paramsSchema = z.object({
         reviewId: z.string(),
       });
@@ -230,7 +226,7 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
       const { reviewId } = paramsSchema.parse(req.params);
       const body = bodySchema.parse(req.body);
 
-      const result = await reviewService.closeReview(merchantId, reviewId, userId, body);
+      const result = await reviewService.closeReview(principal.merchantId, reviewId, principal.userId, body);
       return reply.status(200).send(result);
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);

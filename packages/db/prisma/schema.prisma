@@ -328,6 +328,7 @@ model HumanReview {
   caseId           String
   actionId         String?
   planVersionId    String?
+  reviewKey        String?
   reviewerId       String?
   reasonForReview  String
   status           ReviewStatus    @default(PENDING)
@@ -345,6 +346,7 @@ model HumanReview {
   planVersion      RecoveryPlanVersion? @relation(fields: [planVersionId], references: [id], onDelete: SetNull)
   reviewer         User?                @relation(fields: [reviewerId], references: [id], onDelete: SetNull)
 
+  @@unique([merchantId, caseId, reviewKey])
   @@index([merchantId, status])
   @@index([caseId, planVersionId])
   @@map("human_reviews")

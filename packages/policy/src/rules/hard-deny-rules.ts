@@ -60,6 +60,10 @@ export class CaseNeedsReviewRule implements IPolicyRule {
   readonly name = 'CaseNeedsReviewRule';
   evaluate(context: PolicyExecutionContext): RuleResult | null {
     if (context.case.status === CaseStatus.NEEDS_REVIEW) {
+      if (context.executionSource === 'HUMAN_REVIEW_APPROVAL') {
+        // Explicit human-review approval revalidation skips ONLY this specific pending-review gate.
+        return null;
+      }
       return {
         decision: PolicyDecision.DENY,
         reasonCode: PolicyReasonCodes.CASE_NEEDS_REVIEW,

@@ -1,56 +1,87 @@
-﻿import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ReviewStatus } from '@prisma/client';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { ReviewStatus, Role } from '@prisma/client';
 import { buildServer } from '../src/server.js';
 import { ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
 
-describe('Human Review API Routes', () => {
-  const merchantId = 'mch_api_test_01';
-  const userId = 'usr_api_reviewer_01';
-  const reviewId = 'rev_api_test_01';
+describe('Human Review API Routes & AuthenticatedPrincipal Boundary', () => {
+  const merchantAId = 'mch_api_test_aaa';
+  const merchantBId = 'mch_api_test_bbb';
+
+  const userAdminAId = 'usr_api_admin_a';
+  const userReviewerAId = 'usr_api_reviewer_a';
+  const userMemberAId = 'usr_api_member_a';
+  const userAdminBId = 'usr_api_admin_b';
+
+  const reviewAId = 'rev_api_test_aaa';
 
   let mockReviewService: any;
   let app: any;
 
   beforeEach(() => {
     mockReviewService = {
-      listReviews: vi.fn(async (mId: string, _filter?: any) => [
-        {
-          id: reviewId,
-          merchantId: mId,
-          caseId: 'case_01',
-          status: ReviewStatus.PENDING,
-          reasonForReview: 'Test review',
-        },
-      ]),
+      listReviews: vi.fn(async (mId: string, _filter?: any) => {
+        if (mId === merchantAId) {
+          return [
+            {
+              id: reviewAId,
+              merchantId: merchantAId,
+              caseId: 'case_01',
+              status: ReviewStatus.PENDING,
+              reasonForReview: 'Alpha test review',
+            },
+          ];
+        }
+        return [];
+      }),
       getReviewById: vi.fn(async (mId: string, rId: string) => {
-        if (rId !== reviewId || mId !== merchantId) {
+        if (rId === reviewAId && mId === merchantAId) {
+          return {
+            id: rId,
+            merchantId: merchantAId,
+            caseId: 'case_01',
+            status: ReviewStatus.PENDING,
+            reasonForReview: 'Alpha test review',
+          };
+        }
+        throw new Error(`Review "${rId}" not found for merchant "${mId}"`);
+      }),
+      approveReview: vi.fn(async (mId: string, rId: string, uId: string, _options?: any) => {
+        if (mId !== merchantAId) {
           throw new Error(`Review "${rId}" not found for merchant "${mId}"`);
         }
         return {
-          id: rId,
-          merchantId: mId,
-          caseId: 'case_01',
-          status: ReviewStatus.PENDING,
-          reasonForReview: 'Test review',
+          approved: true,
+          review: { id: rId, merchantId: mId, reviewerId: uId, status: ReviewStatus.APPROVED },
+          executionResult: { executed: true, success: true },
         };
       }),
-      approveReview: vi.fn(async (_mId: string, _rId: string, _uId: string, _options?: any) => ({
-        approved: true,
-        review: { id: reviewId, status: ReviewStatus.APPROVED },
-        executionResult: { executed: true, success: true },
-      })),
-      rejectReview: vi.fn(async (_mId: string, _rId: string, _uId: string, _options: any) => ({
-        rejected: true,
-        review: { id: reviewId, status: ReviewStatus.REJECTED },
-      })),
-      takeOverReview: vi.fn(async (_mId: string, _rId: string, _uId: string, _options?: any) => ({
-        takenOver: true,
-        review: { id: reviewId, status: ReviewStatus.TAKEN_OVER },
-      })),
-      closeReview: vi.fn(async (_mId: string, _rId: string, _uId: string, _options: any) => ({
-        closed: true,
-        review: { id: reviewId, status: ReviewStatus.CLOSED },
-      })),
+      rejectReview: vi.fn(async (mId: string, rId: string, uId: string, _options: any) => {
+        if (mId !== merchantAId) {
+          throw new Error(`Review "${rId}" not found for merchant "${mId}"`);
+        }
+        return {
+          rejected: true,
+          review: { id: rId, merchantId: mId, reviewerId: uId, status: ReviewStatus.REJECTED },
+        };
+      }),
+      takeOverReview: vi.fn(async (mId: string, rId: string, uId: string, _options?: any) => {
+        if (mId !== merchantAId) {
+          throw new Error(`Review "${rId}" not found for merchant "${mId}"`);
+        }
+        return {
+          takenOver: true,
+          review: { id: rId, merchantId: mId, reviewerId: uId, status: ReviewStatus.TAKEN_OVER },
+        };
+      }),
+      closeReview: vi.fn(async (mId: string, rId: string, uId: string, _options: any) => {
+        if (mId !== merchantAId) {
+          throw new Error(`Review "${rId}" not found for merchant "${mId}"`);
+        }
+        return {
+          closed: true,
+          review: { id: rId, merchantId: mId, reviewerId: uId, status: ReviewStatus.CLOSED },
+        };
+      }),
     };
 
     app = buildServer({
@@ -59,73 +90,120 @@ describe('Human Review API Routes', () => {
     });
   });
 
-  it('GET /reviews returns 200 with list of reviews', async () => {
+  it('no authenticated principal -> 401 Unauthorized', async () => {
     const res = await app.inject({
       method: 'GET',
       url: '/reviews',
-      headers: {
-        'x-merchant-id': merchantId,
-        'x-user-id': userId,
-      },
-    });
-
-    expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.payload);
-    expect(body.reviews).toHaveLength(1);
-    expect(body.reviews[0].id).toBe(reviewId);
-    expect(mockReviewService.listReviews).toHaveBeenCalledWith(merchantId, {});
-  });
-
-  it('GET /reviews returns 401 when merchant header is missing', async () => {
-    const res = await app.inject({
-      method: 'GET',
-      url: '/reviews',
-      headers: {
-        'x-user-id': userId,
-      },
     });
 
     expect(res.statusCode).toBe(401);
   });
 
-  it('GET /reviews/:reviewId returns 200 with review details', async () => {
+  it('Merchant A principal reads Merchant A review', async () => {
     const res = await app.inject({
       method: 'GET',
-      url: `/reviews/${reviewId}`,
+      url: `/reviews/${reviewAId}`,
       headers: {
-        'x-merchant-id': merchantId,
-        'x-user-id': userId,
+        'x-merchant-id': merchantAId,
+        'x-user-id': userAdminAId,
+        'x-user-role': Role.MERCHANT_ADMIN,
       },
     });
 
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.payload);
-    expect(body.review.id).toBe(reviewId);
+    expect(body.review.id).toBe(reviewAId);
+    expect(body.review.merchantId).toBe(merchantAId);
   });
 
-  it('GET /reviews/:reviewId returns 404 when review does not exist', async () => {
+  it('Merchant B principal cannot read Merchant A review (returns 404)', async () => {
     const res = await app.inject({
       method: 'GET',
-      url: '/reviews/non_existent_rev',
+      url: `/reviews/${reviewAId}`,
       headers: {
-        'x-merchant-id': merchantId,
-        'x-user-id': userId,
+        'x-merchant-id': merchantBId,
+        'x-user-id': userAdminBId,
+        'x-user-role': Role.MERCHANT_ADMIN,
       },
     });
 
     expect(res.statusCode).toBe(404);
   });
 
-  it('POST /reviews/:reviewId/approve returns 200 on approval', async () => {
+  it('Merchant B principal cannot resolve Merchant A review', async () => {
     const res = await app.inject({
       method: 'POST',
-      url: `/reviews/${reviewId}/approve`,
+      url: `/reviews/${reviewAId}/approve`,
       headers: {
-        'x-merchant-id': merchantId,
-        'x-user-id': userId,
+        'x-merchant-id': merchantBId,
+        'x-user-id': userAdminBId,
+        'x-user-role': Role.MERCHANT_ADMIN,
       },
       payload: {
-        notes: 'Approved via API',
+        notes: 'Cross tenant approval attack',
+      },
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('MEMBER principal cannot approve review (returns 403 Forbidden)', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/reviews/${reviewAId}/approve`,
+      headers: {
+        'x-merchant-id': merchantAId,
+        'x-user-id': userMemberAId,
+        'x-user-role': 'MEMBER',
+      },
+      payload: {
+        notes: 'Unauthorized approval attempt by member',
+      },
+    });
+
+    expect(res.statusCode).toBe(403);
+    const body = JSON.parse(res.payload);
+    expect(body.error).toContain('UNAUTHORIZED_ROLE');
+  });
+
+  it('MEMBER principal cannot reject or takeover review (returns 403 Forbidden)', async () => {
+    const rejectRes = await app.inject({
+      method: 'POST',
+      url: `/reviews/${reviewAId}/reject`,
+      headers: {
+        'x-merchant-id': merchantAId,
+        'x-user-id': userMemberAId,
+        'x-user-role': 'MEMBER',
+      },
+      payload: {
+        reason: 'Unauthorized rejection attempt',
+      },
+    });
+    expect(rejectRes.statusCode).toBe(403);
+
+    const takeoverRes = await app.inject({
+      method: 'POST',
+      url: `/reviews/${reviewAId}/take-over`,
+      headers: {
+        'x-merchant-id': merchantAId,
+        'x-user-id': userMemberAId,
+        'x-user-role': 'MEMBER',
+      },
+    });
+    expect(takeoverRes.statusCode).toBe(403);
+  });
+
+  it('REVIEWER principal can resolve review (returns 200 OK)', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/reviews/${reviewAId}/approve`,
+      headers: {
+        'x-merchant-id': merchantAId,
+        'x-user-id': userReviewerAId,
+        'x-user-role': Role.REVIEWER,
+      },
+      payload: {
+        notes: 'Approved by reviewer',
       },
     });
 
@@ -133,108 +211,125 @@ describe('Human Review API Routes', () => {
     const body = JSON.parse(res.payload);
     expect(body.approved).toBe(true);
     expect(mockReviewService.approveReview).toHaveBeenCalledWith(
-      merchantId,
-      reviewId,
-      userId,
-      { notes: 'Approved via API' },
+      merchantAId,
+      reviewAId,
+      userReviewerAId,
+      { notes: 'Approved by reviewer' },
     );
   });
 
-  it('POST /reviews/:reviewId/approve returns 409 on stale proposal', async () => {
+  it('MERCHANT_ADMIN principal can resolve review (returns 200 OK)', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/reviews/${reviewAId}/approve`,
+      headers: {
+        'x-merchant-id': merchantAId,
+        'x-user-id': userAdminAId,
+        'x-user-role': Role.MERCHANT_ADMIN,
+      },
+      payload: {
+        notes: 'Approved by admin',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.payload);
+    expect(body.approved).toBe(true);
+  });
+
+  it('request body merchantId cannot change tenant or spoof identity', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/reviews/${reviewAId}/approve`,
+      headers: {
+        'x-merchant-id': merchantAId,
+        'x-user-id': userAdminAId,
+        'x-user-role': Role.MERCHANT_ADMIN,
+      },
+      payload: {
+        merchantId: merchantBId, // Spoofed body param
+        userId: userAdminBId,   // Spoofed body param
+        notes: 'Approved with spoofed body',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    // Service receives authenticated principal's merchantAId and userAdminAId, NOT spoofed body params
+    expect(mockReviewService.approveReview).toHaveBeenCalledWith(
+      merchantAId,
+      reviewAId,
+      userAdminAId,
+      expect.objectContaining({ notes: 'Approved with spoofed body' }),
+    );
+  });
+
+  it('handles stale proposal (409) and policy block (422)', async () => {
     mockReviewService.approveReview.mockResolvedValueOnce({
       approved: false,
       stale: true,
       reason: 'Proposal version is stale',
     });
 
-    const res = await app.inject({
+    const staleRes = await app.inject({
       method: 'POST',
-      url: `/reviews/${reviewId}/approve`,
+      url: `/reviews/${reviewAId}/approve`,
       headers: {
-        'x-merchant-id': merchantId,
-        'x-user-id': userId,
+        'x-merchant-id': merchantAId,
+        'x-user-id': userAdminAId,
+        'x-user-role': Role.MERCHANT_ADMIN,
       },
     });
 
-    expect(res.statusCode).toBe(409);
-    const body = JSON.parse(res.payload);
-    expect(body.stale).toBe(true);
-  });
+    expect(staleRes.statusCode).toBe(409);
 
-  it('POST /reviews/:reviewId/approve returns 422 when blocked by fresh policy', async () => {
     mockReviewService.approveReview.mockResolvedValueOnce({
       approved: false,
       blockedByPolicy: true,
       reason: 'Customer opted out',
     });
 
-    const res = await app.inject({
+    const blockRes = await app.inject({
       method: 'POST',
-      url: `/reviews/${reviewId}/approve`,
+      url: `/reviews/${reviewAId}/approve`,
       headers: {
-        'x-merchant-id': merchantId,
-        'x-user-id': userId,
+        'x-merchant-id': merchantAId,
+        'x-user-id': userAdminAId,
+        'x-user-role': Role.MERCHANT_ADMIN,
       },
     });
 
-    expect(res.statusCode).toBe(422);
-    const body = JSON.parse(res.payload);
-    expect(body.blockedByPolicy).toBe(true);
+    expect(blockRes.statusCode).toBe(422);
   });
 
-  it('POST /reviews/:reviewId/reject returns 200 on rejection', async () => {
-    const res = await app.inject({
+  it('POST /reviews/:reviewId/reject and /close endpoints work with authenticated principal', async () => {
+    const rejectRes = await app.inject({
       method: 'POST',
-      url: `/reviews/${reviewId}/reject`,
+      url: `/reviews/${reviewAId}/reject`,
       headers: {
-        'x-merchant-id': merchantId,
-        'x-user-id': userId,
+        'x-merchant-id': merchantAId,
+        'x-user-id': userAdminAId,
+        'x-user-role': Role.MERCHANT_ADMIN,
       },
       payload: {
-        reason: 'Offer rejected by merchant admin',
-        notes: 'Customer discount exceeded limit',
+        reason: 'Offer rejected',
+        notes: 'Customer contacted support directly',
       },
     });
+    expect(rejectRes.statusCode).toBe(200);
 
-    expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.payload);
-    expect(body.rejected).toBe(true);
-  });
-
-  it('POST /reviews/:reviewId/take-over returns 200 on takeover', async () => {
-    const res = await app.inject({
+    const closeRes = await app.inject({
       method: 'POST',
-      url: `/reviews/${reviewId}/take-over`,
+      url: `/reviews/${reviewAId}/close`,
       headers: {
-        'x-merchant-id': merchantId,
-        'x-user-id': userId,
+        'x-merchant-id': merchantAId,
+        'x-user-id': userAdminAId,
+        'x-user-role': Role.MERCHANT_ADMIN,
       },
       payload: {
-        notes: 'Taking over for custom high-touch handling',
-      },
-    });
-
-    expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.payload);
-    expect(body.takenOver).toBe(true);
-  });
-
-  it('POST /reviews/:reviewId/close returns 200 on administrative close', async () => {
-    const res = await app.inject({
-      method: 'POST',
-      url: `/reviews/${reviewId}/close`,
-      headers: {
-        'x-merchant-id': merchantId,
-        'x-user-id': userId,
-      },
-      payload: {
-        reason: 'Administrative cancellation',
+        reason: 'Administrative stop',
         stopCase: true,
       },
     });
-
-    expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.payload);
-    expect(body.closed).toBe(true);
+    expect(closeRes.statusCode).toBe(200);
   });
 });
