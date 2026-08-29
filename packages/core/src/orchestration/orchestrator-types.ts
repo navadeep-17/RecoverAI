@@ -6,12 +6,21 @@ import {
   RecoveryOutcome,
 } from '@prisma/client';
 
+export interface OrchestrationTriggerPayload {
+  triggerKey: string;
+  triggerType: string;
+  merchantEventId?: string;
+  customerMessageId?: string;
+  scheduledJobId?: string;
+}
+
 export type OrchestrationTrigger =
   | 'CASE_OPENED'
   | 'REPLAN_TRIGGERED'
   | 'OBSERVATION_ARRIVED'
   | 'TIMER_FIRED'
-  | 'MANUAL_RETRY';
+  | 'MANUAL_RETRY'
+  | OrchestrationTriggerPayload;
 
 export interface EligibilityCheckResult {
   eligible: boolean;

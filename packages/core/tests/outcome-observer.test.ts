@@ -5,7 +5,6 @@ import {
 } from '@prisma/client';
 import {
   OutcomeObserver,
-  RecoveryOrchestrator,
 } from '../src/index.js';
 import { NormalizedEventType, MerchantEventSource } from '@recoverai/shared';
 
@@ -77,10 +76,17 @@ describe('OutcomeObserver Unit Tests', () => {
 
     mockOutcomeRepo = {
       recordOutcome: vi.fn(async (_mId: string, cId: string, params: any) => {
+        if (params.dedupeKey) {
+          const existing = inMemoryOutcomes.find((o) => o.dedupeKey === params.dedupeKey);
+          if (existing) {
+            return { outcome: existing, created: false };
+          }
+        }
         const outcome = {
           id: `out_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           caseId: cId,
           merchantEventId: params.merchantEventId || null,
+          dedupeKey: params.dedupeKey || null,
           actionId: params.actionId || null,
           outcomeType: params.outcomeType,
           amountRecovered: params.amountRecovered || null,
@@ -88,7 +94,7 @@ describe('OutcomeObserver Unit Tests', () => {
           observedAt: params.observedAt || new Date(),
         };
         inMemoryOutcomes.push(outcome);
-        return outcome;
+        return { outcome, created: true };
       }),
       findOutcomeByEvent: vi.fn(async (_mId: string, cId: string, eventId: string) => {
         return inMemoryOutcomes.find((o) => o.caseId === cId && o.merchantEventId === eventId) || null;
@@ -121,22 +127,28 @@ describe('OutcomeObserver Unit Tests', () => {
       }),
     };
 
-    mockEventRepo = {
-      recordMerchantEvent: vi.fn(),
-    };
-
     mockAuditRepo = {
       record: vi.fn(async (_mId: string, entry: any) => {
-        inMemoryAudits.push({ merchantId: _mId, ...entry, createdAt: new Date() });
+        inMemoryAudits.push(entry);
       }),
     };
 
+    mockEventRepo = {};
+
     mockJobScheduler = {
-      schedule: vi.fn(async (params: any) => ({ id: `job_${Date.now()}`, ...params })),
+      schedule: vi.fn(async (params: any) => ({
+        id: `job_${Date.now()}`,
+        ...params,
+        status: 'SCHEDULED',
+      })),
     };
 
     mockOrchestrator = {
-      runIteration: vi.fn(async () => ({ iterationCompleted: true })),
+      runIteration: vi.fn(async () => ({
+        caseId,
+        status: CaseStatus.OPEN,
+        iterationCompleted: true,
+      })),
     };
 
     observer = new OutcomeObserver({
@@ -145,7 +157,7 @@ describe('OutcomeObserver Unit Tests', () => {
       outcomeRepo: mockOutcomeRepo,
       customerRepo: mockCustomerRepo,
       commitmentRepo: mockCommitmentRepo,
-      eventRepo: mockEventRepo,
+      eventRepo: mockEventRepo as any,
       auditRepo: mockAuditRepo,
       jobScheduler: mockJobScheduler,
       orchestrator: mockOrchestrator as any,
@@ -184,7 +196,7 @@ describe('OutcomeObserver Unit Tests', () => {
       expect(inMemoryOutcomes.length).toBe(1);
       expect(inMemoryOutcomes[0].outcomeType).toBe(NormalizedEventType.PAYMENT_SUCCEEDED);
 
-      expect(inMemoryAudits.some((a) => a.eventType === 'CASE_RESOLVED_BY_PAYMENT')).toBe(true);
+      expect(inMemoryAudits.some((a) => a.eventType === 'CASE_RECOVERED_BY_PAYMENT')).toBe(true);
     });
 
     it('rejects recovery when currency does not match case currency (preserves case open)', async () => {
@@ -211,6 +223,91 @@ describe('OutcomeObserver Unit Tests', () => {
       expect(inMemoryOutcomes.length).toBe(0);
 
       expect(inMemoryAudits.some((a) => a.eventType === 'CURRENCY_MISMATCH_REJECTED')).toBe(true);
+    });
+
+    it('rejects recovery when amount is missing', async () => {
+      const paymentEvent: any = {
+        eventId: 'evt_pay_no_amt',
+        merchantId,
+        source: MerchantEventSource.RAZORPAY,
+        eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+        occurredAt: new Date(),
+        currency: 'INR',
+        payment: {
+          paymentId: 'pay_123456',
+        },
+      };
+
+      const result = await observer.observeMerchantEvent(paymentEvent);
+
+      expect(result.observed).toBe(false);
+      expect(result.reason).toContain('missing or has invalid monetary amount');
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
+    });
+
+    it('rejects recovery when amount is zero (0.00)', async () => {
+      const paymentEvent: any = {
+        eventId: 'evt_pay_zero',
+        merchantId,
+        source: MerchantEventSource.RAZORPAY,
+        eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+        occurredAt: new Date(),
+        amount: '0.00',
+        currency: 'INR',
+        payment: {
+          paymentId: 'pay_123456',
+        },
+      };
+
+      const result = await observer.observeMerchantEvent(paymentEvent);
+
+      expect(result.observed).toBe(false);
+      expect(result.reason).toContain('must be strictly positive');
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
+    });
+
+    it('rejects full recovery when amount is partial (< amountAtRisk, e.g. 10000.00)', async () => {
+      const paymentEvent: any = {
+        eventId: 'evt_pay_partial',
+        merchantId,
+        source: MerchantEventSource.RAZORPAY,
+        eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+        occurredAt: new Date(),
+        amount: '10000.00',
+        currency: 'INR',
+        payment: {
+          paymentId: 'pay_123456',
+        },
+      };
+
+      const result = await observer.observeMerchantEvent(paymentEvent);
+
+      expect(result.observed).toBe(false);
+      expect(result.reason).toContain('is less than case amount at risk');
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
+      expect(inMemoryAudits.some((a) => a.eventType === 'PARTIAL_PAYMENT_REJECTED')).toBe(true);
+    });
+
+    it('rejects recovery when amount exceeds amountAtRisk (> amountAtRisk, e.g. 15000.00)', async () => {
+      const paymentEvent: any = {
+        eventId: 'evt_pay_over',
+        merchantId,
+        source: MerchantEventSource.RAZORPAY,
+        eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+        occurredAt: new Date(),
+        amount: '15000.00',
+        currency: 'INR',
+        payment: {
+          paymentId: 'pay_123456',
+        },
+      };
+
+      const result = await observer.observeMerchantEvent(paymentEvent);
+
+      expect(result.observed).toBe(false);
+      expect(result.reason).toContain('exceeds case amount at risk');
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
+      expect(inMemoryAudits.some((a) => a.eventType === 'OVERPAYMENT_REJECTED')).toBe(true);
     });
 
     it('idempotent: repeated identical event returns existing outcome and does not double credit', async () => {
@@ -257,17 +354,22 @@ describe('OutcomeObserver Unit Tests', () => {
 
       expect(result.observed).toBe(true);
       expect(result.replanTriggered).toBe(true);
-      expect(mockOrchestrator.runIteration).toHaveBeenCalledWith(merchantId, caseId, 'OBSERVATION_ARRIVED');
+      expect(mockOrchestrator.runIteration).toHaveBeenCalledWith(
+        merchantId,
+        caseId,
+        expect.objectContaining({ triggerType: 'OBSERVATION_ARRIVED' }),
+      );
 
       expect(inMemoryOutcomes.some((o) => o.outcomeType === 'PAYMENT_METHOD_UPDATED')).toBe(true);
     });
 
     it('Customer OPT_OUT marks customer optedOut and stops case', async () => {
-      const result = await observer.observeCustomerReply(
+      const result = await observer.observeCustomerReply({
         merchantId,
         caseId,
-        'Please stop sending me messages, unsubscribe me.',
-      );
+        messageId: 'msg_optout_01',
+        replyText: 'Please stop sending me messages, unsubscribe me.',
+      });
 
       expect(result.observed).toBe(true);
       expect(result.caseStatus).toBe(CaseStatus.STOPPED);
@@ -277,12 +379,13 @@ describe('OutcomeObserver Unit Tests', () => {
       expect(inMemoryAudits.some((a) => a.eventType === 'CUSTOMER_OPTED_OUT')).toBe(true);
     });
 
-    it('Customer PROMISE_TO_PAY creates authoritative RecoveryCommitment and schedules timer', async () => {
-      const result = await observer.observeCustomerReply(
+    it('Customer PROMISE_TO_PAY with explicit date creates authoritative RecoveryCommitment and schedules timer', async () => {
+      const result = await observer.observeCustomerReply({
         merchantId,
         caseId,
-        'I will pay ₹14,999 on Friday without fail',
-      );
+        messageId: 'msg_promise_01',
+        replyText: 'I will pay ₹14,999 on Friday without fail',
+      });
 
       expect(result.observed).toBe(true);
       expect(mockCommitmentRepo.createCommitment).toHaveBeenCalledWith(
@@ -305,6 +408,22 @@ describe('OutcomeObserver Unit Tests', () => {
       expect(inMemoryOutcomes.some((o) => o.outcomeType === 'PROMISE_TO_PAY')).toBe(true);
     });
 
+    it('Customer promise without date does NOT fabricate date (+3 days) and routes to review', async () => {
+      const result = await observer.observeCustomerReply({
+        merchantId,
+        caseId,
+        messageId: 'msg_undated_promise',
+        replyText: 'I promise I will pay soon',
+      });
+
+      expect(result.observed).toBe(true);
+      expect(result.caseStatus).toBe(CaseStatus.NEEDS_REVIEW);
+      // Commitment must NOT be created with fabricated date
+      expect(mockCommitmentRepo.createCommitment).not.toHaveBeenCalled();
+      expect(mockJobScheduler.schedule).not.toHaveBeenCalled();
+      expect(inMemoryAudits.some((a) => a.eventType === 'PROMISE_WITHOUT_DATE_RECEIVED')).toBe(true);
+    });
+
     it('PROMISE_TO_PAY_CHECK timer on unpaid case marks commitment BROKEN and wakes orchestrator', async () => {
       // Create pending commitment
       inMemoryCommitments.set('cmt_01', {
@@ -315,8 +434,12 @@ describe('OutcomeObserver Unit Tests', () => {
         status: 'PENDING',
       });
 
-      const result = await observer.observeTimerFired(merchantId, caseId, 'PROMISE_TO_PAY_CHECK', {
-        commitmentId: 'cmt_01',
+      const result = await observer.observeTimerFired({
+        merchantId,
+        caseId,
+        scheduledJobId: 'job_timer_01',
+        timerType: 'PROMISE_TO_PAY_CHECK',
+        payload: { commitmentId: 'cmt_01' },
       });
 
       expect(result.observed).toBe(true);
@@ -328,7 +451,42 @@ describe('OutcomeObserver Unit Tests', () => {
       );
 
       expect(inMemoryOutcomes.some((o) => o.outcomeType === 'PROMISE_TO_PAY_BROKEN')).toBe(true);
-      expect(mockOrchestrator.runIteration).toHaveBeenCalledWith(merchantId, caseId, 'TIMER_FIRED');
+      expect(mockOrchestrator.runIteration).toHaveBeenCalledWith(
+        merchantId,
+        caseId,
+        expect.objectContaining({ triggerType: 'TIMER_FIRED' }),
+      );
+    });
+
+    it('repeated timer delivery with same scheduledJobId is deduplicated', async () => {
+      inMemoryCommitments.set('cmt_02', {
+        id: 'cmt_02',
+        caseId,
+        promisedAmount: '14999.00',
+        promisedDate: new Date(Date.now() - 3600000),
+        status: 'PENDING',
+      });
+
+      const first = await observer.observeTimerFired({
+        merchantId,
+        caseId,
+        scheduledJobId: 'job_timer_02',
+        timerType: 'PROMISE_TO_PAY_CHECK',
+        payload: { commitmentId: 'cmt_02' },
+      });
+      const second = await observer.observeTimerFired({
+        merchantId,
+        caseId,
+        scheduledJobId: 'job_timer_02',
+        timerType: 'PROMISE_TO_PAY_CHECK',
+        payload: { commitmentId: 'cmt_02' },
+      });
+
+      expect(first.observed).toBe(true);
+      expect(second.observed).toBe(true);
+      expect(second.deduplicated).toBe(true);
+      // updateCommitmentStatus called only once
+      expect(mockCommitmentRepo.updateCommitmentStatus).toHaveBeenCalledTimes(1);
     });
   });
 });

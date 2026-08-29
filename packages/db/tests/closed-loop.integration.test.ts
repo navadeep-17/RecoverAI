@@ -10,6 +10,8 @@ import {
   CommitmentRepository,
   OutcomeRepository,
   EventRepository,
+  ScheduledJobRepository,
+  TriggerRepository,
   CaseStatus,
   PolicyDecision,
   RecoveryActionType,
@@ -85,6 +87,22 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
         clock: () => new Date('2026-08-28T14:00:00+05:30'),
       });
 
+      const scheduledJobRepo = new ScheduledJobRepository();
+      const triggerRepo = new TriggerRepository();
+      const jobScheduler = {
+        schedule: async (params: any) => {
+          const job = await scheduledJobRepo.createJob(params.merchantId, {
+            caseId: params.caseId,
+            jobType: params.jobType,
+            scheduledFor: params.scheduledFor,
+            payloadJson: params.payloadJson,
+          });
+          const pgBossJobId = `pgboss_${job.id}`;
+          await scheduledJobRepo.updateJobStatus(params.merchantId, job.id, 'SCHEDULED', pgBossJobId);
+          return { id: job.id, pgBossJobId };
+        },
+      };
+
       orchestrator = new RecoveryOrchestrator({
         caseRepo,
         actionRepo,
@@ -96,6 +114,8 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
         recoveryAgent,
         policyEngine,
         actionExecutor,
+        jobScheduler,
+        triggerRepo,
         clock: () => new Date('2026-08-28T14:00:00+05:30'),
       });
 
@@ -107,6 +127,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
         commitmentRepo,
         eventRepo,
         auditRepo,
+        jobScheduler,
         orchestrator,
         clock: () => new Date('2026-08-28T14:00:00+05:30'),
       });
@@ -339,11 +360,12 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     expect(iter1.status).toBe(CaseStatus.WAITING);
 
     // 2. Customer replies: "Will pay ₹85,000 this Friday"
-    const replyResult = await observer.observeCustomerReply(
+    const replyResult = await observer.observeCustomerReply({
       merchantId,
-      testCase.id,
-      'We will pay ₹85,000 this Friday by NEFT',
-    );
+      caseId: testCase.id,
+      messageId: `msg_flowb_${Date.now()}`,
+      replyText: 'We will pay ₹85,000 this Friday by NEFT',
+    });
 
     expect(replyResult.observed).toBe(true);
 
@@ -365,12 +387,13 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       shouldEscalate: false,
     });
 
-    const timerResult = await observer.observeTimerFired(
+    const timerResult = await observer.observeTimerFired({
       merchantId,
-      testCase.id,
-      'PROMISE_TO_PAY_CHECK',
-      { commitmentId: commitments[0].id },
-    );
+      caseId: testCase.id,
+      scheduledJobId: `job_flowb_timer_${Date.now()}`,
+      timerType: 'PROMISE_TO_PAY_CHECK',
+      payload: { commitmentId: commitments[0].id },
+    });
 
     expect(timerResult.observed).toBe(true);
 
@@ -433,5 +456,59 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     // Exactly ONE outcome was recorded in database (no duplicate credit)
     const outcomesInDb = await outcomeRepo.listOutcomesByCase(merchantId, testCase.id);
     expect(outcomesInDb.length).toBe(1);
+
+    // Exactly 1 CASE_RECOVERED_BY_PAYMENT audit in database
+    const recoveryAudits = await prisma.auditEvent.findMany({
+      where: { caseId: testCase.id, eventType: 'CASE_RECOVERED_BY_PAYMENT' },
+    });
+    expect(recoveryAudits.length).toBe(1);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('CONCURRENCY & IDEMPOTENCY: 5 concurrent replan wakes claim trigger atomically with exactly 1 agent proposal', async () => {
+    if (!dbAvailable) return;
+
+    const testCase = await caseRepo.createCase(merchantId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '3000.00',
+      currency: 'INR',
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_replan_${Date.now()}`,
+      contextJson: { verifiedPaymentFailureCode: 'TEMPORARY_NETWORK_ERROR' },
+    });
+
+    mockLLM.setMockResponse({
+      diagnosisCode: 'CONCURRENT_WAKE_TEST',
+      diagnosisSummary: 'Test diagnosis for concurrent wake',
+      confidence: 0.9,
+      proposedActionType: RecoveryActionType.SCHEDULE_FOLLOWUP,
+      proposedActionParams: {},
+      reasoningSummary: 'Concurrent wake follow up',
+    });
+
+    const triggerPayload = {
+      triggerKey: `TIMER:job_wake_${Date.now()}`,
+      triggerType: 'TIMER_FIRED',
+    };
+
+    // 5 concurrent wakes for the same trigger
+    const results = await Promise.all([
+      orchestrator.runIteration(merchantId, testCase.id, triggerPayload),
+      orchestrator.runIteration(merchantId, testCase.id, triggerPayload),
+      orchestrator.runIteration(merchantId, testCase.id, triggerPayload),
+      orchestrator.runIteration(merchantId, testCase.id, triggerPayload),
+      orchestrator.runIteration(merchantId, testCase.id, triggerPayload),
+    ]);
+
+    // Exactly 1 winner completed the iteration
+    const winners = results.filter((r) => r.iterationCompleted);
+    const duplicates = results.filter((r) => r.error === 'TRIGGER_ALREADY_CLAIMED');
+    expect(winners.length).toBe(1);
+    expect(duplicates.length).toBe(4);
+
+    // Exactly 1 plan version created
+    const plansInDb = await prisma.recoveryPlanVersion.findMany({
+      where: { caseId: testCase.id },
+    });
+    expect(plansInDb.length).toBe(1);
   });
 });

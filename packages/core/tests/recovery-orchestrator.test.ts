@@ -483,4 +483,143 @@ describe('RecoveryOrchestrator Unit Tests', () => {
       expect(result.iterationCompleted).toBe(true);
     });
   });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  describe('4. Strict Policy Ordering & Fail-Closed Safety', () => {
+    it('hard DENY strictly outranks agent escalation proposal', async () => {
+      // Opt out customer -> CustomerOptOutRule triggers hard DENY
+      const cust = inMemoryCustomers.get(customerId);
+      cust.optedOut = true;
+
+      mockLLM.setMockResponse({
+        diagnosisCode: 'ESCALATION_REQUESTED',
+        diagnosisSummary: 'Agent wants human review',
+        confidence: 0.85,
+        proposedActionType: RecoveryActionType.ESCALATE_TO_HUMAN,
+        proposedActionParams: {},
+        reasoningSummary: 'Requesting human assistance',
+        shouldStop: false,
+        shouldEscalate: true,
+      });
+
+      const result = await orchestrator.runIteration(merchantId, caseId);
+
+      // Hard DENY outranks escalation -> case is STOPPED, NOT NEEDS_REVIEW
+      expect(result.status).toBe(CaseStatus.STOPPED);
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.STOPPED);
+    });
+
+    it('STOP_RECOVERY proposal is evaluated by policy and executed via ActionExecutor', async () => {
+      mockLLM.setMockResponse({
+        diagnosisCode: 'TERMINAL_RISK',
+        diagnosisSummary: 'No further recovery possible',
+        confidence: 0.95,
+        proposedActionType: RecoveryActionType.STOP_RECOVERY,
+        proposedActionParams: {},
+        reasoningSummary: 'Stop recovery per risk assessment',
+        shouldStop: true,
+        shouldEscalate: false,
+      });
+
+      const result = await orchestrator.runIteration(merchantId, caseId);
+
+      expect(result.iterationCompleted).toBe(true);
+      expect(result.status).toBe(CaseStatus.STOPPED);
+      expect(result.policyDecision).toBe(PolicyDecision.ALLOW);
+
+      // STOP_RECOVERY was recorded as an authoritative action and executed
+      expect(result.action).toBeDefined();
+      expect(result.action?.actionType).toBe(RecoveryActionType.STOP_RECOVERY);
+      expect(result.action?.status).toBe(ActionExecutionStatus.SUCCESS);
+      expect(inMemoryAudits.some((a) => a.eventType === 'ACTION_SUCCEEDED')).toBe(true);
+    });
+
+    it('kill switch fails closed if merchant lookup throws or returns null', async () => {
+      mockMerchantRepo.getMerchantById = vi.fn(async () => {
+        throw new Error('Database connection lost');
+      });
+
+      const result = await orchestrator.runIteration(merchantId, caseId);
+
+      expect(result.iterationCompleted).toBe(false);
+      expect(result.error).toContain('failing closed');
+      // No agent proposal generated
+      expect(mockLLM.getLastRequest()).toBeNull();
+      expect(inMemoryAudits.some((a) => a.eventType === 'ORCHESTRATOR_BLOCKED')).toBe(true);
+    });
+
+    it('waiting action routes to NEEDS_REVIEW if scheduler fails', async () => {
+      mockJobScheduler.schedule = vi.fn(async () => {
+        throw new Error('Scheduler Redis down');
+      });
+
+      mockLLM.setMockResponse({
+        diagnosisCode: 'INSUFFICIENT_FUNDS',
+        diagnosisSummary: 'Temporary failure; request payment update',
+        confidence: 0.9,
+        proposedActionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE,
+        proposedActionParams: { channel: 'WHATSAPP' },
+        reasoningSummary: 'Request update via WhatsApp',
+        followUpAfterSeconds: 3600,
+        shouldStop: false,
+        shouldEscalate: false,
+      });
+
+      const result = await orchestrator.runIteration(merchantId, caseId);
+
+      // Must NOT be WAITING without durable timer!
+      expect(result.status).toBe(CaseStatus.NEEDS_REVIEW);
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.NEEDS_REVIEW);
+      expect(inMemoryAudits.some((a) => a.eventType === 'SCHEDULING_FAILED')).toBe(true);
+      expect(inMemoryAudits.some((a) => a.eventType === 'CASE_WAITING')).toBe(false);
+    });
+
+    it('trigger claim deduplicates duplicate execution', async () => {
+      let claimedCount = 0;
+      const mockTriggerRepo: any = {
+        claimTrigger: vi.fn(async () => {
+          claimedCount++;
+          return { claimed: claimedCount === 1, trigger: { id: 'trig_01' } };
+        }),
+        completeTrigger: vi.fn(async () => {}),
+      };
+
+      const orchWithTrigger = new RecoveryOrchestrator({
+        caseRepo: mockCaseRepo,
+        actionRepo: mockActionRepo,
+        customerRepo: mockCustomerRepo,
+        merchantRepo: mockMerchantRepo,
+        policyConfigRepo: mockPolicyConfigRepo,
+        commitmentRepo: mockCommitmentRepo,
+        auditRepo: mockAuditRepo,
+        recoveryAgent,
+        policyEngine,
+        actionExecutor,
+        jobScheduler: mockJobScheduler,
+        triggerRepo: mockTriggerRepo,
+      });
+
+      mockLLM.setMockResponse({
+        diagnosisCode: 'TEST_DIAG',
+        diagnosisSummary: 'Test diagnosis',
+        confidence: 0.9,
+        proposedActionType: RecoveryActionType.SCHEDULE_FOLLOWUP,
+        proposedActionParams: {},
+        reasoningSummary: 'Test follow-up',
+      });
+
+      const first = await orchWithTrigger.runIteration(merchantId, caseId, {
+        triggerKey: 'test_key',
+        triggerType: 'REPLAN_TRIGGERED',
+      });
+      const second = await orchWithTrigger.runIteration(merchantId, caseId, {
+        triggerKey: 'test_key',
+        triggerType: 'REPLAN_TRIGGERED',
+      });
+
+      expect(first.iterationCompleted).toBe(true);
+      expect(second.iterationCompleted).toBe(false);
+      expect(second.error).toBe('TRIGGER_ALREADY_CLAIMED');
+    });
+  });
 });

@@ -93,6 +93,7 @@ model Merchant {
   humanReviews    HumanReview[]
   auditEvents     AuditEvent[]
   scheduledJobs   ScheduledJob[]
+  iterationTriggers RecoveryIterationTrigger[]
 
   @@map("merchants")
 }
@@ -196,6 +197,7 @@ model RevenueRiskCase {
   commitments        RecoveryCommitment[]
   scheduledJobs      ScheduledJob[]
   auditEvents        AuditEvent[]
+  iterationTriggers  RecoveryIterationTrigger[]
 
   @@unique([merchantId, incidentKey])
   @@index([merchantId, status])
@@ -257,6 +259,7 @@ model RecoveryOutcome {
   caseId          String
   actionId        String?
   merchantEventId String?
+  dedupeKey       String?
   outcomeType     String
   amountRecovered Decimal?          @db.Decimal(12, 2)
   detailsJson     Json?
@@ -266,8 +269,28 @@ model RecoveryOutcome {
   action          RecoveryAction?   @relation(fields: [actionId], references: [id], onDelete: SetNull)
   merchantEvent   MerchantEvent?    @relation(fields: [merchantEventId], references: [id], onDelete: SetNull)
 
+  @@unique([caseId, dedupeKey])
   @@index([caseId])
   @@map("recovery_outcomes")
+}
+
+model RecoveryIterationTrigger {
+  id          String          @id @default(uuid())
+  merchantId  String
+  caseId      String
+  triggerKey  String
+  triggerType String
+  status      String          @default("CLAIMED")
+  resultJson  Json?
+  createdAt   DateTime        @default(now())
+  completedAt DateTime?
+
+  merchant    Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  case        RevenueRiskCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@unique([merchantId, caseId, triggerKey])
+  @@index([merchantId, caseId])
+  @@map("recovery_iteration_triggers")
 }
 
 model PolicyConfig {

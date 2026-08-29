@@ -11,3 +11,4 @@ export * from './repositories/scheduled-job-repository.js';
 export * from './repositories/action-repository.js';
 export * from './repositories/commitment-repository.js';
 export * from './repositories/outcome-repository.js';
+export * from './repositories/trigger-repository.js';

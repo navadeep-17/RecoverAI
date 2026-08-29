@@ -3,7 +3,6 @@ import {
   CaseStatus,
   PolicyDecision,
   RecoveryActionType,
-  RecoveryPlanVersion,
 } from '@prisma/client';
 import {
   ActionRepository,
@@ -13,8 +12,11 @@ import {
   CustomerRepository,
   MerchantRepository,
   PolicyConfigRepository,
+  TriggerRepository,
+  ClaimTriggerResult,
   CaseWithRelations,
 } from '@recoverai/db';
+import { PolicyReasonCodes } from '@recoverai/shared';
 import { isHardDecline } from '../agent/agent-contracts.js';
 import { isActionCompatible } from '../domain/action-compatibility.js';
 import { IPolicyEngine, PolicyExecutionContext } from '../execution/policy-interface.js';
@@ -26,6 +28,7 @@ import {
   EligibilityCheckResult,
   OrchestrationIterationResult,
   OrchestrationTrigger,
+  OrchestrationTriggerPayload,
 } from './orchestrator-types.js';
 
 export interface RecoveryOrchestratorOptions {
@@ -39,6 +42,7 @@ export interface RecoveryOrchestratorOptions {
   recoveryAgent: RecoveryAgent;
   policyEngine: IPolicyEngine;
   actionExecutor: ActionExecutor;
+  triggerRepo?: TriggerRepository;
   jobScheduler?: IJobScheduler;
   clock?: () => Date;
 }
@@ -54,6 +58,7 @@ export class RecoveryOrchestrator {
   private recoveryAgent: RecoveryAgent;
   private policyEngine: IPolicyEngine;
   private actionExecutor: ActionExecutor;
+  private triggerRepo?: TriggerRepository;
   private jobScheduler?: IJobScheduler;
   private clock?: () => Date;
 
@@ -68,6 +73,7 @@ export class RecoveryOrchestrator {
     this.recoveryAgent = options.recoveryAgent;
     this.policyEngine = options.policyEngine;
     this.actionExecutor = options.actionExecutor;
+    this.triggerRepo = options.triggerRepo;
     this.jobScheduler = options.jobScheduler;
     this.clock = options.clock;
   }
@@ -91,17 +97,99 @@ export class RecoveryOrchestrator {
   ): Promise<OrchestrationIterationResult> {
     const currentTime = this.now();
 
+    // 0. Deduplicate trigger wake via DB-backed trigger claim
+    const triggerPayload: OrchestrationTriggerPayload =
+      typeof trigger === 'string'
+        ? { triggerKey: `${trigger}:${caseId}`, triggerType: trigger }
+        : trigger;
+
+    let claimResult: ClaimTriggerResult | undefined;
+    if (this.triggerRepo) {
+      claimResult = await this.triggerRepo.claimTrigger(
+        merchantId,
+        caseId,
+        triggerPayload.triggerKey,
+        triggerPayload.triggerType,
+      );
+      if (!claimResult.claimed) {
+        const existingCase = await this.caseRepo.getCaseById(merchantId, caseId);
+        return {
+          caseId,
+          status: existingCase?.status || CaseStatus.OPEN,
+          iterationCompleted: false,
+          error: 'TRIGGER_ALREADY_CLAIMED',
+        };
+      }
+    }
+
     // 1. Load fresh case with relations from DB
     const caseRecord = await this.caseRepo.getCaseById(merchantId, caseId);
     if (!caseRecord) {
+      if (claimResult && this.triggerRepo) {
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
+          error: 'Case not found',
+        });
+      }
       throw new Error(`Case "${caseId}" not found for merchant "${merchantId}"`);
     }
 
-    // 2. Check stopping and terminal conditions
-    const merchant = await this.merchantRepo.getMerchantById(merchantId);
+    // 2. Kill Switch MUST FAIL CLOSED: if merchant cannot be retrieved, fail closed
+    let merchant;
+    try {
+      merchant = await this.merchantRepo.getMerchantById(merchantId);
+    } catch {
+      merchant = null;
+    }
+
+    if (!merchant) {
+      await this.auditRepo.record(merchantId, {
+        caseId,
+        eventType: 'ORCHESTRATOR_BLOCKED',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { reason: 'Merchant safety state unavailable; failing closed' },
+        reasonCode: 'MERCHANT_SAFETY_STATE_UNAVAILABLE',
+      });
+      if (claimResult && this.triggerRepo) {
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
+          error: 'Merchant safety state unavailable',
+        });
+      }
+      return {
+        caseId,
+        status: caseRecord.status,
+        iterationCompleted: false,
+        error: 'Merchant safety state unavailable; failing closed',
+      };
+    }
+
+    if (merchant.killSwitchActive) {
+      if (caseRecord.status !== CaseStatus.STOPPED) {
+        await this.caseRepo.compareAndSetStatus(merchantId, caseId, caseRecord.status, CaseStatus.STOPPED);
+      }
+      await this.auditRepo.record(merchantId, {
+        caseId,
+        eventType: 'CASE_STOPPED',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { trigger: triggerPayload.triggerType, reason: 'Merchant kill switch is active' },
+        reasonCode: 'KILL_SWITCH_ACTIVE',
+      });
+      if (claimResult && this.triggerRepo) {
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+          status: CaseStatus.STOPPED,
+        });
+      }
+      return {
+        caseId,
+        status: CaseStatus.STOPPED,
+        iterationCompleted: true,
+        stoppedReason: 'Merchant kill switch is active',
+      };
+    }
+
     const policyConfig = await this.policyConfigRepo.getOrCreateConfig(merchantId);
 
-    const eligibility = this.checkEligibility(caseRecord, merchant?.killSwitchActive ?? false, policyConfig, currentTime);
+    // 3. Check stopping and terminal conditions
+    const eligibility = this.checkEligibility(caseRecord, merchant.killSwitchActive, policyConfig, currentTime);
     if (!eligibility.eligible) {
       if (eligibility.shouldStop) {
         if (caseRecord.status !== CaseStatus.STOPPED) {
@@ -111,9 +199,14 @@ export class RecoveryOrchestrator {
           caseId,
           eventType: 'CASE_STOPPED',
           actorType: AuditActorType.SYSTEM,
-          inputSummaryJson: { trigger, reason: eligibility.reason },
+          inputSummaryJson: { trigger: triggerPayload.triggerType, reason: eligibility.reason },
           reasonCode: 'CASE_STOPPED_BY_RULE',
         });
+        if (claimResult && this.triggerRepo) {
+          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+            status: CaseStatus.STOPPED,
+          });
+        }
         return {
           caseId,
           status: CaseStatus.STOPPED,
@@ -130,9 +223,14 @@ export class RecoveryOrchestrator {
           caseId,
           eventType: 'CASE_EXHAUSTED',
           actorType: AuditActorType.SYSTEM,
-          inputSummaryJson: { trigger, reason: eligibility.reason },
+          inputSummaryJson: { trigger: triggerPayload.triggerType, reason: eligibility.reason },
           reasonCode: 'CASE_LIMITS_EXHAUSTED',
         });
+        if (claimResult && this.triggerRepo) {
+          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+            status: CaseStatus.EXHAUSTED,
+          });
+        }
         return {
           caseId,
           status: CaseStatus.EXHAUSTED,
@@ -141,6 +239,11 @@ export class RecoveryOrchestrator {
         };
       }
 
+      if (claimResult && this.triggerRepo) {
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+          status: caseRecord.status,
+        });
+      }
       return {
         caseId,
         status: caseRecord.status,
@@ -150,7 +253,7 @@ export class RecoveryOrchestrator {
       };
     }
 
-    // If case is in WAITING and iteration is triggered (e.g. replan or observation arrived),
+    // If case is in WAITING and iteration is triggered (replan or observation),
     // transition back to OPEN via legal state transition matrix: WAITING -> OPEN
     let currentStatus = caseRecord.status;
     if (currentStatus === CaseStatus.WAITING) {
@@ -165,12 +268,12 @@ export class RecoveryOrchestrator {
         caseId,
         eventType: 'REPLAN_TRIGGERED',
         actorType: AuditActorType.SYSTEM,
-        inputSummaryJson: { trigger, previousStatus: CaseStatus.WAITING },
+        inputSummaryJson: { trigger: triggerPayload.triggerType, previousStatus: CaseStatus.WAITING },
         reasonCode: 'REPLAN_WOKE_FROM_WAITING',
       });
     }
 
-    // 3. Compute legally allowed actions for this context
+    // 4. Compute legally allowed actions for this context
     const allowedActions = this.computeAllowedActions(caseRecord, policyConfig);
     if (allowedActions.length === 0) {
       await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.EXHAUSTED);
@@ -181,6 +284,11 @@ export class RecoveryOrchestrator {
         inputSummaryJson: { reason: 'No legal actions remain compatible with case status and limits' },
         reasonCode: 'NO_ALLOWED_ACTIONS_REMAIN',
       });
+      if (claimResult && this.triggerRepo) {
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+          status: CaseStatus.EXHAUSTED,
+        });
+      }
       return {
         caseId,
         status: CaseStatus.EXHAUSTED,
@@ -189,7 +297,7 @@ export class RecoveryOrchestrator {
       };
     }
 
-    // 4. Build Agent Context and request structured Proposal
+    // 5. Build Agent Context and request structured Proposal
     const priorActions = (caseRecord.actions || []).map((a) => ({
       actionType: a.actionType,
       executedAt: a.executedAt || a.createdAt,
@@ -217,14 +325,16 @@ export class RecoveryOrchestrator {
       retryCount,
       contactCount,
       allowedActions,
-      verifiedPaymentFacts: (caseRecord.contextJson as Record<string, unknown> | null)?.verifiedPaymentFacts as any,
-      customerHistory: caseRecord.customer ? {
-        totalPastCases: 1,
-        successfullyRecoveredCases: 0,
-        contactConsent: caseRecord.customer.contactConsent ?? false,
-        optedOut: caseRecord.customer.optedOut,
-        lastContactedAt: caseRecord.customer.lastContactedAt,
-      } : undefined,
+      verifiedPaymentFacts: (caseRecord.contextJson as Record<string, unknown> | null)?.verifiedPaymentFacts as Record<string, unknown> | undefined,
+      customerHistory: caseRecord.customer
+        ? {
+            totalPastCases: 1,
+            successfullyRecoveredCases: 0,
+            contactConsent: caseRecord.customer.contactConsent ?? false,
+            optedOut: caseRecord.customer.optedOut,
+            lastContactedAt: caseRecord.customer.lastContactedAt,
+          }
+        : undefined,
       priorActions,
       priorOutcomes,
       policySummary: {
@@ -239,12 +349,11 @@ export class RecoveryOrchestrator {
 
     const proposal = await this.recoveryAgent.generateProposal(agentContext);
 
-    // 5. Append-only RecoveryPlanVersion creation (never mutate prior plans)
-    const latestVersion = caseRecord.planVersions?.[0]?.version ?? 0;
-    const nextVersionNumber = latestVersion + 1;
-
+    // 6. Append-only RecoveryPlanVersion creation (never mutate prior plans)
+    const existingVersions = (caseRecord.planVersions || []).length;
+    const nextVersion = existingVersions + 1;
     const planVersion = await this.caseRepo.addPlanVersion(merchantId, caseId, {
-      version: nextVersionNumber,
+      version: nextVersion,
       diagnosisCode: proposal.diagnosisCode,
       diagnosisSummary: proposal.diagnosisSummary,
       confidence: proposal.confidence,
@@ -261,7 +370,7 @@ export class RecoveryOrchestrator {
       eventType: 'PLAN_CREATED',
       actorType: AuditActorType.AGENT,
       inputSummaryJson: {
-        version: nextVersionNumber,
+        version: planVersion.version,
         diagnosisCode: proposal.diagnosisCode,
         proposedActionType: proposal.proposedActionType,
         confidence: proposal.confidence,
@@ -274,49 +383,12 @@ export class RecoveryOrchestrator {
       reasonCode: 'RECOVERY_PLAN_VERSION_PERSISTED',
     });
 
-    // 6. Handle explicit Agent escalation or stop signals
-    if (proposal.shouldEscalate || proposal.proposedActionType === RecoveryActionType.ESCALATE_TO_HUMAN) {
-      await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
-      await this.auditRepo.record(merchantId, {
-        caseId,
-        eventType: 'CASE_ESCALATED',
-        actorType: AuditActorType.AGENT,
-        inputSummaryJson: { reason: proposal.reasoningSummary },
-        reasonCode: 'AGENT_PROPOSED_ESCALATION',
-      });
-      return {
-        caseId,
-        status: CaseStatus.NEEDS_REVIEW,
-        iterationCompleted: true,
-        planVersion,
-        reviewReason: proposal.reasoningSummary,
-      };
-    }
-
-    if (proposal.shouldStop || proposal.proposedActionType === RecoveryActionType.STOP_RECOVERY) {
-      await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.STOPPED);
-      await this.auditRepo.record(merchantId, {
-        caseId,
-        eventType: 'CASE_STOPPED',
-        actorType: AuditActorType.AGENT,
-        inputSummaryJson: { reason: proposal.reasoningSummary },
-        reasonCode: 'AGENT_PROPOSED_STOP',
-      });
-      return {
-        caseId,
-        status: CaseStatus.STOPPED,
-        iterationCompleted: true,
-        planVersion,
-        stoppedReason: proposal.reasoningSummary,
-      };
-    }
-
-    // 7. PolicyEngine evaluation
+    // 7. PolicyEngine evaluation (ALWAYS occurs before any action or case state change)
     const commitments = await this.commitmentRepo.getActiveCommitmentsForCase(merchantId, caseId);
 
     const policyExecutionContext: PolicyExecutionContext = {
       merchantId,
-      killSwitchActive: merchant?.killSwitchActive ?? false,
+      killSwitchActive: merchant.killSwitchActive,
       policyConfig: {
         maxRetriesPerCase: policyConfig.maxRetriesPerCase,
         maxContactsPerCase: policyConfig.maxContactsPerCase,
@@ -342,20 +414,25 @@ export class RecoveryOrchestrator {
         openedAt: caseRecord.openedAt,
         diagnosisCode: proposal.diagnosisCode,
       },
-      customer: caseRecord.customer ? {
-        id: caseRecord.customer.id,
-        contactConsent: caseRecord.customer.contactConsent,
-        optedOut: caseRecord.customer.optedOut,
-        lastContactedAt: caseRecord.customer.lastContactedAt,
-      } : null,
+      customer: caseRecord.customer
+        ? {
+            id: caseRecord.customer.id,
+            contactConsent: caseRecord.customer.contactConsent,
+            optedOut: caseRecord.customer.optedOut,
+            lastContactedAt: caseRecord.customer.lastContactedAt,
+          }
+        : null,
       proposedActionType: proposal.proposedActionType,
       proposedActionParams: proposal.proposedActionParams,
       confidence: proposal.confidence,
       diagnosisCode: proposal.diagnosisCode,
       diagnosisSummary: proposal.diagnosisSummary,
-      verifiedPaymentFailureCode: typeof (caseRecord.contextJson as Record<string, unknown> | null)?.verifiedPaymentFailureCode === 'string'
-        ? ((caseRecord.contextJson as Record<string, unknown>).verifiedPaymentFailureCode as string)
-        : null,
+      verifiedPaymentFailureCode:
+        typeof (caseRecord.contextJson as Record<string, unknown> | null)?.verifiedPaymentFailureCode === 'string'
+          ? ((caseRecord.contextJson as Record<string, unknown>).verifiedPaymentFailureCode as string)
+          : null,
+      shouldEscalate: proposal.shouldEscalate,
+      shouldStop: proposal.shouldStop,
       priorActions,
       priorOutcomes,
       activeCommitments: commitments.map((c) => ({
@@ -370,30 +447,7 @@ export class RecoveryOrchestrator {
     const policyEvaluation = this.policyEngine.evaluate(policyExecutionContext);
 
     // 8. Enforce Policy Decision: ALLOW | DENY | REVIEW
-    if (policyEvaluation.decision === PolicyDecision.REVIEW) {
-      await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
-      await this.auditRepo.record(merchantId, {
-        caseId,
-        eventType: 'CASE_ESCALATED',
-        actorType: AuditActorType.POLICY,
-        inputSummaryJson: {
-          reasonCode: policyEvaluation.reasonCode,
-          rationale: policyEvaluation.rationale,
-          planVersion: nextVersionNumber,
-        },
-        reasonCode: policyEvaluation.reasonCode,
-      });
-
-      return {
-        caseId,
-        status: CaseStatus.NEEDS_REVIEW,
-        iterationCompleted: true,
-        planVersion,
-        policyDecision: PolicyDecision.REVIEW,
-        reviewReason: policyEvaluation.rationale,
-      };
-    }
-
+    // Hard DENY outranks all agent escalations or proposed stops
     if (policyEvaluation.decision === PolicyDecision.DENY) {
       await this.auditRepo.record(merchantId, {
         caseId,
@@ -407,42 +461,236 @@ export class RecoveryOrchestrator {
         reasonCode: policyEvaluation.reasonCode,
       });
 
-      // Deterministic stop / exhaust on hard policy deny
-      if (
-        policyEvaluation.reasonCode === 'KILL_SWITCH_ACTIVE' ||
-        policyEvaluation.reasonCode === 'CUSTOMER_OPTED_OUT' ||
-        policyEvaluation.reasonCode === 'HARD_CARD_DECLINE'
-      ) {
-        await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.STOPPED);
-        return {
-          caseId,
-          status: CaseStatus.STOPPED,
-          iterationCompleted: true,
-          planVersion,
-          policyDecision: PolicyDecision.DENY,
-          stoppedReason: policyEvaluation.rationale,
-        };
-      }
+      // Deterministic resolution mapping based on Phase 2 PolicyReasonCodes:
+      switch (policyEvaluation.reasonCode) {
+        case PolicyReasonCodes.KILL_SWITCH_ACTIVE:
+        case PolicyReasonCodes.CUSTOMER_OPTED_OUT: {
+          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.STOPPED);
+          if (claimResult && this.triggerRepo) {
+            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+              status: CaseStatus.STOPPED,
+            });
+          }
+          return {
+            caseId,
+            status: CaseStatus.STOPPED,
+            iterationCompleted: true,
+            planVersion,
+            policyDecision: PolicyDecision.DENY,
+            stoppedReason: policyEvaluation.rationale,
+          };
+        }
 
-      if (policyEvaluation.reasonCode === 'MAX_ACTIONS_EXCEEDED' || policyEvaluation.reasonCode === 'MAX_RETRIES_EXCEEDED') {
-        await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.EXHAUSTED);
-        return {
-          caseId,
-          status: CaseStatus.EXHAUSTED,
-          iterationCompleted: true,
-          planVersion,
-          policyDecision: PolicyDecision.DENY,
-          exhaustedReason: policyEvaluation.rationale,
-        };
+        case PolicyReasonCodes.CASE_ALREADY_TERMINAL: {
+          if (claimResult && this.triggerRepo) {
+            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+              status: currentStatus,
+            });
+          }
+          return {
+            caseId,
+            status: currentStatus,
+            iterationCompleted: true,
+            planVersion,
+            policyDecision: PolicyDecision.DENY,
+            stoppedReason: policyEvaluation.rationale,
+          };
+        }
+
+        case PolicyReasonCodes.CASE_NEEDS_REVIEW:
+        case PolicyReasonCodes.REQUIRED_FACTS_MISSING:
+        case PolicyReasonCodes.INCOMPATIBLE_ACTION_FOR_RISK: {
+          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+          if (claimResult && this.triggerRepo) {
+            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+              status: CaseStatus.NEEDS_REVIEW,
+            });
+          }
+          return {
+            caseId,
+            status: CaseStatus.NEEDS_REVIEW,
+            iterationCompleted: true,
+            planVersion,
+            policyDecision: PolicyDecision.DENY,
+            reviewReason: policyEvaluation.rationale,
+          };
+        }
+
+        case PolicyReasonCodes.CONTACT_CONSENT_MISSING:
+        case PolicyReasonCodes.HARD_DECLINE_BLOCKS_RETRY:
+        case PolicyReasonCodes.MAX_RETRIES_EXCEEDED:
+        case PolicyReasonCodes.MAX_CONTACTS_EXCEEDED:
+        case PolicyReasonCodes.MAX_ACTIONS_EXCEEDED:
+        case PolicyReasonCodes.EXPIRED_RECOVERY_WINDOW: {
+          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.EXHAUSTED);
+          if (claimResult && this.triggerRepo) {
+            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+              status: CaseStatus.EXHAUSTED,
+            });
+          }
+          return {
+            caseId,
+            status: CaseStatus.EXHAUSTED,
+            iterationCompleted: true,
+            planVersion,
+            policyDecision: PolicyDecision.DENY,
+            exhaustedReason: policyEvaluation.rationale,
+          };
+        }
+
+        case PolicyReasonCodes.COOLDOWN_VIOLATION: {
+          if (this.jobScheduler) {
+            const cooldownHours = policyConfig.cooldownHoursBetweenActions;
+            const scheduledFor = new Date(currentTime.getTime() + cooldownHours * 60 * 60 * 1000);
+            try {
+              await this.jobScheduler.schedule({
+                merchantId,
+                caseId,
+                jobType: 'RECOVERY_FOLLOWUP_CHECK',
+                scheduledFor,
+                payloadJson: { caseId, reason: 'COOLDOWN_ELAPSED' },
+              });
+              await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.WAITING);
+              if (claimResult && this.triggerRepo) {
+                await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+                  status: CaseStatus.WAITING,
+                });
+              }
+              return {
+                caseId,
+                status: CaseStatus.WAITING,
+                iterationCompleted: true,
+                planVersion,
+                policyDecision: PolicyDecision.DENY,
+                stoppedReason: `Cooldown in effect; re-evaluation scheduled at ${scheduledFor.toISOString()}`,
+              };
+            } catch {
+              // fallback to NEEDS_REVIEW
+            }
+          }
+          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+          if (claimResult && this.triggerRepo) {
+            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+              status: CaseStatus.NEEDS_REVIEW,
+            });
+          }
+          return {
+            caseId,
+            status: CaseStatus.NEEDS_REVIEW,
+            iterationCompleted: true,
+            planVersion,
+            policyDecision: PolicyDecision.DENY,
+            reviewReason: policyEvaluation.rationale,
+          };
+        }
+
+        case PolicyReasonCodes.QUIET_HOURS_VIOLATION: {
+          if (this.jobScheduler) {
+            const scheduledFor = new Date(currentTime.getTime() + 8 * 60 * 60 * 1000);
+            try {
+              await this.jobScheduler.schedule({
+                merchantId,
+                caseId,
+                jobType: 'RECOVERY_FOLLOWUP_CHECK',
+                scheduledFor,
+                payloadJson: { caseId, reason: 'QUIET_HOURS_ELAPSED' },
+              });
+              await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.WAITING);
+              if (claimResult && this.triggerRepo) {
+                await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+                  status: CaseStatus.WAITING,
+                });
+              }
+              return {
+                caseId,
+                status: CaseStatus.WAITING,
+                iterationCompleted: true,
+                planVersion,
+                policyDecision: PolicyDecision.DENY,
+                stoppedReason: `Quiet hours in effect; re-evaluation scheduled at ${scheduledFor.toISOString()}`,
+              };
+            } catch {
+              // fallback to NEEDS_REVIEW
+            }
+          }
+          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+          if (claimResult && this.triggerRepo) {
+            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+              status: CaseStatus.NEEDS_REVIEW,
+            });
+          }
+          return {
+            caseId,
+            status: CaseStatus.NEEDS_REVIEW,
+            iterationCompleted: true,
+            planVersion,
+            policyDecision: PolicyDecision.DENY,
+            reviewReason: policyEvaluation.rationale,
+          };
+        }
+
+        case PolicyReasonCodes.DUPLICATE_ACTION_IN_FLIGHT: {
+          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.WAITING);
+          if (claimResult && this.triggerRepo) {
+            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+              status: CaseStatus.WAITING,
+            });
+          }
+          return {
+            caseId,
+            status: CaseStatus.WAITING,
+            iterationCompleted: true,
+            planVersion,
+            policyDecision: PolicyDecision.DENY,
+            stoppedReason: 'Action already executing in flight; waiting for resolution',
+          };
+        }
+
+        default: {
+          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+          if (claimResult && this.triggerRepo) {
+            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+              status: CaseStatus.NEEDS_REVIEW,
+            });
+          }
+          return {
+            caseId,
+            status: CaseStatus.NEEDS_REVIEW,
+            iterationCompleted: true,
+            planVersion,
+            policyDecision: PolicyDecision.DENY,
+            reviewReason: policyEvaluation.rationale,
+          };
+        }
+      }
+    }
+
+    if (policyEvaluation.decision === PolicyDecision.REVIEW) {
+      await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+      await this.auditRepo.record(merchantId, {
+        caseId,
+        eventType: 'CASE_ESCALATED',
+        actorType: AuditActorType.POLICY,
+        inputSummaryJson: {
+          reasonCode: policyEvaluation.reasonCode,
+          rationale: policyEvaluation.rationale,
+          planVersion: planVersion.version,
+        },
+        reasonCode: policyEvaluation.reasonCode,
+      });
+      if (claimResult && this.triggerRepo) {
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+          status: CaseStatus.NEEDS_REVIEW,
+        });
       }
 
       return {
         caseId,
-        status: currentStatus,
-        iterationCompleted: false,
+        status: CaseStatus.NEEDS_REVIEW,
+        iterationCompleted: true,
         planVersion,
-        policyDecision: PolicyDecision.DENY,
-        stoppedReason: policyEvaluation.rationale,
+        policyDecision: PolicyDecision.REVIEW,
+        reviewReason: policyEvaluation.rationale,
       };
     }
 
@@ -452,10 +700,15 @@ export class RecoveryOrchestrator {
       actionType: proposal.proposedActionType,
       actionParams: proposal.proposedActionParams,
       policyEvaluation,
-      attemptOrVersion: nextVersionNumber,
+      attemptOrVersion: planVersion.version,
     });
 
     if (!authResult.authorized || !authResult.action) {
+      if (claimResult && this.triggerRepo) {
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
+          error: authResult.reason,
+        });
+      }
       return {
         caseId,
         status: currentStatus,
@@ -466,50 +719,121 @@ export class RecoveryOrchestrator {
       };
     }
 
+    // If proposed action was STOP_RECOVERY and policy permitted it:
+    if (proposal.proposedActionType === RecoveryActionType.STOP_RECOVERY) {
+      const actionExecution = await this.actionExecutor.executeAction(merchantId, authResult.action.id);
+      if (claimResult && this.triggerRepo) {
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+          status: CaseStatus.STOPPED,
+        });
+      }
+      return {
+        caseId,
+        status: CaseStatus.STOPPED,
+        iterationCompleted: true,
+        planVersion,
+        action: actionExecution.action,
+        policyDecision: PolicyDecision.ALLOW,
+        stoppedReason: proposal.reasoningSummary,
+      };
+    }
+
+    // If proposed action was ESCALATE_TO_HUMAN and policy permitted it:
+    if (proposal.proposedActionType === RecoveryActionType.ESCALATE_TO_HUMAN) {
+      const actionExecution = await this.actionExecutor.executeAction(merchantId, authResult.action.id);
+      if (claimResult && this.triggerRepo) {
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+          status: CaseStatus.NEEDS_REVIEW,
+        });
+      }
+      return {
+        caseId,
+        status: CaseStatus.NEEDS_REVIEW,
+        iterationCompleted: true,
+        planVersion,
+        action: actionExecution.action,
+        policyDecision: PolicyDecision.ALLOW,
+        reviewReason: proposal.reasoningSummary,
+      };
+    }
+
+    // Standard action execution
     const actionExecution = await this.actionExecutor.executeAction(merchantId, authResult.action.id);
 
-    // 10. Check if action puts case into WAITING status
+    // 10. Check if action requires durable waiting
     let finalStatus = currentStatus;
     if (actionExecution.success) {
       if (this.isWaitingAction(proposal.proposedActionType)) {
-        const waitingCase = await this.caseRepo.compareAndSetStatus(
-          merchantId,
-          caseId,
-          currentStatus,
-          CaseStatus.WAITING,
-        );
-        finalStatus = waitingCase.status;
-
-        // Schedule follow-up timer durably
-        if (this.jobScheduler) {
-          const followUpSeconds = proposal.followUpAfterSeconds || 86400; // default 24h
-          const scheduledFor = new Date(currentTime.getTime() + followUpSeconds * 1000);
-
-          await this.jobScheduler.schedule({
-            merchantId,
-            caseId,
-            jobType: 'RECOVERY_FOLLOWUP_CHECK',
-            scheduledFor,
-            payloadJson: {
-              caseId,
-              planVersionId: planVersion.id,
-              actionId: authResult.action.id,
-            },
-          });
-
+        if (!this.jobScheduler) {
+          // Scheduler unavailable: fail closed, do not leave false WAITING state
+          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+          finalStatus = CaseStatus.NEEDS_REVIEW;
           await this.auditRepo.record(merchantId, {
             caseId,
-            eventType: 'CASE_WAITING',
+            eventType: 'SCHEDULING_FAILED',
             actorType: AuditActorType.SYSTEM,
-            inputSummaryJson: {
-              actionType: proposal.proposedActionType,
-              followUpSeconds,
-              scheduledFor,
-            },
-            reasonCode: 'CASE_ENTERED_WAITING_FOR_RESPONSE',
+            inputSummaryJson: { reason: 'Job scheduler unavailable for waiting action' },
+            reasonCode: 'SCHEDULER_UNAVAILABLE',
           });
+        } else {
+          try {
+            const followUpSeconds = proposal.followUpAfterSeconds || 86400; // default 24h
+            const scheduledFor = new Date(currentTime.getTime() + followUpSeconds * 1000);
+
+            await this.jobScheduler.schedule({
+              merchantId,
+              caseId,
+              jobType: 'RECOVERY_FOLLOWUP_CHECK',
+              scheduledFor,
+              payloadJson: {
+                caseId,
+                planVersionId: planVersion.id,
+                actionId: authResult.action.id,
+              },
+            });
+
+            // ONLY after durable job is scheduled successfully:
+            const waitingCase = await this.caseRepo.compareAndSetStatus(
+              merchantId,
+              caseId,
+              currentStatus,
+              CaseStatus.WAITING,
+            );
+            finalStatus = waitingCase.status;
+
+            await this.auditRepo.record(merchantId, {
+              caseId,
+              eventType: 'CASE_WAITING',
+              actorType: AuditActorType.SYSTEM,
+              inputSummaryJson: {
+                actionType: proposal.proposedActionType,
+                followUpSeconds,
+                scheduledFor,
+              },
+              reasonCode: 'CASE_ENTERED_WAITING_FOR_RESPONSE',
+            });
+          } catch (schedErr) {
+            // Scheduling failed: route safely to NEEDS_REVIEW
+            await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+            finalStatus = CaseStatus.NEEDS_REVIEW;
+            await this.auditRepo.record(merchantId, {
+              caseId,
+              eventType: 'SCHEDULING_FAILED',
+              actorType: AuditActorType.SYSTEM,
+              inputSummaryJson: {
+                error: schedErr instanceof Error ? schedErr.message : String(schedErr),
+              },
+              reasonCode: 'DURABLE_JOB_SCHEDULING_FAILED',
+            });
+          }
         }
       }
+    }
+
+    if (claimResult && this.triggerRepo) {
+      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+        status: finalStatus,
+      });
     }
 
     return {
@@ -593,17 +917,16 @@ export class RecoveryOrchestrator {
     }
 
     // Hard decline check
-    const failureCode = typeof (c.contextJson as Record<string, unknown> | null)?.verifiedPaymentFailureCode === 'string'
-      ? ((c.contextJson as Record<string, unknown>).verifiedPaymentFailureCode as string)
-      : null;
+    const failureCode =
+      typeof (c.contextJson as Record<string, unknown> | null)?.verifiedPaymentFailureCode === 'string'
+        ? ((c.contextJson as Record<string, unknown>).verifiedPaymentFailureCode as string)
+        : null;
 
     if (isHardDecline(failureCode)) {
-      // If hard decline (e.g. CARD_EXPIRED), has a payment method updated outcome occurred?
       const hasMethodUpdated = (c.outcomes || []).some(
         (o) => o.outcomeType === 'PAYMENT_METHOD_UPDATED',
       );
       if (!hasMethodUpdated) {
-        // Method NOT updated -> RETRY_PAYMENT is prohibited
         compatible = compatible.filter((a) => a !== RecoveryActionType.RETRY_PAYMENT);
       }
     }

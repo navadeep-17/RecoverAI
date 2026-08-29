@@ -267,7 +267,7 @@ export class CaseRepository {
     merchantId: string,
     caseId: string,
     data: {
-      version: number;
+      version?: number;
       diagnosisCode: string;
       diagnosisSummary: string;
       confidence: number;
@@ -284,21 +284,50 @@ export class CaseRepository {
       where: { id: caseId, merchantId },
     });
 
-    return prisma.recoveryPlanVersion.create({
-      data: {
-        caseId,
-        version: data.version,
-        diagnosisCode: data.diagnosisCode,
-        diagnosisSummary: data.diagnosisSummary,
-        confidence: data.confidence,
-        proposedActionType: data.proposedActionType,
-        proposedActionParams: data.proposedActionParams as Prisma.InputJsonValue,
-        reasoningSummary: data.reasoningSummary,
-        followUpAfterSeconds: data.followUpAfterSeconds,
-        shouldStop: data.shouldStop ?? false,
-        shouldEscalate: data.shouldEscalate ?? false,
-      },
-    });
+    let targetVersion = data.version;
+    if (!targetVersion || targetVersion <= 0) {
+      const maxVersion = await prisma.recoveryPlanVersion.findFirst({
+        where: { caseId },
+        orderBy: { version: 'desc' },
+        select: { version: true },
+      });
+      targetVersion = (maxVersion?.version ?? 0) + 1;
+    }
+
+    try {
+      return await prisma.recoveryPlanVersion.create({
+        data: {
+          caseId,
+          version: targetVersion,
+          diagnosisCode: data.diagnosisCode,
+          diagnosisSummary: data.diagnosisSummary,
+          confidence: data.confidence,
+          proposedActionType: data.proposedActionType,
+          proposedActionParams: data.proposedActionParams as Prisma.InputJsonValue,
+          reasoningSummary: data.reasoningSummary,
+          followUpAfterSeconds: data.followUpAfterSeconds,
+          shouldStop: data.shouldStop ?? false,
+          shouldEscalate: data.shouldEscalate ?? false,
+        },
+      });
+    } catch (err: unknown) {
+      if (
+        err &&
+        typeof err === 'object' &&
+        'code' in err &&
+        (err as { code: string }).code === 'P2002'
+      ) {
+        return prisma.recoveryPlanVersion.findUniqueOrThrow({
+          where: {
+            caseId_version: {
+              caseId,
+              version: targetVersion,
+            },
+          },
+        });
+      }
+      throw err;
+    }
   }
 
   async recordAction(

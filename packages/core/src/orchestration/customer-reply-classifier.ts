@@ -1,3 +1,5 @@
+import { Money } from '@recoverai/shared';
+
 export enum CustomerReplyIntent {
   PAYMENT_METHOD_WILL_UPDATE = 'PAYMENT_METHOD_WILL_UPDATE',
   NEED_MORE_TIME = 'NEED_MORE_TIME',
@@ -10,8 +12,8 @@ export enum CustomerReplyIntent {
 export interface ClassifiedCustomerReply {
   intent: CustomerReplyIntent;
   confidence: number;
-  extractedPromisedDate?: Date;
-  extractedPromisedAmount?: string;
+  extractedPromisedDate?: Date | null;
+  extractedPromisedAmount?: string | null;
   rawText: string;
 }
 
@@ -19,6 +21,7 @@ export class CustomerReplyClassifier {
   /**
    * Classifies inbound customer communication into bounded structured concepts.
    * Deterministic safety state remains authoritative.
+   * Never fabricates dates or uses floating-point financial parsing.
    */
   classify(text: string, referenceTime: Date = new Date()): ClassifiedCustomerReply {
     const raw = text.trim();
@@ -100,8 +103,8 @@ export class CustomerReplyClassifier {
       return {
         intent: CustomerReplyIntent.PROMISE_TO_PAY,
         confidence: 0.90,
-        extractedPromisedDate,
-        extractedPromisedAmount,
+        extractedPromisedDate: extractedPromisedDate ?? null,
+        extractedPromisedAmount: extractedPromisedAmount ?? null,
         rawText: raw,
       };
     }
@@ -129,7 +132,7 @@ export class CustomerReplyClassifier {
     };
   }
 
-  private extractDate(lower: string, ref: Date): Date {
+  private extractDate(lower: string, ref: Date): Date | null {
     const daysOfWeek = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
     
     for (let i = 0; i < daysOfWeek.length; i++) {
@@ -161,20 +164,29 @@ export class CustomerReplyClassifier {
       }
     }
 
-    // Default: 3 days from ref
-    return new Date(ref.getTime() + 3 * 24 * 60 * 60 * 1000);
+    // Never fabricate dates: return null if customer did not specify a date
+    return null;
   }
 
   private extractAmount(lower: string): string | undefined {
-    // Look for patterns like ₹85,000, Rs. 85000, 85000, 1500.00
-    const match = lower.match(/(?:₹|rs\.?|inr)?\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]{2})?)/);
+    // Look for currency prefix followed by monetary digits: ₹85,000, Rs. 85000, 85000, 1500.00
+    const match = lower.match(/(?:₹|rs\.?|inr)\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)/);
     if (match && match[1]) {
       const cleaned = match[1].replace(/,/g, '');
-      const num = parseFloat(cleaned);
-      if (!isNaN(num) && num > 0) {
-        return num.toFixed(2);
+      if (Money.isValidDecimalString(cleaned)) {
+        return Money.fromDecimalString(cleaned).toDecimalString();
       }
     }
+
+    // Also match verbs like "pay 85000" or "settle 85000"
+    const contextMatch = lower.match(/(?:pay|transfer|settle|send)\s+([0-9]+(?:,[0-9]+)*(?:\.[0-9]{1,2})?)/);
+    if (contextMatch && contextMatch[1]) {
+      const cleaned = contextMatch[1].replace(/,/g, '');
+      if (Money.isValidDecimalString(cleaned)) {
+        return Money.fromDecimalString(cleaned).toDecimalString();
+      }
+    }
+
     return undefined;
   }
 }

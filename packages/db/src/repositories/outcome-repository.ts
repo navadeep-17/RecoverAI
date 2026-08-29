@@ -6,26 +6,33 @@ import { ExactMonetaryInput, toPrismaDecimal } from './case-repository.js';
 export interface RecordOutcomeParams {
   actionId?: string;
   merchantEventId?: string;
+  dedupeKey?: string;
   outcomeType: string;
   amountRecovered?: ExactMonetaryInput;
   detailsJson?: Record<string, unknown>;
   observedAt?: Date;
 }
 
+export interface RecordOutcomeResult {
+  outcome: RecoveryOutcome;
+  created: boolean;
+}
+
 export class OutcomeRepository {
   /**
-   * Records an authoritative RecoveryOutcome under a tenant-scoped case.
+   * Records an authoritative RecoveryOutcome under a tenant-scoped case with atomic create-or-get semantics.
    *
    * Invariants:
    * - Enforces parent case belongs to merchantId.
    * - If amountRecovered is Money, verifies exact currency matches case currency.
+   * - Atomic insert: if P2002 unique constraint is violated (e.g. duplicate dedupeKey), re-reads existing and returns created: false.
    * - Validates actionId and merchantEventId foreign keys when provided.
    */
   async recordOutcome(
     merchantId: string,
     caseId: string,
     params: RecordOutcomeParams,
-  ): Promise<RecoveryOutcome> {
+  ): Promise<RecordOutcomeResult> {
     // Assert tenant ownership of parent case and load authoritative case currency
     const parentCase = await prisma.revenueRiskCase.findFirstOrThrow({
       where: { id: caseId, merchantId },
@@ -53,20 +60,48 @@ export class OutcomeRepository {
       });
     }
 
-    return prisma.recoveryOutcome.create({
-      data: {
-        caseId,
-        actionId: params.actionId,
-        merchantEventId: params.merchantEventId,
-        outcomeType: params.outcomeType,
-        amountRecovered:
-          params.amountRecovered !== undefined
-            ? toPrismaDecimal(params.amountRecovered)
-            : null,
-        detailsJson: params.detailsJson as Prisma.InputJsonValue,
-        observedAt: params.observedAt || new Date(),
-      },
-    });
+    try {
+      const outcome = await prisma.recoveryOutcome.create({
+        data: {
+          caseId,
+          actionId: params.actionId,
+          merchantEventId: params.merchantEventId,
+          dedupeKey: params.dedupeKey,
+          outcomeType: params.outcomeType,
+          amountRecovered:
+            params.amountRecovered !== undefined
+              ? toPrismaDecimal(params.amountRecovered)
+              : null,
+          detailsJson: params.detailsJson as Prisma.InputJsonValue,
+          observedAt: params.observedAt || new Date(),
+        },
+      });
+      return { outcome, created: true };
+    } catch (err: unknown) {
+      if (
+        err &&
+        typeof err === 'object' &&
+        'code' in err &&
+        (err as { code: string }).code === 'P2002'
+      ) {
+        // Unique constraint violation (e.g. [caseId, dedupeKey]) -> atomic re-read
+        let existing: RecoveryOutcome | null = null;
+        if (params.dedupeKey) {
+          existing = await prisma.recoveryOutcome.findFirst({
+            where: { caseId, dedupeKey: params.dedupeKey },
+          });
+        }
+        if (!existing && params.merchantEventId) {
+          existing = await prisma.recoveryOutcome.findFirst({
+            where: { caseId, merchantEventId: params.merchantEventId },
+          });
+        }
+        if (existing) {
+          return { outcome: existing, created: false };
+        }
+      }
+      throw err;
+    }
   }
 
   /**
@@ -107,10 +142,15 @@ export class OutcomeRepository {
     return prisma.recoveryOutcome.findFirst({
       where: {
         caseId,
-        detailsJson: {
-          path: ['dedupeKey'],
-          equals: dedupeKey,
-        },
+        OR: [
+          { dedupeKey },
+          {
+            detailsJson: {
+              path: ['dedupeKey'],
+              equals: dedupeKey,
+            },
+          },
+        ],
       },
     });
   }
