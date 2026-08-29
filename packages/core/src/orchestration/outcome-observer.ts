@@ -1,6 +1,8 @@
 import {
   AuditActorType,
+  ActionExecutionStatus,
   CaseStatus,
+  RecoveryActionType,
   RecoveryOutcome,
   RevenueRiskCase,
 } from '@prisma/client';
@@ -131,7 +133,7 @@ export class OutcomeObserver {
     // Payment-link outcomes may use a provider link ID, but only after it has
     // been resolved from a persisted tenant-scoped RecoveryAction.
     const matchedCase = authoritativeActionCorrelation
-      ? await this.correlateAuthoritativeAction(merchantId, authoritativeActionCorrelation)
+      ? await this.correlateAuthoritativeAction(merchantId, event, authoritativeActionCorrelation)
       : await this.correlateEventToCase(merchantId, event);
     if (!matchedCase) {
       return {
@@ -224,14 +226,21 @@ export class OutcomeObserver {
 
   private async correlateAuthoritativeAction(
     merchantId: string,
+    event: NormalizedMerchantEvent,
     correlation: AuthoritativeActionCorrelation,
   ): Promise<RevenueRiskCase | null> {
     const action = await this.actionRepo.getActionById(merchantId, correlation.actionId);
+    const webhookLinkId = (event.metadata as Record<string, unknown> | null)?.razorpayPaymentLinkId;
     if (
       !action ||
       action.caseId !== correlation.caseId ||
+      action.actionType !== RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK ||
+      action.status !== ActionExecutionStatus.SUCCESS ||
+      action.providerName !== 'RAZORPAY_TEST_MODE_PAYMENT_LINKS' ||
       action.providerName !== correlation.providerName ||
-      action.externalActionId !== correlation.externalActionId
+      action.externalActionId !== correlation.externalActionId ||
+      typeof webhookLinkId !== 'string' ||
+      webhookLinkId !== action.externalActionId
     ) {
       return null;
     }

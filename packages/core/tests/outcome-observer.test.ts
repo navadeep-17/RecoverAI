@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
+  ActionExecutionStatus,
   CaseStatus,
+  RecoveryActionType,
   RiskType,
 } from '@prisma/client';
 import {
@@ -215,7 +217,8 @@ describe('OutcomeObserver Unit Tests', () => {
   describe('1. Authoritative Monetary Recovery', () => {
     it('resolves a payment-link payment only when the persisted action correlation exactly matches', async () => {
       mockActionRepo.getActionById.mockResolvedValue({
-        id: 'act_link_001', caseId, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_001',
+        id: 'act_link_001', caseId, actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+        status: ActionExecutionStatus.SUCCESS, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_001',
       });
       const event: any = {
         merchantId, source: MerchantEventSource.RAZORPAY, externalEventId: 'evt_link_paid',
@@ -234,18 +237,43 @@ describe('OutcomeObserver Unit Tests', () => {
 
     it('rejects forged payment-link correlation before any recovery credit', async () => {
       mockActionRepo.getActionById.mockResolvedValue({
-        id: 'act_link_001', caseId, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_other',
+        id: 'act_link_001', caseId, actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+        status: ActionExecutionStatus.SUCCESS, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_other',
       });
       const event: any = {
         merchantId, source: MerchantEventSource.RAZORPAY, externalEventId: 'evt_forged_link',
         eventType: NormalizedEventType.PAYMENT_SUCCEEDED, occurredAt: new Date(), amount: '14999.00', currency: 'INR',
-        payment: { paymentId: 'pay_link_forged' },
+        payment: { paymentId: 'pay_link_forged' }, metadata: { razorpayPaymentLinkId: 'plink_001' },
       };
 
       const result = await observer.observeMerchantEvent(event, 'merchant_evt_forged', {
         actionId: 'act_link_001', caseId, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_001',
       });
 
+      expect(result.observed).toBe(false);
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
+      expect(inMemoryOutcomes).toHaveLength(0);
+    });
+
+    it.each([
+      ['wrong action type', { actionType: RecoveryActionType.RETRY_PAYMENT }],
+      ['non-success action', { status: ActionExecutionStatus.FAILED }],
+      ['wrong provider', { providerName: 'SIMULATED_RECOVERY_PROVIDER' }],
+      ['cross-case action', { caseId: 'case_other' }],
+      ['webhook link ID mismatch', { externalActionId: 'plink_other' }],
+    ])('rejects payment-link authority with %s and creates no credit', async (_label, override) => {
+      mockActionRepo.getActionById.mockResolvedValue({
+        id: 'act_link_001', caseId, actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+        status: ActionExecutionStatus.SUCCESS, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_001', ...override,
+      });
+      const event: any = {
+        merchantId, source: MerchantEventSource.RAZORPAY, externalEventId: 'evt_bad_authority', eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+        occurredAt: new Date(), amount: '14999.00', currency: 'INR', payment: { paymentId: 'pay_link_001' },
+        metadata: { razorpayPaymentLinkId: 'plink_001' },
+      };
+      const result = await observer.observeMerchantEvent(event, 'merchant_evt_bad', {
+        actionId: 'act_link_001', caseId, providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', externalActionId: 'plink_001',
+      });
       expect(result.observed).toBe(false);
       expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
       expect(inMemoryOutcomes).toHaveLength(0);

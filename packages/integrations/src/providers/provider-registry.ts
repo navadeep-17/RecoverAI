@@ -6,6 +6,7 @@ export interface RazorpayTestModeRuntimeConfig {
   enabled: boolean;
   keyId?: string;
   keySecret?: string;
+  fetchImpl?: typeof fetch;
 }
 
 export class ProviderRegistry extends BaseProviderRegistry {
@@ -21,7 +22,7 @@ export class ProviderRegistry extends BaseProviderRegistry {
   static forRuntime(config: RazorpayTestModeRuntimeConfig): ProviderRegistry {
     if (config.enabled) {
       return new ProviderRegistry([
-        new RazorpayPaymentLinkProvider({ keyId: config.keyId, keySecret: config.keySecret }),
+        new RazorpayPaymentLinkProvider({ keyId: config.keyId, keySecret: config.keySecret, fetchImpl: config.fetchImpl }),
       ]);
     }
     return new ProviderRegistry();

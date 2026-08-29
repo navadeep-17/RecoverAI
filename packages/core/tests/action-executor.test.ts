@@ -1038,4 +1038,23 @@ describe('ActionExecutor Unit Tests', () => {
       expect(simulatedProvider.dispatchedCalls.length).toBe(0);
     });
   });
+
+  it('routes explicitly configured Test Mode payment-link execution through ActionExecutor to Razorpay, not the simulator', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 'plink_runtime', status: 'created' }), { status: 200 }));
+    const runtimeRegistry = ProviderRegistry.forRuntime({ enabled: true, keyId: 'rzp_test_key', keySecret: 'secret', fetchImpl });
+    const executor = new ActionExecutor({
+      actionRepo: mockActionRepo, caseRepo: mockCaseRepo, customerRepo: mockCustomerRepo,
+      policyConfigRepo: mockPolicyConfigRepo, auditRepo: mockAuditRepo, merchantRepo: mockMerchantRepo,
+      commitmentRepo: mockCommitmentRepo, jobScheduler: mockJobScheduler, policyEngine, providerRegistry: runtimeRegistry,
+      clock: () => new Date('2026-08-28T14:00:00+05:30'),
+    });
+    const { action } = await executor.authorizeAndCreateAction(merchantId, caseId, {
+      actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK, actionParams: {}, policyEvaluation: allowResult(), attemptOrVersion: 'runtime',
+    });
+    const result = await executor.executeAction(merchantId, action!.id);
+    expect(result.success).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(simulatedProvider.dispatchedCalls).toHaveLength(0);
+    expect(inMemoryActions.get(action!.id).externalActionId).toBe('plink_runtime');
+  });
 });
