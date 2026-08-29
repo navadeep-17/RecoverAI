@@ -22,6 +22,7 @@
     "dotenv": "^16.4.5",
     "fastify": "^4.28.1",
     "pino": "^9.2.0",
+    "pg-boss": "^9.0.3",
     "zod": "^3.23.8"
   },
   "devDependencies": {

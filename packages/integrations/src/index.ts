@@ -4,4 +4,6 @@ export * from './normalizers/simulator-normalizer.js';
 export * from './normalizers/timer-normalizer.js';
 export * from './providers/provider-contracts.js';
 export * from './providers/simulated-provider.js';
+export * from './providers/razorpay-payment-link-provider.js';
 export * from './providers/provider-registry.js';
+export * from './razorpay-webhook-service.js';

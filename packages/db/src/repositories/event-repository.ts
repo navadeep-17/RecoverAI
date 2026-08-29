@@ -49,6 +49,7 @@ export class EventRepository {
   }
 
   async recordWebhookEvent(data: {
+    merchantId: string;
     provider: string;
     externalEventId?: string;
     signature?: string;
@@ -59,6 +60,7 @@ export class EventRepository {
     try {
       const event = await prisma.webhookEvent.create({
         data: {
+          merchantId: data.merchantId,
           provider: data.provider,
           externalEventId: data.externalEventId,
           signature: data.signature,
@@ -76,7 +78,13 @@ export class EventRepository {
         (err as { code: string }).code === 'P2002'
       ) {
         const existing = await prisma.webhookEvent.findUniqueOrThrow({
-          where: { dedupeKey: data.dedupeKey },
+          where: {
+            merchantId_provider_dedupeKey: {
+              merchantId: data.merchantId,
+              provider: data.provider,
+              dedupeKey: data.dedupeKey,
+            },
+          },
         });
         return { created: false, event: existing };
       }
@@ -84,11 +92,15 @@ export class EventRepository {
     }
   }
 
-  async markWebhookProcessed(dedupeKey: string): Promise<WebhookEvent> {
+  async markWebhookProcessed(merchantId: string, provider: string, dedupeKey: string): Promise<WebhookEvent> {
     return prisma.webhookEvent.update({
-      where: { dedupeKey },
+      where: { merchantId_provider_dedupeKey: { merchantId, provider, dedupeKey } },
       data: { processed: true },
     });
+  }
+
+  async getWebhookEventById(merchantId: string, webhookEventId: string): Promise<WebhookEvent | null> {
+    return prisma.webhookEvent.findFirst({ where: { id: webhookEventId, merchantId } });
   }
 
   async findEventByTypeAndField(

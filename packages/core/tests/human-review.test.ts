@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   ActionExecutionStatus,
   AuditActorType,
@@ -47,6 +47,11 @@ describe('HumanReviewService Unit Tests', () => {
   let inMemoryAudits: any[];
 
   beforeEach(() => {
+    // The approval happy path is an email action. Keep it outside the configured
+    // Asia/Kolkata quiet-hours window so this fixture tests review execution, not
+    // the separately covered hard policy deny.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-29T06:00:00.000Z'));
     inMemoryReviews = new Map();
     inMemoryCases = new Map();
     inMemoryCustomers = new Map();
@@ -348,6 +353,10 @@ describe('HumanReviewService Unit Tests', () => {
       policyEngine,
       actionExecutor,
     });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   // A. Review Creation

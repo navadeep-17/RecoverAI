@@ -1,12 +1,25 @@
 import { buildServer } from './server.js';
 import { loadEnv, createLogger } from '@recoverai/shared';
+import { AuditRepository, EventRepository } from '@recoverai/db';
+import { RazorpayWebhookService } from '@recoverai/integrations';
+import { PgBossRazorpayWebhookQueue } from './razorpay-webhook-queue.js';
 
 const env = loadEnv();
 const logger = createLogger({ level: env.LOG_LEVEL });
-const server = buildServer();
+const webhookQueue = new PgBossRazorpayWebhookQueue(env.DATABASE_URL, env.PG_BOSS_SCHEMA);
+const server = buildServer({
+  razorpayWebhookService: new RazorpayWebhookService({
+    merchantId: env.RAZORPAY_TEST_MERCHANT_ID,
+    webhookSecret: env.RAZORPAY_WEBHOOK_SECRET,
+    eventRepo: new EventRepository(),
+    auditRepo: new AuditRepository(),
+    queue: webhookQueue,
+  }),
+});
 
 async function start() {
   try {
+    await webhookQueue.start();
     const address = await server.listen({
       port: env.PORT,
       host: env.HOST,
@@ -23,6 +36,7 @@ for (const signal of signals) {
   process.on(signal, async () => {
     logger.info({ msg: `Received ${signal}, closing HTTP server...` });
     await server.close();
+    await webhookQueue.stop();
     process.exit(0);
   });
 }

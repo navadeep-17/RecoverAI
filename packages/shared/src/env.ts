@@ -12,6 +12,11 @@ export const EnvSchema = z.object({
   SESSION_SECRET: z.string().min(16).default('development_secret_must_be_overridden_in_prod'),
   AI_PROVIDER: z.enum(['mock', 'gemini', 'anthropic', 'openai']).default('mock'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+  // Test-mode only. These remain optional so ordinary CI never needs private credentials.
+  RAZORPAY_KEY_ID: z.string().min(1).optional(),
+  RAZORPAY_KEY_SECRET: z.string().min(1).optional(),
+  RAZORPAY_WEBHOOK_SECRET: z.string().min(1).optional(),
+  RAZORPAY_TEST_MERCHANT_ID: z.string().min(1).optional(),
 });
 
 export type EnvConfig = z.infer<typeof EnvSchema>;

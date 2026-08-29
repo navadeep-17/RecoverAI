@@ -175,7 +175,17 @@ export class RazorpayEventNormalizer {
       formattedAmount = formatPaiseToDecimalString(invoiceEntity.amount);
     }
 
-    const currency = (paymentEntity?.currency || invoiceEntity?.currency || 'INR').toUpperCase();
+    const rawCurrency = paymentEntity?.currency || invoiceEntity?.currency;
+    const requiresMoney = eventType === NormalizedEventType.PAYMENT_FAILED ||
+      eventType === NormalizedEventType.PAYMENT_SUCCEEDED ||
+      eventType === NormalizedEventType.INVOICE_PAID;
+    if (requiresMoney && (!formattedAmount || !rawCurrency || !/^[A-Za-z]{3}$/.test(rawCurrency))) {
+      throw new InvalidProviderAmountError('Authoritative monetary Razorpay events require valid amount and ISO currency', {
+        amount: paymentEntity?.amount ?? invoiceEntity?.amount,
+        currency: rawCurrency,
+      });
+    }
+    const currency = rawCurrency ? rawCurrency.toUpperCase() : null;
 
     const normalized: NormalizedMerchantEvent = {
       merchantId,

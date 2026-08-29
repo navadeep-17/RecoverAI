@@ -158,16 +158,18 @@ model MerchantEvent {
 
 model WebhookEvent {
   id              String            @id @default(uuid())
+  merchantId      String
   provider        String
   externalEventId String?
   signature       String?
   verified        Boolean           @default(false)
-  dedupeKey       String            @unique
+  dedupeKey       String
   rawPayload      String
   processed       Boolean           @default(false)
   receivedAt      DateTime          @default(now())
 
-  @@index([provider, externalEventId])
+  @@unique([merchantId, provider, dedupeKey])
+  @@index([merchantId, provider, externalEventId])
   @@map("webhook_events")
 }
 

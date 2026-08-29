@@ -2,15 +2,18 @@ import fastify, { FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import sensible from '@fastify/sensible';
 import { generateCorrelationId, createLogger, loadEnv } from '@recoverai/shared';
-import { checkDatabaseConnection } from '@recoverai/db';
+import { checkDatabaseConnection, AuditRepository, EventRepository } from '@recoverai/db';
+import { RazorpayWebhookService } from '@recoverai/integrations';
 
 import { HumanReviewService } from '@recoverai/core';
 import { reviewRoutes } from './routes/review-routes.js';
 import { authenticatePrincipalHook } from './auth/principal.js';
+import { razorpayWebhookRoutes } from './routes/razorpay-webhook-routes.js';
 
 export interface BuildServerOptions {
   checkDbConnection?: () => Promise<boolean>;
   reviewService?: HumanReviewService;
+  razorpayWebhookService?: RazorpayWebhookService;
 }
 
 export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
@@ -27,6 +30,13 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       }
       return generateCorrelationId();
     },
+  });
+
+  // Keep raw bytes only for the Razorpay webhook route. Other JSON routes retain parsed objects.
+  app.removeContentTypeParser('application/json');
+  app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (req, body, done) => {
+    if (req.url.split('?')[0] === '/webhooks/razorpay') return done(null, body);
+    try { done(null, JSON.parse(body.toString('utf8'))); } catch (err) { done(err as Error); }
   });
 
   // Plugins
@@ -91,6 +101,16 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       reviewService: options.reviewService,
     });
   }
+
+  app.register(razorpayWebhookRoutes, {
+    prefix: '/webhooks',
+    webhookService: options.razorpayWebhookService || new RazorpayWebhookService({
+      merchantId: env.RAZORPAY_TEST_MERCHANT_ID,
+      webhookSecret: env.RAZORPAY_WEBHOOK_SECRET,
+      eventRepo: new EventRepository(),
+      auditRepo: new AuditRepository(),
+    }),
+  });
 
   return app;
 }

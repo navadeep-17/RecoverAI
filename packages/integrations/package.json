@@ -13,6 +13,7 @@
   "dependencies": {
     "@recoverai/shared": "*",
     "@recoverai/db": "*",
+    "@recoverai/core": "*",
     "zod": "^3.23.8"
   },
   "devDependencies": {

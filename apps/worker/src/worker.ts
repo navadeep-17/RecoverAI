@@ -7,8 +7,12 @@ import {
   AuditRepository,
   EventRepository,
   ScheduledJobRepository,
+  ActionRepository,
+  OutcomeRepository,
+  CommitmentRepository,
 } from '@recoverai/db';
-import { RiskDetector, OutcomeObserver } from '@recoverai/core';
+import { RiskDetector, OutcomeObserver, EventIngestionService } from '@recoverai/core';
+import { RazorpayEventNormalizer } from '@recoverai/integrations';
 import { PgBossJobScheduler } from './scheduler.js';
 
 export interface RecoveryWorkerConfig {
@@ -31,6 +35,7 @@ export class RecoveryWorkerService {
   private scheduler: PgBossJobScheduler | null = null;
   private riskDetector: RiskDetector | null = null;
   private outcomeObserver: OutcomeObserver | null = null;
+  private eventIngestionService: EventIngestionService | null = null;
 
   constructor(private config?: RecoveryWorkerConfig) {
     if (config?.bossInstance) {
@@ -80,6 +85,20 @@ export class RecoveryWorkerService {
         eventRepo,
         this.scheduler,
       );
+      this.eventIngestionService = new EventIngestionService(eventRepo, auditRepo, this.riskDetector);
+      if (!this.outcomeObserver) {
+        this.outcomeObserver = new OutcomeObserver({
+          caseRepo,
+          actionRepo: new ActionRepository(),
+          outcomeRepo: new OutcomeRepository(),
+          customerRepo,
+          commitmentRepo: new CommitmentRepository(),
+          eventRepo,
+          auditRepo,
+          scheduledJobRepo,
+          jobScheduler: this.scheduler,
+        });
+      }
 
       // Register pg-boss job subscribers
       await this.registerJobHandlers(scheduledJobRepo);
@@ -94,6 +113,26 @@ export class RecoveryWorkerService {
 
   private async registerJobHandlers(scheduledJobRepo: ScheduledJobRepository): Promise<void> {
     if (!this.boss) return;
+
+    await this.boss.work('RAZORPAY_WEBHOOK_PROCESS', async (job) => {
+      const data = job.data as { merchantId: string; webhookEventId: string };
+      if (!this.eventIngestionService || !this.outcomeObserver) {
+        throw new Error('Razorpay webhook worker dependencies unavailable');
+      }
+      const eventRepo = this.config?.eventRepo || new EventRepository();
+      const receipt = await eventRepo.getWebhookEventById(data.merchantId, data.webhookEventId);
+      if (!receipt || !receipt.verified || receipt.provider !== 'RAZORPAY') {
+        throw new Error('Verified Razorpay webhook receipt not found');
+      }
+      const normalized = RazorpayEventNormalizer.normalize(
+        data.merchantId,
+        JSON.parse(receipt.rawPayload),
+        receipt.externalEventId || undefined,
+      );
+      const ingested = await this.eventIngestionService.ingestEvent(normalized);
+      await this.outcomeObserver.observeMerchantEvent(normalized, ingested.event.id);
+      await eventRepo.markWebhookProcessed(data.merchantId, 'RAZORPAY', receipt.dedupeKey);
+    });
 
     // 1. Checkout Abandonment Recheck
     await this.boss.work('CHECKOUT_ABANDONMENT_CHECK', async (job) => {
