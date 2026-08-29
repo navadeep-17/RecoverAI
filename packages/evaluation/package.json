@@ -5,17 +5,21 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
+    "evaluate": "tsx src/cli.ts",
     "build": "tsc -b",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts",
     "clean": "rimraf dist"
   },
   "dependencies": {
+    "@recoverai/core": "*",
+    "@recoverai/policy": "*",
     "@recoverai/shared": "*",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "rimraf": "^5.0.7",
-    "typescript": "^5.5.2"
+    "typescript": "^5.5.2",
+    "tsx": "^4.16.2"
   }
 }
