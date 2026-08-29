@@ -616,7 +616,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(audits.some((a) => a.eventType === 'REVIEW_TAKEN_OVER')).toBe(true);
 
     // When orchestrator tries to run iteration on this case, it halts due to active takeover
-    const claim = await triggerRepo.claimTrigger(merchantAId, testCase.id, 'MANUAL_DISPATCH', {});
+    const claim = await triggerRepo.claimTrigger(merchantAId, testCase.id, `manual_${Date.now()}`, 'MANUAL_DISPATCH');
     const iteration = await orchestrator.runIteration(merchantAId, testCase.id, claim);
 
     expect(iteration.iterationCompleted).toBe(false);
