@@ -8,6 +8,7 @@ import {
   ActionRepository,
   AuditRepository,
   CaseRepository,
+  CaseTransitionOptions,
   CommitmentRepository,
   CustomerRepository,
   EventRepository,
@@ -15,6 +16,7 @@ import {
   ScheduledJobRepository,
 } from '@recoverai/db';
 import {
+  CaseStateConflictError,
   Money,
   NormalizedEventType,
   NormalizedMerchantEvent,
@@ -252,7 +254,7 @@ export class OutcomeObserver {
       }
 
       if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-        await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.STOPPED);
+        await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.STOPPED);
       }
 
       await this.auditRepo.record(merchantId, {
@@ -303,7 +305,7 @@ export class OutcomeObserver {
         }
 
         if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-          await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
+          await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
         }
 
         await this.auditRepo.record(merchantId, {
@@ -334,7 +336,7 @@ export class OutcomeObserver {
         });
 
         if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-          await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
+          await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
         }
 
         await this.auditRepo.record(merchantId, {
@@ -351,10 +353,6 @@ export class OutcomeObserver {
           caseId,
           caseStatus: CaseStatus.NEEDS_REVIEW,
         };
-      }
-
-      if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-        await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
       }
 
       // 1. Create authoritative commitment idempotently by sourceMessageId
@@ -460,7 +458,7 @@ export class OutcomeObserver {
               };
             } catch {
               if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-                await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
+                await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
               }
               return {
                 observed: true,
@@ -501,7 +499,7 @@ export class OutcomeObserver {
       } catch (scheduleErr) {
         // Scheduler failed: route safely to NEEDS_REVIEW so commitment is never silently orphaned without human or timer wake!
         if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-          await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
+          await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
         }
 
         await this.auditRepo.record(merchantId, {
@@ -591,7 +589,7 @@ export class OutcomeObserver {
 
       // Escalate to human review
       if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-        await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
+        await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
       }
 
       return {
@@ -808,7 +806,7 @@ export class OutcomeObserver {
 
       // Transition case to NEEDS_REVIEW
       if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-        await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
+        await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
       }
 
       // Emit canonical CASE_ESCALATED audit with reasonCode BROKEN_PROMISE_TO_PAY
@@ -1128,7 +1126,7 @@ export class OutcomeObserver {
       matchedCase.status === CaseStatus.WAITING ||
       matchedCase.status === CaseStatus.NEEDS_REVIEW
     ) {
-      await this.caseRepo.compareAndSetStatus(
+      await this.safeCompareAndSetStatus(
         merchantId,
         caseId,
         matchedCase.status,
@@ -1181,5 +1179,30 @@ export class OutcomeObserver {
       caseResolved: true,
       caseStatus: CaseStatus.RECOVERED,
     };
+  }
+
+  /**
+   * Helper to perform atomic Compare-And-Set state transitions while converging
+   * gracefully when concurrent deliveries of the same authoritative operation
+   * have already placed the case in the desired target state.
+   */
+  private async safeCompareAndSetStatus(
+    merchantId: string,
+    caseId: string,
+    expected: CaseStatus,
+    next: CaseStatus,
+    options?: CaseTransitionOptions,
+  ): Promise<RevenueRiskCase> {
+    try {
+      return await this.caseRepo.compareAndSetStatus(merchantId, caseId, expected, next, options);
+    } catch (err) {
+      if (err instanceof CaseStateConflictError) {
+        const currentCase = await this.caseRepo.getCaseById(merchantId, caseId);
+        if (currentCase && currentCase.status === next) {
+          return currentCase;
+        }
+      }
+      throw err;
+    }
   }
 }

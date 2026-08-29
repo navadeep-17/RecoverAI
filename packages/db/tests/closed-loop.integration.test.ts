@@ -866,7 +866,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const msgId = `msg_conc_prom_${Date.now()}`;
     const replyText = 'I will pay ₹85,000 on Friday without fail';
 
-    const results = await Promise.all([
+    const results = await Promise.allSettled([
       observer.observeCustomerReply({ merchantId, caseId: testCase.id, messageId: msgId, replyText }),
       observer.observeCustomerReply({ merchantId, caseId: testCase.id, messageId: msgId, replyText }),
       observer.observeCustomerReply({ merchantId, caseId: testCase.id, messageId: msgId, replyText }),
@@ -874,8 +874,17 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       observer.observeCustomerReply({ merchantId, caseId: testCase.id, messageId: msgId, replyText }),
     ]);
 
-    // All 5 calls observe the customer reply (0 rejected promises)
-    expect(results.every((r) => r.observed)).toBe(true);
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+
+    // 5 fulfilled / 0 rejected
+    expect(fulfilled.length).toBe(5);
+    expect(rejected.length).toBe(0);
+    expect(fulfilled.every((r) => r.value.observed)).toBe(true);
+
+    // Final case state remains OPEN (not forced into NEEDS_REVIEW by race)
+    const finalCase = await caseRepo.getCaseById(merchantId, testCase.id);
+    expect(finalCase?.status).toBe(CaseStatus.OPEN);
 
     // Exactly 1 RecoveryOutcome in DB for that message
     const outcomesInDb = await prisma.recoveryOutcome.findMany({
