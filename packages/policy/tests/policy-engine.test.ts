@@ -250,6 +250,24 @@ describe('Deterministic PolicyEngine Specification & Invariant Tests', () => {
         expect(result.reasonCode).toBe(PolicyReasonCodes.REQUIRED_FACTS_MISSING);
         expect(result.violations).toContain('MISSING_VERIFIED_PAYMENT_FAILURE_CODE');
       });
+
+      it('ALLOW: verified CARD_EXPIRED decline allows subsequent RETRY_PAYMENT if authoritative PAYMENT_METHOD_UPDATED was observed', () => {
+        const contextWithUpdatedMethod = createBaseContext({
+          proposedActionType: RecoveryActionType.RETRY_PAYMENT,
+          verifiedPaymentFailureCode: 'CARD_EXPIRED',
+          priorOutcomes: [
+            {
+              outcomeType: 'PAYMENT_METHOD_UPDATED',
+              observedAt: new Date('2026-08-28T11:00:00Z'),
+            },
+          ],
+        });
+        const result = engine.evaluate(contextWithUpdatedMethod);
+
+        expect(result.decision).toBe(PolicyDecision.ALLOW);
+        expect(result.reasonCode).toBe(PolicyReasonCodes.POLICY_PASSED_ALLOW);
+        expect(result.evaluatedFacts.isHardDecline).toBe(false);
+      });
     });
 
     it('DENY: max payment retries exceeded', () => {

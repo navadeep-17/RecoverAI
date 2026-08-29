@@ -1,4 +1,4 @@
-import { PolicyDecision, RecoveryActionType, Money } from '@recoverai/shared';
+import { PolicyDecision, RecoveryActionType, Money, NormalizedEventType } from '@recoverai/shared';
 import { isHardDecline } from '@recoverai/core';
 import {
   IPolicyEngine,
@@ -213,7 +213,11 @@ export class PolicyEngine implements IPolicyEngine {
     }
 
     const verifiedCode = context.verifiedPaymentFailureCode ?? context.verifiedPaymentFacts?.gatewayErrorCode ?? null;
-    const hardDecline = isHardDecline(verifiedCode);
+    const isExpiredCard = verifiedCode?.trim().toUpperCase() === 'CARD_EXPIRED';
+    const hasAuthoritativeMethodUpdate = (context.priorOutcomes || []).some(
+      (o) => o.outcomeType === 'PAYMENT_METHOD_UPDATED' || o.outcomeType === NormalizedEventType.PAYMENT_METHOD_UPDATED,
+    );
+    const hardDecline = isHardDecline(verifiedCode) && !(isExpiredCard && hasAuthoritativeMethodUpdate);
 
     return {
       merchantKillSwitch: context.killSwitchActive,

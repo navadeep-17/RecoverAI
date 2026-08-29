@@ -1,4 +1,4 @@
-import { PolicyDecision, CaseStatus, RecoveryActionType, Money } from '@recoverai/shared';
+import { PolicyDecision, CaseStatus, RecoveryActionType, Money, NormalizedEventType } from '@recoverai/shared';
 import { isActionCompatible, isHardDecline } from '@recoverai/core';
 import { IPolicyRule, RuleResult } from './rule.interface.js';
 import {
@@ -263,6 +263,19 @@ export class HardDeclineRule implements IPolicyRule {
       }
 
       if (isHardDecline(verifiedCode)) {
+        // If the verified failure was CARD_EXPIRED and an authoritative PAYMENT_METHOD_UPDATED
+        // has subsequently been observed in the event/outcome history, new verified credentials
+        // are on file and automatic payment retry on updated credentials is permitted.
+        const isExpiredCard = verifiedCode.trim().toUpperCase() === 'CARD_EXPIRED';
+        const hasAuthoritativeMethodUpdate = (context.priorOutcomes || []).some(
+          (o) => o.outcomeType === 'PAYMENT_METHOD_UPDATED' || o.outcomeType === NormalizedEventType.PAYMENT_METHOD_UPDATED,
+        );
+
+        if (isExpiredCard && hasAuthoritativeMethodUpdate) {
+          // Permitted subject to remaining policy rules (max retries, quiet hours, cooldown)
+          return null;
+        }
+
         return {
           decision: PolicyDecision.DENY,
           reasonCode: PolicyReasonCodes.HARD_DECLINE_BLOCKS_RETRY,

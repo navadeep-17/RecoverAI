@@ -264,6 +264,13 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       occurredAt: new Date(),
     });
 
+    // Verify before success observation that the case remains active and correctly correlated
+    const beforeSuccess = await caseRepo.getCaseById(merchantId, testCase.id);
+    expect(beforeSuccess?.status).toBe(CaseStatus.WAITING);
+
+    const correlated = await caseRepo.findActiveCaseByPaymentId(merchantId, paymentId);
+    expect(correlated?.id).toBe(testCase.id);
+
     const successObsResult = await observer.observeMerchantEvent(successEvent, succResult.event.id);
 
     expect(successObsResult.observed).toBe(true);
