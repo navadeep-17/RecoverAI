@@ -5,6 +5,7 @@ import {
   PolicyDecision,
   RecoveryAction,
   RecoveryActionType,
+  ReviewStatus,
 } from '@prisma/client';
 import {
   ActionRepository,
@@ -12,6 +13,7 @@ import {
   CaseRepository,
   CommitmentRepository,
   CustomerRepository,
+  HumanReviewRepository,
   MerchantRepository,
   PolicyConfigRepository,
   CaseWithRelations,
@@ -32,9 +34,34 @@ import { ActionExecutionError } from '@recoverai/shared';
 import { IJobScheduler } from '../detection/job-scheduler-interface.js';
 import { generateActionIdempotencyKey } from './idempotency-generator.js';
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Options
-// ──────────────────────────────────────────────────────────────────────────────
+function semanticJsonEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (left === null || right === null) return false;
+  if (typeof left !== typeof right) return false;
+
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+    return left.every((value, index) => semanticJsonEqual(value, right[index]));
+  }
+
+  if (typeof left === 'object' && typeof right === 'object') {
+    const leftRecord = left as Record<string, unknown>;
+    const rightRecord = right as Record<string, unknown>;
+    const leftKeys = Object.keys(leftRecord).sort();
+    const rightKeys = Object.keys(rightRecord).sort();
+
+    if (leftKeys.length !== rightKeys.length) return false;
+    for (let i = 0; i < leftKeys.length; i += 1) {
+      if (leftKeys[i] !== rightKeys[i]) return false;
+      if (!semanticJsonEqual(leftRecord[leftKeys[i]], rightRecord[rightKeys[i]])) return false;
+    }
+    return true;
+  }
+
+  return false;
+}
 
 export interface ActionExecutorOptions {
   actionRepo: ActionRepository;
@@ -42,46 +69,34 @@ export interface ActionExecutorOptions {
   customerRepo: CustomerRepository;
   policyConfigRepo: PolicyConfigRepository;
   auditRepo: AuditRepository;
-  /**
-   * MANDATORY. merchantRepo is required for authoritative kill-switch evaluation.
-   * Absent merchantRepo causes the executor to fail closed (never fail open).
-   */
+  /** MANDATORY for authoritative kill-switch evaluation. */
   merchantRepo: MerchantRepository;
-  /**
-   * CommitmentRepository for authoritative RECORD_PROMISE_TO_PAY persistence.
-   * If absent, RECORD_PROMISE_TO_PAY will fail safely (action marked FAILED).
-   */
   commitmentRepo?: CommitmentRepository;
+  /**
+   * Optional injection for tests/composition. When omitted, the repository is
+   * constructed from the shared Prisma client. Human-review authority always
+   * fails closed if durable review state cannot be read.
+   */
+  humanReviewRepo?: HumanReviewRepository;
   policyEngine: IPolicyEngine;
   providerRegistry: ProviderRegistry;
-  /**
-   * jobScheduler is required for SCHEDULE_FOLLOWUP internal actions.
-   * If absent, SCHEDULE_FOLLOWUP will fail safely (action marked FAILED).
-   */
   jobScheduler?: IJobScheduler;
   clock?: () => Date;
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Authorization: accepts a typed PolicyEvaluationResult — not loose strings
-// ──────────────────────────────────────────────────────────────────────────────
 
 export interface AuthorizeActionParams {
   planVersionId?: string;
   actionType: RecoveryActionType;
   actionParams: Record<string, unknown>;
-  /**
-   * Typed result from PolicyEngine.evaluate(). The executor binds authorization
-   * to this deterministic result rather than caller-supplied loose strings.
-   */
   policyEvaluation: PolicyEvaluationResult;
   attemptOrVersion?: string | number;
+  /**
+   * Deprecated compatibility input. It is deliberately NOT persisted or trusted.
+   * Human-review authority is derived from fresh durable HumanReview state at
+   * execution time, never from this caller-provided string.
+   */
   executionSource?: PolicyExecutionSource;
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Execution result
-// ──────────────────────────────────────────────────────────────────────────────
 
 export interface ActionExecutionResult {
   executed: boolean;
@@ -96,19 +111,15 @@ export interface ActionExecutionResult {
   error?: string;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// ActionExecutor
-// ──────────────────────────────────────────────────────────────────────────────
-
 export class ActionExecutor {
   private actionRepo: ActionRepository;
   private caseRepo: CaseRepository;
   private customerRepo: CustomerRepository;
   private policyConfigRepo: PolicyConfigRepository;
   private auditRepo: AuditRepository;
-  /** MANDATORY: Absent merchantRepo fails closed. */
   private merchantRepo: MerchantRepository;
   private commitmentRepo?: CommitmentRepository;
+  private humanReviewRepo: HumanReviewRepository;
   private policyEngine: IPolicyEngine;
   private providerRegistry: ProviderRegistry;
   private jobScheduler?: IJobScheduler;
@@ -122,24 +133,13 @@ export class ActionExecutor {
     this.auditRepo = options.auditRepo;
     this.merchantRepo = options.merchantRepo;
     this.commitmentRepo = options.commitmentRepo;
+    this.humanReviewRepo = options.humanReviewRepo || new HumanReviewRepository();
     this.policyEngine = options.policyEngine;
     this.providerRegistry = options.providerRegistry;
     this.jobScheduler = options.jobScheduler;
     this.clock = options.clock;
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // 1. Authorization — binds creation to a deterministic PolicyEvaluationResult
-  // ────────────────────────────────────────────────────────────────────────────
-
-  /**
-   * Creates an authoritative RecoveryAction only when PolicyEvaluationResult.decision
-   * is ALLOW. Authorization is bound to the typed PolicyEvaluationResult from
-   * PolicyEngine.evaluate() — not caller-supplied loose strings.
-   *
-   * Idempotent: if a RecoveryAction with the same idempotencyKey already exists,
-   * returns the existing action and emits NO duplicate ACTION_AUTHORIZED audit.
-   */
   async authorizeAndCreateAction(
     merchantId: string,
     caseId: string,
@@ -195,15 +195,11 @@ export class ActionExecutor {
       return { action: null, authorized: false, reason: policyEvaluation.rationale };
     }
 
-    // PolicyDecision is ALLOW — check idempotency first
     const existing = await this.actionRepo.findActionByIdempotencyKey(merchantId, idempotencyKey);
     if (existing) {
-      // Idempotent return: same logical authorization retry → return existing action
-      // Do NOT emit a duplicate ACTION_AUTHORIZED audit
       return { action: existing, authorized: true };
     }
 
-    // Create authoritative RecoveryAction
     const action = await this.actionRepo.createAction(merchantId, caseId, {
       planVersionId: params.planVersionId,
       actionType: params.actionType,
@@ -212,7 +208,8 @@ export class ActionExecutor {
       policyDecision: PolicyDecision.ALLOW,
       policyRationale: policyEvaluation.rationale,
       status: ActionExecutionStatus.PENDING,
-      executionMetadata: params.executionSource ? { executionSource: params.executionSource } : undefined,
+      // Never persist caller-supplied executionSource as authority.
+      executionMetadata: undefined,
     });
 
     await this.auditRepo.record(merchantId, {
@@ -238,30 +235,17 @@ export class ActionExecutor {
     return { action, authorized: true };
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // 2. Execution — claim first, then revalidate, then dispatch
-  // ────────────────────────────────────────────────────────────────────────────
-
   /**
-   * Executes an authoritative RecoveryAction through:
-   *
-   * 1. Tenant verification
-   * 2. PENDING eligibility check
-   * 3. ATOMIC CLAIM: PENDING → EXECUTING (only winning worker continues)
-   * 4. Fresh authoritative context load (case/customer/merchant/policy)
-   * 5. Fresh PolicyEngine revalidation immediately before dispatch
-   *    - DENY/REVIEW: EXECUTING → CANCELLED via CAS, provider NOT called
-   * 6. Internal vs. external routing
-   *    - Internal: safe execution with explicit failure handling
-   *    - External: resolve provider, emit ACTION_DISPATCHED immediately before
-   *      provider.execute(), handle result/failure/exception
+   * Executes an authoritative RecoveryAction. The optional executionSource field
+   * is retained only for source compatibility and is ignored. Human-review
+   * authority is resolved exclusively from fresh APPROVED HumanReview records
+   * bound to this merchant/case and exact reviewed proposal/action.
    */
   async executeAction(
     merchantId: string,
     actionId: string,
-    options?: { executionSource?: PolicyExecutionSource },
+    _options?: { executionSource?: PolicyExecutionSource },
   ): Promise<ActionExecutionResult> {
-    // ── Step 1: Verify tenant ownership ──────────────────────────────────────
     const action = await this.actionRepo.getActionById(merchantId, actionId);
     if (!action) {
       throw new Error(
@@ -269,7 +253,6 @@ export class ActionExecutor {
       );
     }
 
-    // ── Step 2: PENDING eligibility check ────────────────────────────────────
     if (action.status !== ActionExecutionStatus.PENDING) {
       return {
         executed: false,
@@ -278,8 +261,6 @@ export class ActionExecutor {
       };
     }
 
-    // ── Step 3: ATOMIC CLAIM — PENDING → EXECUTING ───────────────────────────
-    // Only the winning worker continues. Losers observe alreadyClaimed.
     const claimResult = await this.actionRepo.claimActionForExecution(merchantId, actionId);
     if (!claimResult.claimed) {
       return {
@@ -289,7 +270,6 @@ export class ActionExecutor {
       };
     }
 
-    // Record the claim immediately
     await this.auditRepo.record(merchantId, {
       caseId: action.caseId,
       eventType: 'ACTION_CLAIMED',
@@ -302,15 +282,10 @@ export class ActionExecutor {
       reasonCode: 'ACTION_ATOMICALLY_CLAIMED',
     });
 
-    // ── Step 4: Load fresh authoritative context ──────────────────────────────
-    // Load AFTER claim to ensure only claim owner does expensive reloads.
-
-    // KILL SWITCH: merchantRepo is mandatory. Fail closed if merchant cannot be loaded.
     let killSwitchActive: boolean;
     try {
       const merchant = await this.merchantRepo.getMerchantById(merchantId);
       if (!merchant) {
-        // Merchant not found — fail closed: EXECUTING → FAILED
         return await this.failActionSafely(
           merchantId,
           actionId,
@@ -350,12 +325,15 @@ export class ActionExecutor {
 
     const policyConfig = await this.policyConfigRepo.getOrCreateConfig(merchantId);
 
-    const executionSource: PolicyExecutionSource =
-      options?.executionSource ||
-      ((action.executionMetadata as Record<string, unknown> | null)?.executionSource as PolicyExecutionSource) ||
-      'AUTONOMOUS';
+    const reviewAuthority = await this.resolveAuthoritativeHumanReview(
+      merchantId,
+      action,
+      caseRecord,
+    );
+    const executionSource: PolicyExecutionSource = reviewAuthority.authorized
+      ? 'HUMAN_REVIEW_APPROVAL'
+      : 'AUTONOMOUS';
 
-    // ── Step 5: Fresh Policy Revalidation — only the claim owner revalidates ──
     const freshContext: PolicyExecutionContext = {
       merchantId,
       killSwitchActive,
@@ -428,9 +406,6 @@ export class ActionExecutor {
       revalidation.decision === PolicyDecision.DENY ||
       revalidation.decision === PolicyDecision.REVIEW
     ) {
-      // Roll back claim via CAS: EXECUTING → CANCELLED
-      // Only the claim owner (holding EXECUTING) can make this transition.
-      // Stale workers who lost the claim cannot touch EXECUTING/CANCELLED.
       const rollback = await this.actionRepo.transitionActionStatus(
         merchantId,
         actionId,
@@ -449,6 +424,8 @@ export class ActionExecutor {
           actionId,
           actionType: action.actionType,
           idempotencyKey: action.idempotencyKey,
+          executionSource,
+          humanReviewId: reviewAuthority.reviewId,
         },
         outputSummaryJson: {
           decision: revalidation.decision,
@@ -468,7 +445,6 @@ export class ActionExecutor {
       };
     }
 
-    // Revalidation passed (ALLOW) — only claim owner emits this
     await this.auditRepo.record(merchantId, {
       caseId: caseRecord.id,
       eventType: 'ACTION_POLICY_REVALIDATED',
@@ -477,6 +453,8 @@ export class ActionExecutor {
         actionId,
         actionType: action.actionType,
         idempotencyKey: action.idempotencyKey,
+        executionSource,
+        humanReviewId: reviewAuthority.reviewId,
       },
       outputSummaryJson: {
         decision: PolicyDecision.ALLOW,
@@ -486,16 +464,12 @@ export class ActionExecutor {
       reasonCode: revalidation.reasonCode,
     });
 
-    // ── Step 6: Dispatch ──────────────────────────────────────────────────────
     if (this.isInternalAction(action.actionType)) {
-      // Internal actions: no ACTION_DISPATCHED audit. No external provider called.
       return this.executeInternalActionSafely(merchantId, action, caseRecord);
     }
 
-    // External action: resolve provider FIRST
     const provider = this.providerRegistry.getProviderForAction(action.actionType);
     if (!provider) {
-      // No provider registered — fail the action. No ACTION_DISPATCHED audit.
       const failedAction = await this.actionRepo.updateActionStatus(merchantId, actionId, {
         status: ActionExecutionStatus.FAILED,
         errorMessage: `No provider registered for action type: ${action.actionType}`,
@@ -547,7 +521,6 @@ export class ActionExecutor {
       },
     };
 
-    // Emit ACTION_DISPATCHED immediately BEFORE provider.execute() — never earlier.
     await this.auditRepo.record(merchantId, {
       caseId: caseRecord.id,
       eventType: 'ACTION_DISPATCHED',
@@ -558,6 +531,7 @@ export class ActionExecutor {
         idempotencyKey: action.idempotencyKey,
         providerName: provider.providerName,
         isSimulated: provider.isSimulated,
+        humanReviewId: reviewAuthority.reviewId,
       },
       reasonCode: 'DISPATCHING_TO_PROVIDER',
     });
@@ -573,7 +547,6 @@ export class ActionExecutor {
           executionMetadata: providerResult.metadata,
         });
 
-        // If contact action, update customer lastContactedAt
         if (caseRecord.customer && this.isContactAction(action.actionType)) {
           await this.customerRepo.updateLastContactedAt(
             merchantId,
@@ -608,7 +581,6 @@ export class ActionExecutor {
         };
       }
 
-      // Provider reported failure (RETRYABLE_FAILURE or PERMANENT_FAILURE)
       const failedAction = await this.actionRepo.updateActionStatus(merchantId, actionId, {
         status: ActionExecutionStatus.FAILED,
         providerName: providerResult.providerName,
@@ -674,9 +646,78 @@ export class ActionExecutor {
     }
   }
 
-  // ────────────────────────────────────────────────────────────────────────────
-  // Private helpers
-  // ────────────────────────────────────────────────────────────────────────────
+  /**
+   * Resolve the only narrow authority human approval grants. A caller string,
+   * action metadata field, or policy result is never enough. We re-read durable
+   * APPROVED reviews after the action claim and require same tenant, same case,
+   * and exact action/proposal binding.
+   */
+  private async resolveAuthoritativeHumanReview(
+    merchantId: string,
+    action: RecoveryAction,
+    caseRecord: CaseWithRelations,
+  ): Promise<{ authorized: boolean; reviewId?: string }> {
+    if (caseRecord.status !== CaseStatus.NEEDS_REVIEW) {
+      return { authorized: false };
+    }
+
+    let approvedReviews;
+    try {
+      approvedReviews = await this.humanReviewRepo.listReviews(merchantId, {
+        status: ReviewStatus.APPROVED,
+        caseId: caseRecord.id,
+      });
+    } catch {
+      // Authority lookup failure must never turn into approval.
+      return { authorized: false };
+    }
+
+    const planVersions = caseRecord.planVersions || [];
+    const latestPlanVersion =
+      planVersions.length > 0
+        ? planVersions.reduce((prev, curr) => (curr.version > prev.version ? curr : prev))
+        : null;
+
+    for (const review of approvedReviews) {
+      if (review.merchantId !== merchantId || review.caseId !== caseRecord.id) continue;
+      if (review.status !== ReviewStatus.APPROVED) continue;
+
+      // Action-bound reviews authorize only that exact existing action.
+      if (review.actionId) {
+        if (review.actionId !== action.id || !review.action) continue;
+        if (review.action.caseId !== caseRecord.id) continue;
+        if (review.action.actionType !== action.actionType) continue;
+        if (!semanticJsonEqual(review.action.actionParams, action.actionParams)) continue;
+
+        if (review.planVersionId) {
+          if (action.planVersionId !== review.planVersionId || !review.planVersion) continue;
+          if (review.planVersion.proposedActionType !== action.actionType) continue;
+          if (!semanticJsonEqual(review.planVersion.proposedActionParams, action.actionParams)) {
+            continue;
+          }
+          if (latestPlanVersion && latestPlanVersion.id !== review.planVersionId) continue;
+        }
+
+        return { authorized: true, reviewId: review.id };
+      }
+
+      // Plan-bound reviews authorize only the exact proposal of the still-current
+      // authoritative plan version. Object key order is irrelevant; arrays and
+      // primitive values remain exact.
+      if (review.planVersionId) {
+        if (!action.planVersionId || action.planVersionId !== review.planVersionId) continue;
+        if (!review.planVersion) continue;
+        if (latestPlanVersion && latestPlanVersion.id !== review.planVersionId) continue;
+        if (review.planVersion.proposedActionType !== action.actionType) continue;
+        if (!semanticJsonEqual(review.planVersion.proposedActionParams, action.actionParams)) {
+          continue;
+        }
+        return { authorized: true, reviewId: review.id };
+      }
+    }
+
+    return { authorized: false };
+  }
 
   private isInternalAction(actionType: RecoveryActionType): boolean {
     return (
@@ -696,11 +737,6 @@ export class ActionExecutor {
     );
   }
 
-  /**
-   * Safely transitions a claimed (EXECUTING) action to FAILED when a
-   * prerequisite (merchant, case) cannot be loaded. Emits ACTION_FAILED audit.
-   * Never fails open.
-   */
   private async failActionSafely(
     merchantId: string,
     actionId: string,
@@ -712,7 +748,6 @@ export class ActionExecutor {
   ): Promise<ActionExecutionResult> {
     let failedAction: RecoveryAction | null = null;
     try {
-      // Use CAS: EXECUTING → FAILED to protect against stale overwrite
       const transition = await this.actionRepo.transitionActionStatus(
         merchantId,
         actionId,
@@ -722,7 +757,7 @@ export class ActionExecutor {
       );
       failedAction = transition.action;
     } catch {
-      // Best-effort; proceed to audit regardless
+      // Best-effort; audit still records the safety failure.
     }
 
     await this.auditRepo.record(merchantId, {
@@ -742,15 +777,6 @@ export class ActionExecutor {
     };
   }
 
-  /**
-   * Executes an internal action with explicit failure handling.
-   *
-   * Contract:
-   * - Action must never be left silently in EXECUTING status after this returns.
-   * - Any failure → action FAILED, ACTION_FAILED audit emitted.
-   * - No ACTION_DISPATCHED audit for internal actions.
-   * - No ACTION_SUCCEEDED emitted on failure paths.
-   */
   private async executeInternalActionSafely(
     merchantId: string,
     action: RecoveryAction,
@@ -763,7 +789,6 @@ export class ActionExecutor {
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
 
-      // Safely transition EXECUTING → FAILED via CAS
       let failedAction: RecoveryAction | null = null;
       try {
         const transition = await this.actionRepo.transitionActionStatus(
@@ -775,7 +800,7 @@ export class ActionExecutor {
         );
         failedAction = transition.action;
       } catch {
-        // Best-effort
+        // Best-effort.
       }
 
       await this.auditRepo.record(merchantId, {
@@ -800,10 +825,6 @@ export class ActionExecutor {
     }
   }
 
-  /**
-   * Core internal action dispatch logic. Throws on any failure so that
-   * executeInternalActionSafely can handle it uniformly.
-   */
   private async dispatchInternalAction(
     merchantId: string,
     action: RecoveryAction,
@@ -811,9 +832,7 @@ export class ActionExecutor {
   ): Promise<ActionExecutionResult> {
     const actionId = action.id;
 
-    // ── STOP_RECOVERY ─────────────────────────────────────────────────────────
     if (action.actionType === RecoveryActionType.STOP_RECOVERY) {
-      // compareAndSetStatus will throw CaseStateConflictError on a race
       await this.caseRepo.compareAndSetStatus(
         merchantId,
         caseRecord.id,
@@ -838,7 +857,6 @@ export class ActionExecutor {
       return { executed: true, success: true, action: succeededAction };
     }
 
-    // ── ESCALATE_TO_HUMAN ─────────────────────────────────────────────────────
     if (action.actionType === RecoveryActionType.ESCALATE_TO_HUMAN) {
       await this.caseRepo.compareAndSetStatus(
         merchantId,
@@ -864,9 +882,7 @@ export class ActionExecutor {
       return { executed: true, success: true, action: succeededAction };
     }
 
-    // ── SCHEDULE_FOLLOWUP ─────────────────────────────────────────────────────
     if (action.actionType === RecoveryActionType.SCHEDULE_FOLLOWUP) {
-      // jobScheduler is required for this action
       if (!this.jobScheduler) {
         throw new Error(
           'SCHEDULE_FOLLOWUP requires a jobScheduler but none was provided in ActionExecutorOptions. ' +
@@ -879,7 +895,6 @@ export class ActionExecutor {
         ? new Date(params.scheduledFor as string)
         : new Date(Date.now() + 86400000);
 
-      // If scheduler throws, this will propagate to executeInternalActionSafely → action FAILED
       await this.jobScheduler.schedule({
         merchantId,
         caseId: caseRecord.id,
@@ -908,11 +923,9 @@ export class ActionExecutor {
       return { executed: true, success: true, action: succeededAction };
     }
 
-    // ── RECORD_PROMISE_TO_PAY ─────────────────────────────────────────────────
     if (action.actionType === RecoveryActionType.RECORD_PROMISE_TO_PAY) {
       const params = action.actionParams as Record<string, unknown>;
 
-      // Persist authoritative RecoveryCommitment — commitmentRepo is required
       if (!this.commitmentRepo) {
         throw new Error(
           'RECORD_PROMISE_TO_PAY requires a commitmentRepo but none was provided in ActionExecutorOptions. ' +
@@ -928,7 +941,6 @@ export class ActionExecutor {
       const extractedFromText =
         typeof params.extractedFromText === 'string' ? params.extractedFromText : undefined;
 
-      // Persist authoritative commitment; any error propagates to safe failure handler
       const commitment = await this.commitmentRepo.createCommitment(
         merchantId,
         caseRecord.id,
@@ -940,7 +952,6 @@ export class ActionExecutor {
         },
       );
 
-      // Keep executionMetadata as supplemental evidence referencing the authoritative record
       const succeededAction = await this.actionRepo.updateActionStatus(merchantId, actionId, {
         status: ActionExecutionStatus.SUCCESS,
         executionMetadata: {
