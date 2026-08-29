@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { corpusFingerprint, generateScenarios, STRATEGIES } from '../src/harness.js';
+import { corpusFingerprint, generateScenarios, projectVerifiedFailureCode, STRATEGIES } from '../src/harness.js';
 import { RiskType } from '@recoverai/shared';
 
 describe('Phase 8 frozen corpus scaffold', () => {
+  const serialize = (value: unknown) => JSON.stringify(value, (_key, entry) => typeof entry === 'bigint' ? entry.toString() : entry);
+
   it('has exactly 500 deterministic scenarios with fixed family and split counts', () => {
     const scenarios = generateScenarios(42);
     expect(scenarios).toHaveLength(500);
@@ -24,7 +26,27 @@ describe('Phase 8 frozen corpus scaffold', () => {
   });
 
   it('produces a deterministic, seed-bound corpus fingerprint', () => {
-    expect(corpusFingerprint(42)).toBe('sha256:c6c573fb9b36f5db02584cc4410c4c4451f858986e3762236ad63c36cb35c9f9');
+    expect(corpusFingerprint(42)).toBe('sha256:f07508e41e4c7a29a1a3c09b2206fa5d7c8cb2dca20a75de9d59e927f8bb8e96');
     expect(corpusFingerprint(42)).not.toBe(corpusFingerprint(43));
+  });
+
+  it('never exposes latent CUSTOMER_CHURNED truth in observable strategy context', () => {
+    const scenario = generateScenarios(42).find((item) => item.oracle.failureCause === 'CUSTOMER_CHURNED');
+    expect(scenario).toBeDefined();
+    expect(scenario!.observable.verifiedFailureCode).not.toBe('CUSTOMER_CHURNED');
+    expect(serialize(scenario!.observable)).not.toContain('CUSTOMER_CHURNED');
+    expect(serialize(scenario!.observable.verifiedFailureCode)).not.toContain('CUSTOMER_CHURNED');
+    expect(Object.keys(scenario!.observable)).not.toContain('failureCause');
+    expect('failureCause' in (scenario!.observable as Record<string, unknown>)).toBe(false);
+    expect(projectVerifiedFailureCode('CUSTOMER_CHURNED')).not.toBe('CUSTOMER_CHURNED');
+  });
+
+  it('keeps latent oracle truth available to POLICY_AWARE_ORACLE while normal strategies only see projected evidence', () => {
+    const scenario = generateScenarios(42).find((item) => item.oracle.failureCause === 'CUSTOMER_CHURNED');
+    expect(scenario).toBeDefined();
+    expect(scenario!.oracle.failureCause).toBe('CUSTOMER_CHURNED');
+    expect(projectVerifiedFailureCode(scenario!.oracle.failureCause)).not.toBe('CUSTOMER_CHURNED');
+    expect(scenario!.observable.verifiedFailureCode).toBe(projectVerifiedFailureCode(scenario!.oracle.failureCause));
+    expect(serialize({ observable: scenario!.observable })).not.toContain('CUSTOMER_CHURNED');
   });
 });

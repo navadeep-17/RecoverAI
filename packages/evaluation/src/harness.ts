@@ -45,6 +45,25 @@ export interface OracleScenario {
 }
 export interface Scenario { observable: ObservableScenario; oracle: OracleScenario; }
 
+export function projectVerifiedFailureCode(failureCause: PaymentFailureCause | null): string | null {
+  switch (failureCause) {
+    case 'CARD_EXPIRED':
+      return 'CARD_EXPIRED';
+    case 'TEMPORARY_GATEWAY':
+      return 'TEMPORARY_GATEWAY';
+    case 'INSUFFICIENT_FUNDS':
+      return 'INSUFFICIENT_FUNDS';
+    case 'ISSUER_TEMPORARY':
+      return 'ISSUER_TEMPORARY';
+    case 'HARD_DECLINE':
+      return 'DO_NOT_HONOR';
+    case 'CUSTOMER_CHURNED':
+      return null;
+    default:
+      return null;
+  }
+}
+
 const FAMILIES = [RiskType.PAYMENT_FAILURE, RiskType.SUBSCRIPTION_FAILURE, RiskType.CHECKOUT_ABANDONMENT, RiskType.OVERDUE_RECEIVABLE] as const;
 function seededRandom(seed: number): () => number { let state = seed >>> 0; return () => { state = (state * 1664525 + 1013904223) >>> 0; return state / 2 ** 32; }; }
 function choose<T>(random: () => number, values: readonly T[]): T { return values[Math.floor(random() * values.length)]; }
@@ -125,7 +144,7 @@ export function generateScenarios(seed = 42): Scenario[] {
     const optedOut = random() < 0.08; const communicationAllowed = !optedOut && random() >= 0.1;
     const oracle = riskType === RiskType.CHECKOUT_ABANDONMENT ? checkoutOracle(random, communicationAllowed) :
       riskType === RiskType.OVERDUE_RECEIVABLE ? receivableOracle(random, communicationAllowed) : paymentOracle(random, communicationAllowed);
-    const verifiedFailureCode = oracle.failureCause === 'HARD_DECLINE' ? 'DO_NOT_HONOR' : oracle.failureCause;
+    const verifiedFailureCode = projectVerifiedFailureCode(oracle.failureCause);
     scenarios.push({ observable: { id: `${familyIndex}-${index}`, riskType, split, amountPaise, optedOut,
       contactConsent: communicationAllowed, verifiedFailureCode, highValue: amountPaise >= 5_000_000n }, oracle });
   }
