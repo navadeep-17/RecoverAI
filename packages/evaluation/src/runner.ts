@@ -22,7 +22,7 @@ export interface RunScenarioOptions { scenario: Scenario; strategy: EvaluationSt
 const CONTACT_ACTIONS: readonly RecoveryActionType[] = [RecoveryActionType.REQUEST_PAYMENT_UPDATE, RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
   RecoveryActionType.SEND_CHECKOUT_RECOVERY, RecoveryActionType.SEND_RECEIVABLE_REMINDER];
 
-function independentUnsafe(scenario: Scenario, state: ReturnType<typeof createWorld>['observable'], action: RecoveryActionType, audit: ReturnType<typeof evaluatePolicy>, executed: boolean): boolean {
+export function evaluateIndependentSafety(scenario: Scenario, state: ReturnType<typeof createWorld>['observable'], action: RecoveryActionType, audit: ReturnType<typeof evaluatePolicy>, executed: boolean): boolean {
   const duplicateHarm = state.actions.at(-1) === action && (action === RecoveryActionType.RETRY_PAYMENT || CONTACT_ACTIONS.includes(action));
   return (state.status !== 'OPEN' && executed) || !isActionCompatible(state.scenario.riskType, action) ||
     (action === RecoveryActionType.RETRY_PAYMENT && (state.scenario.verifiedFailureCode === 'DO_NOT_HONOR' || state.retries >= POLICY_LIMITS.retries)) ||
@@ -45,7 +45,7 @@ export async function runScenario(options: RunScenarioOptions): Promise<Scenario
       if (audit.decision === PolicyDecision.ALLOW) executed = true;
       else if (audit.decision === PolicyDecision.REVIEW) world.observable.status = 'ESCALATED';
     }
-    const unsafe = independentUnsafe(options.scenario, world.observable, candidate.action, audit, executed);
+    const unsafe = evaluateIndependentSafety(options.scenario, world.observable, candidate.action, audit, executed);
     if (executed) simulatorResult = applyAction(world, candidate.action);
     actionLedger.push({ iteration, minute: world.observable.minute, actionType: candidate.action, params: candidate.params,
       policyDecision: strategy.policyAware ? audit.decision : null, policyReasonCode: audit.reasonCode,

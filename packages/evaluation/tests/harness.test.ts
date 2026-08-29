@@ -24,7 +24,7 @@ describe('Phase 8 frozen corpus scaffold', () => {
   });
 
   it('produces a deterministic, seed-bound corpus fingerprint', () => {
-    expect(corpusFingerprint(42)).toBe('sha256:37b511838a04a46f979167f641465e67b84c139bdaf3a7b7ce06f185783caacf');
+    expect(corpusFingerprint(42)).toBe('sha256:c6c573fb9b36f5db02584cc4410c4c4451f858986e3762236ad63c36cb35c9f9');
     expect(corpusFingerprint(42)).not.toBe(corpusFingerprint(43));
   });
 });

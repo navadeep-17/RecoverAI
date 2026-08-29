@@ -4,12 +4,10 @@ import { evaluatePolicy } from '../src/policy-adapter.js';
 import { runScenario } from '../src/runner.js';
 import { createWorld } from '../src/simulator.js';
 import type { Scenario } from '../src/harness.js';
+import { makeScenario } from './fixtures.js';
 
 function scenario(overrides: Partial<Scenario['observable']> = {}, oracle: Partial<Scenario['oracle']> = {}): Scenario {
-  return { observable: { id: 'test', riskType: RiskType.PAYMENT_FAILURE, split: 'dev', amountPaise: 100_000n,
-    optedOut: false, contactConsent: true, verifiedFailureCode: 'CARD_EXPIRED', highValue: false, ...overrides },
-    oracle: { recoverable: true, requiresContact: true, requiresRetry: true, shouldEscalate: false,
-      shouldStop: false, naturalRecoveryMinute: null, respondsToContact: true, ...oracle } };
+  return makeScenario(overrides, oracle);
 }
 
 describe('multi-step evaluation runner', () => {
@@ -21,18 +19,21 @@ describe('multi-step evaluation runner', () => {
     expect(result.terminalState).toBe('RECOVERED'); expect(result.recoveredPaise).toBe(100_000n);
   });
   it('does not credit checkout contact until scheduled checkout completion', async () => {
-    const result = await runScenario({ scenario: scenario({ riskType: RiskType.CHECKOUT_ABANDONMENT, verifiedFailureCode: null }, { requiresRetry: false }), strategy: 'RULE_BASED', seed: 42 });
-    expect(result.actionLedger[0].simulatorResult?.detail).toBe('contact-sent');
+    const result = await runScenario({ scenario: scenario({ riskType: RiskType.CHECKOUT_ABANDONMENT, verifiedFailureCode: null },
+      { failureCause: null, purchaseIntent: 'HIGH', contactCanConvert: true, requiresRetry: false }), strategy: 'RULE_BASED', seed: 42 });
+    expect(result.actionLedger[0].simulatorResult?.detail).toBe('checkout-contact-sent');
     expect(result.eventLedger[0].eventType).toBe('CHECKOUT_COMPLETED'); expect(result.recoveryMinute).toBe(60);
   });
   it('models reminder, promise, broken promise, then escalation', async () => {
     const result = await runScenario({ scenario: scenario({ riskType: RiskType.OVERDUE_RECEIVABLE, verifiedFailureCode: null },
-      { recoverable: false, requiresRetry: false, respondsToContact: true, shouldEscalate: true }), strategy: 'RULE_BASED', seed: 42 });
+      { failureCause: null, paymentBehavior: 'PROMISE_BREAKER', recoverable: false, requiresRetry: false,
+        promiseWillBeKept: false, shouldEscalate: true }), strategy: 'RULE_BASED', seed: 42 });
     expect(result.eventLedger.map((event) => event.eventType)).toEqual(['PROMISE_TO_PAY', 'PROMISE_TO_PAY_BROKEN']);
     expect(result.terminalState).toBe('ESCALATED'); expect(result.recoveredPaise).toBe(0n);
   });
   it('independently flags hard-decline retry while policy-aware runner blocks execution', async () => {
-    const hard = scenario({ verifiedFailureCode: 'DO_NOT_HONOR' }, { recoverable: false, respondsToContact: false, shouldStop: true });
+    const hard = scenario({ verifiedFailureCode: 'DO_NOT_HONOR' }, { failureCause: 'HARD_DECLINE', recoverable: false,
+      methodUpdatePossible: false, shouldStop: true });
     const bare = await runScenario({ scenario: hard, strategy: 'RULE_BASED', seed: 42 });
     expect(bare.actionLedger[0]).toMatchObject({ executed: true, unsafe: true, policyViolation: true });
     const gated = await runScenario({ scenario: hard, strategy: 'RULE_BASED_WITH_POLICY', seed: 42 });
@@ -50,9 +51,9 @@ describe('multi-step evaluation runner', () => {
     contacts.contacts = 3; expect(evaluatePolicy(contacts, RecoveryActionType.REQUEST_PAYMENT_UPDATE).decision).toBe(PolicyDecision.DENY);
   });
   it('allows natural authoritative recovery and bounds endless paths', async () => {
-    const natural = await runScenario({ scenario: scenario({}, { naturalRecoveryMinute: 300 }), strategy: 'NO_INTERVENTION', seed: 42 });
+    const natural = await runScenario({ scenario: scenario({}, { naturalPaymentMinute: 300 }), strategy: 'NO_INTERVENTION', seed: 42 });
     expect(natural.terminalState).toBe('RECOVERED'); expect(natural.actionLedger).toHaveLength(0);
-    const capped = await runScenario({ scenario: scenario({}, { recoverable: false, respondsToContact: false }), strategy: 'NAIVE_RECOVERY', seed: 42, maxIterations: 2 });
+    const capped = await runScenario({ scenario: scenario({}, { recoverable: false, methodUpdatePossible: false }), strategy: 'NAIVE_RECOVERY', seed: 42, maxIterations: 2 });
     expect(capped.terminalState).toBe('EXHAUSTED'); expect(capped.exhaustedByIterationCap).toBe(true);
   });
 });

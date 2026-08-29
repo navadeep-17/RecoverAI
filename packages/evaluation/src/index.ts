@@ -5,3 +5,4 @@ export * from './policy-adapter.js';
 export * from './runner.js';
 export * from './metrics.js';
 export * from './evaluator.js';
+export * from './cli-options.js';

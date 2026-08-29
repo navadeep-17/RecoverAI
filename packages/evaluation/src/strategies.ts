@@ -1,6 +1,7 @@
 import { AgentProposalSchema, MockLLMProvider, RecoveryAgent, getAllowedActionsForRisk, type AgentContext, type AgentProposal } from '@recoverai/core';
 import { RecoveryActionType, RiskType } from '@recoverai/shared';
 import type { EvaluationStrategyName, OracleScenario } from './harness.js';
+import { POLICY_LIMITS } from './policy-adapter.js';
 import type { ObservableCaseState } from './simulator.js';
 
 export interface StrategyDecision { action: RecoveryActionType; params: Record<string, unknown>; confidence: number; }
@@ -10,6 +11,7 @@ export interface EvaluationStrategy { readonly name: EvaluationStrategyName; rea
 
 const decision = (action: RecoveryActionType, confidence = 0.9): StrategyDecision => ({ action, params: {}, confidence });
 function has(state: Readonly<ObservableCaseState>, type: string): boolean { return state.events.some((event) => event.type === type); }
+function latestEvent(state: Readonly<ObservableCaseState>): string | undefined { return state.events.at(-1)?.type; }
 
 export function ruleCandidate(context: ObservableStrategyContext): StrategyDecision {
   const state = context.state; const risk = state.scenario.riskType;
@@ -24,7 +26,8 @@ export function ruleCandidate(context: ObservableStrategyContext): StrategyDecis
     return decision(RecoveryActionType.SEND_RECEIVABLE_REMINDER);
   }
   if (state.scenario.verifiedFailureCode === 'CARD_EXPIRED' && !has(state, 'PAYMENT_METHOD_UPDATED')) return decision(RecoveryActionType.REQUEST_PAYMENT_UPDATE);
-  if (state.retries >= 2) return decision(RecoveryActionType.STOP_RECOVERY);
+  if (latestEvent(state) === 'PAYMENT_RETRY_FAILED') return decision(RecoveryActionType.SCHEDULE_FOLLOWUP);
+  if (state.retries >= 3) return decision(RecoveryActionType.STOP_RECOVERY);
   return decision(RecoveryActionType.RETRY_PAYMENT);
 }
 
@@ -78,12 +81,18 @@ export function createStrategy(name: EvaluationStrategyName, oracle?: OracleScen
   if (name === 'POLICY_AWARE_ORACLE') {
     if (!oracle) throw new Error('Oracle strategy requires explicit oracle context');
     return { name, policyAware: true, async nextAction(context) {
-      if (context.state.scenario.optedOut && oracle.requiresContact) {
-        if (oracle.naturalRecoveryMinute !== null) return null;
+      const state = context.state;
+      if (state.actions.length >= POLICY_LIMITS.actions - 1) return decision(RecoveryActionType.STOP_RECOVERY);
+      if (oracle.naturalConversionMinute !== null || oracle.naturalPaymentMinute !== null) return null;
+      if ((!oracle.communicationAllowed || state.scenario.optedOut) && oracle.requiresContact) {
         return decision(oracle.shouldEscalate ? RecoveryActionType.ESCALATE_TO_HUMAN : RecoveryActionType.STOP_RECOVERY);
       }
       if (!oracle.recoverable && oracle.shouldStop) return decision(RecoveryActionType.STOP_RECOVERY);
       if (!oracle.recoverable && oracle.shouldEscalate) return decision(RecoveryActionType.ESCALATE_TO_HUMAN);
+      if (oracle.failureCause === 'CARD_EXPIRED' && !has(state, 'PAYMENT_METHOD_UPDATED')) return decision(RecoveryActionType.REQUEST_PAYMENT_UPDATE);
+      if (oracle.earliestSuccessfulRetryMinute !== null && state.minute < oracle.earliestSuccessfulRetryMinute) return decision(RecoveryActionType.SCHEDULE_FOLLOWUP);
+      if (oracle.purchaseIntent !== null) return decision(oracle.contactCanConvert ? RecoveryActionType.SEND_CHECKOUT_RECOVERY : RecoveryActionType.STOP_RECOVERY);
+      if (oracle.paymentBehavior === 'REMINDER_RESPONSIVE' || oracle.paymentBehavior === 'PROMISE_RELIABLE' || oracle.paymentBehavior === 'PROMISE_BREAKER') return ruleCandidate(context);
       return ruleCandidate(context);
     } };
   }

@@ -2,6 +2,8 @@
 
 The evaluation package runs a deterministic, closed-loop, virtual-time simulation. Each corpus case is cloned into an isolated world for every strategy. Normal strategies receive only observable case state and history; evaluator-only latent truth is passed explicitly only to `POLICY_AWARE_ORACLE` and is used independently for stop/escalation scoring.
 
+The seed controls behavioral truth as well as amount: payment failure cause and retry windows, method-update feasibility and response time, checkout intent/natural conversion/contact responsiveness, receivable payment behavior and promise reliability, communication availability, and per-case event delays. Simulation transitions depend only on this frozen world, the action, virtual minute, and prior observable history; the simulator never receives strategy identity.
+
 The only runtime path is: corpus → strategy proposal → production `PolicyEngine` (for policy-aware strategies) → simulator transition → scheduled observable event → replan → terminal result → independent metrics. `RECOVERAI` proposals pass through the production `RecoveryAgent`, strict `AgentProposalSchema`, allowed-action checks, and production policy engine. `REVIEW` means no simulated action is executed and the case terminates as `ESCALATED`; it never credits recovery.
 
 Recovery credit is recorded in integer paise and only from deduplicated authoritative `PAYMENT_SUCCEEDED`, `CHECKOUT_COMPLETED`, or `INVOICE_PAID` events. An action submission itself never counts as recovered revenue. The action ledger records both the strategy-facing policy decision (where applicable) and independent safety/policy scoring; the event ledger is the source of recovered-money metrics.
