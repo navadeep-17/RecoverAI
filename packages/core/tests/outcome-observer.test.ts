@@ -28,12 +28,14 @@ describe('OutcomeObserver Unit Tests', () => {
   let inMemoryOutcomes: any[];
   let inMemoryCommitments: Map<string, any>;
   let inMemoryAudits: any[];
+  let inMemoryScheduledJobs: Map<string, any>;
 
   beforeEach(() => {
     inMemoryCases = new Map();
     inMemoryOutcomes = [];
     inMemoryCommitments = new Map();
     inMemoryAudits = [];
+    inMemoryScheduledJobs = new Map();
 
     inMemoryCases.set(caseId, {
       id: caseId,
@@ -108,7 +110,7 @@ describe('OutcomeObserver Unit Tests', () => {
     mockCommitmentRepo = {
       createCommitment: vi.fn(async (_mId: string, cId: string, params: any) => {
         const commitment = {
-          id: `cmt_${Date.now()}`,
+          id: params.id || `cmt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           caseId: cId,
           ...params,
           createdAt: new Date(),
@@ -135,12 +137,30 @@ describe('OutcomeObserver Unit Tests', () => {
 
     mockEventRepo = {};
 
+    const mockScheduledJobRepo = {
+      getJobById: vi.fn(async (_mId: string, id: string) => {
+        return inMemoryScheduledJobs.get(id) || null;
+      }),
+      listJobsByCase: vi.fn(async (_mId: string, cId: string) => {
+        return Array.from(inMemoryScheduledJobs.values()).filter((j: any) => j.caseId === cId);
+      }),
+      createJob: vi.fn(async (_mId: string, data: any) => {
+        const job = { id: `job_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`, merchantId: _mId, ...data, status: 'SCHEDULED' };
+        inMemoryScheduledJobs.set(job.id, job);
+        return job;
+      }),
+    };
+
     mockJobScheduler = {
-      schedule: vi.fn(async (params: any) => ({
-        id: `job_${Date.now()}`,
-        ...params,
-        status: 'SCHEDULED',
-      })),
+      schedule: vi.fn(async (params: any) => {
+        const job = {
+          id: `job_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          ...params,
+          status: 'SCHEDULED',
+        };
+        inMemoryScheduledJobs.set(job.id, job);
+        return job;
+      }),
     };
 
     mockOrchestrator = {
@@ -159,6 +179,7 @@ describe('OutcomeObserver Unit Tests', () => {
       commitmentRepo: mockCommitmentRepo,
       eventRepo: mockEventRepo as any,
       auditRepo: mockAuditRepo,
+      scheduledJobRepo: mockScheduledJobRepo as any,
       jobScheduler: mockJobScheduler,
       orchestrator: mockOrchestrator as any,
       clock: () => new Date('2026-08-28T14:00:00+05:30'),
@@ -434,6 +455,15 @@ describe('OutcomeObserver Unit Tests', () => {
         status: 'PENDING',
       });
 
+      inMemoryScheduledJobs.set('job_timer_01', {
+        id: 'job_timer_01',
+        merchantId,
+        caseId,
+        jobType: 'PROMISE_TO_PAY_CHECK',
+        status: 'SCHEDULED',
+        payloadJson: { caseId, commitmentId: 'cmt_01' },
+      });
+
       const result = await observer.observeTimerFired({
         merchantId,
         caseId,
@@ -468,6 +498,15 @@ describe('OutcomeObserver Unit Tests', () => {
         status: 'PENDING',
       });
 
+      inMemoryScheduledJobs.set('job_timer_early', {
+        id: 'job_timer_early',
+        merchantId,
+        caseId,
+        jobType: 'PROMISE_TO_PAY_CHECK',
+        status: 'SCHEDULED',
+        payloadJson: { caseId, commitmentId: 'cmt_early' },
+      });
+
       const result = await observer.observeTimerFired({
         merchantId,
         caseId,
@@ -488,6 +527,15 @@ describe('OutcomeObserver Unit Tests', () => {
         promisedAmount: '14999.00',
         promisedDate: new Date('2026-08-28T12:00:00+05:30'),
         status: 'PENDING',
+      });
+
+      inMemoryScheduledJobs.set('job_timer_02', {
+        id: 'job_timer_02',
+        merchantId,
+        caseId,
+        jobType: 'PROMISE_TO_PAY_CHECK',
+        status: 'SCHEDULED',
+        payloadJson: { caseId, commitmentId: 'cmt_02' },
       });
 
       const first = await observer.observeTimerFired({
@@ -562,6 +610,102 @@ describe('OutcomeObserver Unit Tests', () => {
       expect(result.observed).toBe(true);
       expect(result.caseStatus).toBe(CaseStatus.NEEDS_REVIEW);
       expect(inMemoryAudits.some((a) => a.eventType === 'SCHEDULING_FAILED')).toBe(true);
+    });
+
+    it('rejects timer if caller transport commitmentId does not match authoritative ScheduledJob commitmentId', async () => {
+      inMemoryCommitments.set('cmt_authoritative_A', {
+        id: 'cmt_authoritative_A',
+        caseId,
+        promisedAmount: '5000.00',
+        promisedDate: new Date('2026-08-28T12:00:00+05:30'),
+        status: 'PENDING',
+      });
+
+      inMemoryCommitments.set('cmt_caller_B', {
+        id: 'cmt_caller_B',
+        caseId,
+        promisedAmount: '9000.00',
+        promisedDate: new Date('2026-08-28T12:00:00+05:30'),
+        status: 'PENDING',
+      });
+
+      inMemoryScheduledJobs.set('job_mismatch_01', {
+        id: 'job_mismatch_01',
+        merchantId,
+        caseId,
+        jobType: 'PROMISE_TO_PAY_CHECK',
+        status: 'SCHEDULED',
+        payloadJson: { caseId, commitmentId: 'cmt_authoritative_A' },
+      });
+
+      const result = await observer.observeTimerFired({
+        merchantId,
+        caseId,
+        scheduledJobId: 'job_mismatch_01',
+        timerType: 'PROMISE_TO_PAY_CHECK',
+        payload: { commitmentId: 'cmt_caller_B' }, // Mismatched transport payload!
+      });
+
+      expect(result.observed).toBe(false);
+      expect(result.reason).toContain('Timer payload mismatch');
+      expect(mockCommitmentRepo.updateCommitmentStatus).not.toHaveBeenCalled();
+
+      // Neither commitment is mutated
+      expect(inMemoryCommitments.get('cmt_authoritative_A').status).toBe('PENDING');
+      expect(inMemoryCommitments.get('cmt_caller_B').status).toBe('PENDING');
+    });
+
+    it('redelivery of message B only repairs/schedules timer for commitment B, never commitment A', async () => {
+      // Message A and Commitment A exist
+      const replyA = 'I will pay INR 5000 on 2026-08-30';
+      await observer.observeCustomerReply({
+        merchantId,
+        caseId,
+        messageId: 'msg_A_01',
+        replyText: replyA,
+      });
+
+      // Message B and Commitment B exist
+      const replyB = 'I will pay INR 9000 on 2026-08-31';
+      await observer.observeCustomerReply({
+        merchantId,
+        caseId,
+        messageId: 'msg_B_01',
+        replyText: replyB,
+      });
+
+      expect(inMemoryCommitments.size).toBe(2);
+      const allCommitments = Array.from(inMemoryCommitments.values());
+      const cmtA = allCommitments.find((c) => c.extractedFromText === replyA);
+      const cmtB = allCommitments.find((c) => c.extractedFromText === replyB);
+      expect(cmtA).toBeDefined();
+      expect(cmtB).toBeDefined();
+
+      // Clear scheduled jobs to simulate missing timer schedule for message B
+      inMemoryScheduledJobs.clear();
+
+      mockJobScheduler.schedule.mockClear();
+
+      // Redeliver message B
+      const redeliverResult = await observer.observeCustomerReply({
+        merchantId,
+        caseId,
+        messageId: 'msg_B_01',
+        replyText: replyB,
+      });
+
+      expect(redeliverResult.observed).toBe(true);
+      expect(redeliverResult.deduplicated).toBe(true);
+
+      // Verify that schedule was called specifically with cmtB.id, NOT cmtA.id!
+      expect(mockJobScheduler.schedule).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payloadJson: expect.objectContaining({
+            commitmentId: cmtB!.id,
+            messageId: 'msg_B_01',
+          }),
+        }),
+      );
     });
   });
 });

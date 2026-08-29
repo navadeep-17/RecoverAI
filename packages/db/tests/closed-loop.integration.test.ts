@@ -647,4 +647,126 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const cmtBroken = await commitmentRepo.getCommitmentById(merchantId, testCase.id, commitment.id);
     expect(cmtBroken?.status).toBe('BROKEN');
   });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('LEASE FENCING: Stale worker with expired lease cannot complete trigger reclaimed by newer worker', async () => {
+    if (!dbAvailable) return;
+
+    const testCase = await caseRepo.createCase(merchantId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '3000.00',
+      currency: 'INR',
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_fencing_${Date.now()}`,
+    });
+
+    const triggerKey = `FENCING_TEST:${Date.now()}`;
+    const t0 = new Date('2026-08-28T10:00:00Z');
+
+    // 1. Worker A claims trigger at t0 with 5-second lease (attemptCount = 1)
+    const claimA = await triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', {
+      now: t0,
+      leaseDurationMs: 5000,
+    });
+    expect(claimA.claimed).toBe(true);
+    expect(claimA.trigger.attemptCount).toBe(1);
+
+    // 2. Lease expires at t0 + 6 seconds; Worker B reclaims (attemptCount = 2)
+    const tExpired = new Date(t0.getTime() + 6000);
+    const claimB = await triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', {
+      now: tExpired,
+      leaseDurationMs: 5000,
+    });
+    expect(claimB.claimed).toBe(true);
+    expect(claimB.trigger.attemptCount).toBe(2);
+
+    // 3. Stale Worker A attempts to complete trigger with attemptCount = 1 -> REJECTED
+    const completeA = await triggerRepo.completeTrigger(
+      merchantId,
+      testCase.id,
+      claimA.trigger.id,
+      'COMPLETED',
+      { worker: 'A_stale' },
+      1, // Worker A's owned attempt
+    );
+    expect(completeA.completed).toBe(false);
+
+    // Verify DB record status is STILL CLAIMED with attemptCount = 2
+    const midCheck = await triggerRepo.findTrigger(merchantId, testCase.id, triggerKey);
+    expect(midCheck?.status).toBe('CLAIMED');
+    expect(midCheck?.attemptCount).toBe(2);
+
+    // 4. Valid Worker B completes trigger with attemptCount = 2 -> SUCCEEDS
+    const completeB = await triggerRepo.completeTrigger(
+      merchantId,
+      testCase.id,
+      claimB.trigger.id,
+      'COMPLETED',
+      { worker: 'B_valid', winner: true },
+      2, // Worker B's owned attempt
+    );
+    expect(completeB.completed).toBe(true);
+
+    // Verify final DB record status is COMPLETED and resultJson is from Worker B
+    const finalCheck = await triggerRepo.findTrigger(merchantId, testCase.id, triggerKey);
+    expect(finalCheck?.status).toBe('COMPLETED');
+    expect((finalCheck?.resultJson as any)?.worker).toBe('B_valid');
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('PAYLOAD AUTHORITY: Rejects timer if caller transport commitmentId does not match authoritative ScheduledJob commitmentId', async () => {
+    if (!dbAvailable) return;
+
+    const testCase = await caseRepo.createCase(merchantId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '8000.00',
+      currency: 'INR',
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_mismatch_${Date.now()}`,
+    });
+
+    const scheduledJobRepo = new ScheduledJobRepository();
+    const pastDate = new Date(Date.now() - 10000);
+
+    const cmtAuthoritativeA = await commitmentRepo.createCommitment(merchantId, testCase.id, {
+      promisedAmount: '5000.00',
+      promisedDate: pastDate,
+      status: 'PENDING',
+      extractedFromText: 'Commitment A text',
+    });
+
+    const cmtCallerB = await commitmentRepo.createCommitment(merchantId, testCase.id, {
+      promisedAmount: '3000.00',
+      promisedDate: pastDate,
+      status: 'PENDING',
+      extractedFromText: 'Commitment B text',
+    });
+
+    // ScheduledJob in DB points explicitly to Commitment A
+    const job = await scheduledJobRepo.createJob(merchantId, {
+      caseId: testCase.id,
+      jobType: 'PROMISE_TO_PAY_CHECK',
+      scheduledFor: pastDate,
+      payloadJson: {
+        caseId: testCase.id,
+        commitmentId: cmtAuthoritativeA.id,
+      },
+    });
+
+    // Caller sends mismatched commitment B ID in transport payload
+    const mismatchResult = await observer.observeTimerFired({
+      merchantId,
+      caseId: testCase.id,
+      scheduledJobId: job.id,
+      timerType: 'PROMISE_TO_PAY_CHECK',
+      payload: { commitmentId: cmtCallerB.id },
+    });
+
+    expect(mismatchResult.observed).toBe(false);
+    expect(mismatchResult.reason).toContain('Timer payload mismatch');
+
+    // Verify neither commitment in DB was mutated
+    const cmtACheck = await commitmentRepo.getCommitmentById(merchantId, testCase.id, cmtAuthoritativeA.id);
+    const cmtBCheck = await commitmentRepo.getCommitmentById(merchantId, testCase.id, cmtCallerB.id);
+    expect(cmtACheck?.status).toBe('PENDING');
+    expect(cmtBCheck?.status).toBe('PENDING');
+  });
 });

@@ -12,6 +12,11 @@ export interface ClaimTriggerOptions {
   now?: Date;
 }
 
+export interface CompleteTriggerResult {
+  completed: boolean;
+  trigger?: RecoveryIterationTrigger | null;
+}
+
 export class TriggerRepository {
   /**
    * Atomically claims or reclaims an orchestration iteration trigger for a given (merchantId, caseId, triggerKey).
@@ -125,7 +130,10 @@ export class TriggerRepository {
   }
 
   /**
-   * Marks a claimed trigger as COMPLETED or FAILED, saving the result JSON.
+   * Marks a claimed trigger as COMPLETED or FAILED with lease fencing.
+   * If expectedAttemptCount is specified, the update requires attemptCount to match.
+   * If the trigger was reclaimed by another worker while this worker was running (attemptCount incremented),
+   * the update returns completed: false without overwriting the newer worker's claim.
    */
   async completeTrigger(
     merchantId: string,
@@ -133,12 +141,15 @@ export class TriggerRepository {
     triggerId: string,
     status: 'COMPLETED' | 'FAILED',
     resultJson?: Record<string, unknown>,
-  ): Promise<RecoveryIterationTrigger> {
-    return prisma.recoveryIterationTrigger.update({
+    expectedAttemptCount?: number,
+  ): Promise<CompleteTriggerResult> {
+    const updateResult = await prisma.recoveryIterationTrigger.updateMany({
       where: {
         id: triggerId,
         merchantId,
         caseId,
+        status: 'CLAIMED',
+        ...(expectedAttemptCount !== undefined ? { attemptCount: expectedAttemptCount } : {}),
       },
       data: {
         status,
@@ -146,6 +157,19 @@ export class TriggerRepository {
         completedAt: new Date(),
       },
     });
+
+    if (updateResult.count === 0) {
+      // Stale worker lost ownership (e.g. lease expired and reclaimed by another worker)
+      const current = await prisma.recoveryIterationTrigger.findFirst({
+        where: { id: triggerId, merchantId, caseId },
+      });
+      return { completed: false, trigger: current };
+    }
+
+    const updated = await prisma.recoveryIterationTrigger.findUniqueOrThrow({
+      where: { id: triggerId },
+    });
+    return { completed: true, trigger: updated };
   }
 
   /**

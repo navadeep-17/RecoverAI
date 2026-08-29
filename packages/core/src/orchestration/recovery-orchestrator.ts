@@ -149,7 +149,7 @@ export class RecoveryOrchestrator {
       });
       await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
         error: 'Merchant safety state unavailable',
-      });
+      }, claimResult.trigger.attemptCount);
       return {
         caseId,
         status: caseRecord.status,
@@ -171,7 +171,7 @@ export class RecoveryOrchestrator {
       });
       await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
         status: CaseStatus.STOPPED,
-      });
+      }, claimResult.trigger.attemptCount);
       return {
         caseId,
         status: CaseStatus.STOPPED,
@@ -198,7 +198,7 @@ export class RecoveryOrchestrator {
         });
         await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
           status: CaseStatus.STOPPED,
-        });
+        }, claimResult.trigger.attemptCount);
         return {
           caseId,
           status: CaseStatus.STOPPED,
@@ -220,7 +220,7 @@ export class RecoveryOrchestrator {
         });
         await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
           status: CaseStatus.EXHAUSTED,
-        });
+        }, claimResult.trigger.attemptCount);
         return {
           caseId,
           status: CaseStatus.EXHAUSTED,
@@ -231,7 +231,7 @@ export class RecoveryOrchestrator {
 
       await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
         status: caseRecord.status,
-      });
+      }, claimResult.trigger.attemptCount);
       return {
         caseId,
         status: caseRecord.status,
@@ -274,7 +274,7 @@ export class RecoveryOrchestrator {
       });
       await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
         status: CaseStatus.EXHAUSTED,
-      });
+      }, claimResult.trigger.attemptCount);
       return {
         caseId,
         status: CaseStatus.EXHAUSTED,
@@ -454,7 +454,7 @@ export class RecoveryOrchestrator {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.STOPPED);
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.STOPPED,
-          });
+          }, claimResult.trigger.attemptCount);
           return {
             caseId,
             status: CaseStatus.STOPPED,
@@ -468,7 +468,7 @@ export class RecoveryOrchestrator {
         case PolicyReasonCodes.CASE_ALREADY_TERMINAL: {
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: currentStatus,
-          });
+          }, claimResult.trigger.attemptCount);
           return {
             caseId,
             status: currentStatus,
@@ -485,7 +485,7 @@ export class RecoveryOrchestrator {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.NEEDS_REVIEW,
-          });
+          }, claimResult.trigger.attemptCount);
           return {
             caseId,
             status: CaseStatus.NEEDS_REVIEW,
@@ -505,7 +505,7 @@ export class RecoveryOrchestrator {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.EXHAUSTED);
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.EXHAUSTED,
-          });
+          }, claimResult.trigger.attemptCount);
           return {
             caseId,
             status: CaseStatus.EXHAUSTED,
@@ -531,7 +531,7 @@ export class RecoveryOrchestrator {
               await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.WAITING);
               await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
                 status: CaseStatus.WAITING,
-              });
+              }, claimResult.trigger.attemptCount);
               return {
                 caseId,
                 status: CaseStatus.WAITING,
@@ -547,7 +547,7 @@ export class RecoveryOrchestrator {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.NEEDS_REVIEW,
-          });
+          }, claimResult.trigger.attemptCount);
           return {
             caseId,
             status: CaseStatus.NEEDS_REVIEW,
@@ -572,7 +572,7 @@ export class RecoveryOrchestrator {
               await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.WAITING);
               await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
                 status: CaseStatus.WAITING,
-              });
+              }, claimResult.trigger.attemptCount);
               return {
                 caseId,
                 status: CaseStatus.WAITING,
@@ -588,7 +588,7 @@ export class RecoveryOrchestrator {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.NEEDS_REVIEW,
-          });
+          }, claimResult.trigger.attemptCount);
           return {
             caseId,
             status: CaseStatus.NEEDS_REVIEW,
@@ -603,7 +603,7 @@ export class RecoveryOrchestrator {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.WAITING);
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.WAITING,
-          });
+          }, claimResult.trigger.attemptCount);
           return {
             caseId,
             status: CaseStatus.WAITING,
@@ -618,7 +618,7 @@ export class RecoveryOrchestrator {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.NEEDS_REVIEW,
-          });
+          }, claimResult.trigger.attemptCount);
           return {
             caseId,
             status: CaseStatus.NEEDS_REVIEW,
@@ -646,7 +646,7 @@ export class RecoveryOrchestrator {
       });
       await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
         status: CaseStatus.NEEDS_REVIEW,
-      });
+      }, claimResult.trigger.attemptCount);
 
       return {
         caseId,
@@ -670,7 +670,7 @@ export class RecoveryOrchestrator {
     if (!authResult.authorized || !authResult.action) {
       await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
         error: authResult.reason,
-      });
+      }, claimResult.trigger.attemptCount);
       return {
         caseId,
         status: currentStatus,
@@ -686,7 +686,7 @@ export class RecoveryOrchestrator {
       const actionExecution = await this.actionExecutor.executeAction(merchantId, authResult.action.id);
       await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
         status: CaseStatus.STOPPED,
-      });
+      }, claimResult.trigger.attemptCount);
       return {
         caseId,
         status: CaseStatus.STOPPED,
@@ -703,7 +703,7 @@ export class RecoveryOrchestrator {
       const actionExecution = await this.actionExecutor.executeAction(merchantId, authResult.action.id);
       await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
         status: CaseStatus.NEEDS_REVIEW,
-      });
+      }, claimResult.trigger.attemptCount);
       return {
         caseId,
         status: CaseStatus.NEEDS_REVIEW,
@@ -790,7 +790,7 @@ export class RecoveryOrchestrator {
 
     await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
       status: finalStatus,
-    });
+    }, claimResult.trigger.attemptCount);
 
     return {
       caseId,

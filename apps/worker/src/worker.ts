@@ -144,18 +144,39 @@ export class RecoveryWorkerService {
       };
       this.logger.info({ msg: 'Processing PROMISE_TO_PAY_CHECK', data });
 
-      if (this.outcomeObserver && data.jobRecordId) {
-        await this.outcomeObserver.observeTimerFired({
+      if (!this.outcomeObserver) {
+        const errMsg = 'RecoveryWorkerService cannot process PROMISE_TO_PAY_CHECK without OutcomeObserver configured; failing closed';
+        this.logger.error({ msg: errMsg, data });
+        if (data.jobRecordId) {
+          await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'FAILED');
+        }
+        throw new Error(errMsg);
+      }
+
+      if (!data.jobRecordId) {
+        throw new Error('PROMISE_TO_PAY_CHECK job is missing required jobRecordId');
+      }
+
+      try {
+        const result = await this.outcomeObserver.observeTimerFired({
           merchantId: data.merchantId,
           caseId: data.caseId,
           scheduledJobId: data.jobRecordId,
           timerType: 'PROMISE_TO_PAY_CHECK',
           payload: data,
         });
-      }
 
-      if (data.jobRecordId) {
+        if (!result.observed) {
+          this.logger.warn({ msg: 'PROMISE_TO_PAY_CHECK timer rejected/not observed', result, data });
+          await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'FAILED');
+          return;
+        }
+
         await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+      } catch (err) {
+        this.logger.error({ err, msg: 'Error processing PROMISE_TO_PAY_CHECK; marking FAILED for retry', data });
+        await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'FAILED');
+        throw err;
       }
     });
 
@@ -169,18 +190,39 @@ export class RecoveryWorkerService {
       };
       this.logger.info({ msg: 'Processing RECOVERY_FOLLOWUP_CHECK', data });
 
-      if (this.outcomeObserver && data.jobRecordId) {
-        await this.outcomeObserver.observeTimerFired({
+      if (!this.outcomeObserver) {
+        const errMsg = 'RecoveryWorkerService cannot process RECOVERY_FOLLOWUP_CHECK without OutcomeObserver configured; failing closed';
+        this.logger.error({ msg: errMsg, data });
+        if (data.jobRecordId) {
+          await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'FAILED');
+        }
+        throw new Error(errMsg);
+      }
+
+      if (!data.jobRecordId) {
+        throw new Error('RECOVERY_FOLLOWUP_CHECK job is missing required jobRecordId');
+      }
+
+      try {
+        const result = await this.outcomeObserver.observeTimerFired({
           merchantId: data.merchantId,
           caseId: data.caseId,
           scheduledJobId: data.jobRecordId,
           timerType: 'RECOVERY_FOLLOWUP_CHECK',
           payload: data,
         });
-      }
 
-      if (data.jobRecordId) {
+        if (!result.observed) {
+          this.logger.warn({ msg: 'RECOVERY_FOLLOWUP_CHECK timer rejected/not observed', result, data });
+          await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'FAILED');
+          return;
+        }
+
         await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+      } catch (err) {
+        this.logger.error({ err, msg: 'Error processing RECOVERY_FOLLOWUP_CHECK; marking FAILED for retry', data });
+        await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'FAILED');
+        throw err;
       }
     });
   }

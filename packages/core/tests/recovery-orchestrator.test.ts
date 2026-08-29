@@ -298,16 +298,19 @@ describe('RecoveryOrchestrator Unit Tests', () => {
         inMemoryTriggers.set(key, trigger);
         return { claimed: true, trigger };
       }),
-      completeTrigger: vi.fn(async (_mId: string, _cId: string, triggerId: string, status: string, resultJson?: any) => {
+      completeTrigger: vi.fn(async (_mId: string, _cId: string, triggerId: string, status: string, resultJson?: any, expectedAttemptCount?: number) => {
         for (const t of inMemoryTriggers.values()) {
           if (t.id === triggerId) {
+            if (expectedAttemptCount !== undefined && t.attemptCount !== expectedAttemptCount) {
+              return { completed: false, trigger: t };
+            }
             t.status = status;
             t.resultJson = resultJson;
             t.completedAt = new Date();
-            return t;
+            return { completed: true, trigger: t };
           }
         }
-        return { id: triggerId, status, resultJson };
+        return { completed: false, trigger: null };
       }),
       findTrigger: vi.fn(async (mId: string, cId: string, triggerKey: string) => {
         return inMemoryTriggers.get(`${mId}:${cId}:${triggerKey}`) || null;

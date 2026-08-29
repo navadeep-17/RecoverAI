@@ -62,7 +62,7 @@ export interface OutcomeObserverOptions {
   commitmentRepo: CommitmentRepository;
   eventRepo: EventRepository;
   auditRepo: AuditRepository;
-  scheduledJobRepo?: ScheduledJobRepository;
+  scheduledJobRepo: ScheduledJobRepository;
   jobScheduler?: IJobScheduler;
   orchestrator?: RecoveryOrchestrator;
   clock?: () => Date;
@@ -76,7 +76,7 @@ export class OutcomeObserver {
   private commitmentRepo: CommitmentRepository;
   private eventRepo: EventRepository;
   private auditRepo: AuditRepository;
-  private scheduledJobRepo?: ScheduledJobRepository;
+  private scheduledJobRepo: ScheduledJobRepository;
   private jobScheduler?: IJobScheduler;
   private orchestrator?: RecoveryOrchestrator;
   private classifier: CustomerReplyClassifier;
@@ -352,13 +352,26 @@ export class OutcomeObserver {
         };
       }
 
-      // Record outcome first with atomic deduplication
+      if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
+        await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
+      }
+
+      // 1. Create authoritative commitment first
+      const commitment = await this.commitmentRepo.createCommitment(merchantId, caseId, {
+        promisedAmount,
+        promisedDate,
+        extractedFromText: replyText,
+        status: 'PENDING',
+      });
+
+      // 2. Record outcome with commitmentId bound in detailsJson for deterministic redelivery lookup
       const outcomeResult = await this.outcomeRepo.recordOutcome(merchantId, caseId, {
         actionId,
         dedupeKey,
         outcomeType: 'PROMISE_TO_PAY',
         detailsJson: {
           messageId,
+          commitmentId: commitment.id,
           promisedAmount,
           promisedDate: promisedDate.toISOString(),
           rawText: replyText,
@@ -368,25 +381,35 @@ export class OutcomeObserver {
 
       if (!outcomeResult.created) {
         // Redelivery / duplicate message:
-        // Check if there is an active PENDING commitment for this case whose timer was not scheduled!
-        const activeCommitments = await this.commitmentRepo.getActiveCommitmentsForCase(merchantId, caseId);
-        const pendingCommitment = activeCommitments.find((c) => c.status === 'PENDING');
+        // Bind precisely to the commitment belonging to this message/outcome (never arbitrary first PENDING commitment!)
+        const details = (outcomeResult.outcome.detailsJson as Record<string, unknown> | null) || {};
+        const boundCommitmentId = (details.commitmentId as string | undefined) || commitment.id;
+
+        let pendingCommitment = null;
+        if (boundCommitmentId) {
+          const c = await this.commitmentRepo.getCommitmentById(merchantId, caseId, boundCommitmentId);
+          if (c && c.status === 'PENDING') {
+            pendingCommitment = c;
+          }
+        }
+        if (!pendingCommitment) {
+          // Fallback: match strictly by extractedFromText (never arbitrary first PENDING commitment!)
+          const activeCommitments = await this.commitmentRepo.getActiveCommitmentsForCase(merchantId, caseId);
+          pendingCommitment = activeCommitments.find((c) => c.status === 'PENDING' && c.extractedFromText === replyText) || null;
+        }
 
         if (pendingCommitment && this.jobScheduler) {
-          let hasScheduledJob = false;
-          if (this.scheduledJobRepo) {
-            const jobs = await this.scheduledJobRepo.listJobsByCase(merchantId, caseId);
-            hasScheduledJob = jobs.some(
-              (j) =>
-                j.jobType === 'PROMISE_TO_PAY_CHECK' &&
-                j.status === 'SCHEDULED' &&
-                ((j.payloadJson as Record<string, unknown> | null)?.commitmentId === pendingCommitment.id ||
-                  (j.payloadJson as Record<string, unknown> | null)?.messageId === messageId),
-            );
-          }
+          const jobs = await this.scheduledJobRepo.listJobsByCase(merchantId, caseId);
+          const hasScheduledJob = jobs.some(
+            (j) =>
+              j.jobType === 'PROMISE_TO_PAY_CHECK' &&
+              j.status === 'SCHEDULED' &&
+              ((j.payloadJson as Record<string, unknown> | null)?.commitmentId === pendingCommitment.id ||
+                (j.payloadJson as Record<string, unknown> | null)?.messageId === messageId),
+          );
 
           if (!hasScheduledJob) {
-            // Repair the missing schedule!
+            // Repair the missing schedule for THIS specific commitment!
             try {
               await this.jobScheduler.schedule({
                 merchantId,
@@ -420,7 +443,7 @@ export class OutcomeObserver {
                 caseId,
                 caseStatus: matchedCase.status,
               };
-            } catch (repairErr) {
+            } catch {
               if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
                 await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
               }
@@ -444,14 +467,6 @@ export class OutcomeObserver {
           caseStatus: matchedCase.status,
         };
       }
-
-      // Create authoritative commitment
-      const commitment = await this.commitmentRepo.createCommitment(merchantId, caseId, {
-        promisedAmount,
-        promisedDate,
-        extractedFromText: replyText,
-        status: 'PENDING',
-      });
 
       // Schedule durable timer to check if promised date passes unpaid
       try {
@@ -500,12 +515,12 @@ export class OutcomeObserver {
         eventType: 'PROMISE_TO_PAY_RECORDED',
         actorType: AuditActorType.SYSTEM,
         inputSummaryJson: {
+          messageId,
           commitmentId: commitment.id,
           promisedAmount,
-          promisedDate,
-          messageId,
+          promisedDate: promisedDate.toISOString(),
         },
-        reasonCode: 'CUSTOMER_PROMISED_PAYMENT',
+        reasonCode: 'CUSTOMER_PROMISED_TO_PAY',
       });
 
       return {
@@ -591,7 +606,8 @@ export class OutcomeObserver {
   }
 
   /**
-   * Observes a durable timer firing with required scheduledJobId for database-backed deduplication.
+   * Observes a durable timer firing (e.g. from pg-boss or external scheduler).
+   * Verifies authoritative ScheduledJob identity and status before mutating state.
    */
   async observeTimerFired(params: ObserveTimerFiredParams): Promise<ObservationResult> {
     const { merchantId, caseId, scheduledJobId, timerType, payload } = params;
@@ -605,46 +621,46 @@ export class OutcomeObserver {
       throw new Error(`Case "${caseId}" not found for merchant "${merchantId}"`);
     }
 
-    // 0. Verify authoritative ScheduledJob from PostgreSQL if scheduledJobRepo is configured
-    let scheduledJob;
-    if (this.scheduledJobRepo) {
-      scheduledJob = await this.scheduledJobRepo.getJobById(merchantId, scheduledJobId);
-      if (!scheduledJob) {
-        return {
-          observed: false,
-          caseId,
-          caseStatus: matchedCase.status,
-          reason: `ScheduledJob "${scheduledJobId}" not found for merchant "${merchantId}"; timer rejected`,
-        };
-      }
-
-      if (scheduledJob.merchantId !== merchantId) {
-        return {
-          observed: false,
-          caseId,
-          caseStatus: matchedCase.status,
-          reason: `Cross-tenant timer rejected: job merchantId "${scheduledJob.merchantId}" !== "${merchantId}"`,
-        };
-      }
-
-      if (scheduledJob.caseId !== caseId) {
-        return {
-          observed: false,
-          caseId,
-          caseStatus: matchedCase.status,
-          reason: `Timer case mismatch: job caseId "${scheduledJob.caseId}" !== "${caseId}"`,
-        };
-      }
-
-      if (scheduledJob.jobType !== timerType) {
-        return {
-          observed: false,
-          caseId,
-          caseStatus: matchedCase.status,
-          reason: `Timer type mismatch: job type "${scheduledJob.jobType}" !== "${timerType}"`,
-        };
-      }
+    // 0. Verify authoritative ScheduledJob from PostgreSQL (mandatory)
+    const scheduledJob = await this.scheduledJobRepo.getJobById(merchantId, scheduledJobId);
+    if (!scheduledJob) {
+      return {
+        observed: false,
+        caseId,
+        caseStatus: matchedCase.status,
+        reason: `ScheduledJob "${scheduledJobId}" not found for merchant "${merchantId}"; timer rejected`,
+      };
     }
+
+    if (scheduledJob.merchantId !== merchantId) {
+      return {
+        observed: false,
+        caseId,
+        caseStatus: matchedCase.status,
+        reason: `Cross-tenant timer rejected: job merchantId "${scheduledJob.merchantId}" !== "${merchantId}"`,
+      };
+    }
+
+    if (scheduledJob.caseId !== caseId) {
+      return {
+        observed: false,
+        caseId,
+        caseStatus: matchedCase.status,
+        reason: `Timer case mismatch: job caseId "${scheduledJob.caseId}" !== "${caseId}"`,
+      };
+    }
+
+    if (scheduledJob.jobType !== timerType) {
+      return {
+        observed: false,
+        caseId,
+        caseStatus: matchedCase.status,
+        reason: `Timer type mismatch: job type "${scheduledJob.jobType}" !== "${timerType}"`,
+      };
+    }
+
+    const authoritativeJobPayload = (scheduledJob.payloadJson as Record<string, unknown> | null) || {};
+    const authoritativeCommitmentId = authoritativeJobPayload.commitmentId as string | undefined;
 
     const dedupeKey = `timer:${scheduledJobId}`;
 
@@ -659,21 +675,27 @@ export class OutcomeObserver {
         };
       }
 
-      const commitmentId =
-        (payload?.commitmentId as string | undefined) ||
-        (scheduledJob
-          ? ((scheduledJob.payloadJson as Record<string, unknown> | null)?.commitmentId as string | undefined)
-          : undefined);
-
-      if (!commitmentId) {
+      if (!authoritativeCommitmentId) {
         return {
           observed: false,
           caseId,
           caseStatus: matchedCase.status,
-          reason: 'PROMISE_TO_PAY_CHECK requires payload commitmentId',
+          reason: 'Persisted ScheduledJob payload is missing required commitmentId',
         };
       }
 
+      // If caller transport passed a commitmentId, it MUST match authoritative ScheduledJob commitmentId!
+      const callerCommitmentId = payload?.commitmentId as string | undefined;
+      if (callerCommitmentId && callerCommitmentId !== authoritativeCommitmentId) {
+        return {
+          observed: false,
+          caseId,
+          caseStatus: matchedCase.status,
+          reason: `Timer payload mismatch: transport commitmentId "${callerCommitmentId}" does not match authoritative job commitmentId "${authoritativeCommitmentId}"`,
+        };
+      }
+
+      const commitmentId = authoritativeCommitmentId;
       const commitment = await this.commitmentRepo.getCommitmentById(merchantId, caseId, commitmentId);
       if (!commitment) {
         return {
