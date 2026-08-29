@@ -59,6 +59,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
   const userReviewerAId = 'usr_rev_reviewer_a_02';
   const userAdminBId = 'usr_rev_admin_b_01';
   const nonExistentUserId = 'usr_rev_unknown_99';
+  const testClock = () => new Date('2026-08-28T14:00:00+05:30');
 
   beforeAll(async () => {
     try {
@@ -93,6 +94,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         commitmentRepo,
         policyEngine,
         providerRegistry,
+        clock: testClock,
       });
 
       reviewService = new HumanReviewService({
@@ -107,6 +109,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         auditRepo,
         policyEngine,
         actionExecutor,
+        clock: testClock,
       });
 
       orchestrator = new RecoveryOrchestrator({
@@ -218,7 +221,6 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
 
     const planVersion = await prisma.recoveryPlanVersion.create({
       data: {
-        merchantId: mId,
         caseId: c.id,
         version: 1,
         diagnosisCode: 'CARD_DECLINED',
@@ -226,8 +228,6 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         proposedActionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
         proposedActionParams: { channel: 'EMAIL', discountOffered: 0 },
         confidence: 0.85,
-        llmPrompt: 'test prompt',
-        llmResponse: 'test response',
         reasoningSummary: 'Verified case facts support payment-link recovery; human review required before execution.',
       },
     });
@@ -320,7 +320,6 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     // Also prove a different planVersionId creates a distinct review
     const planVersion2 = await prisma.recoveryPlanVersion.create({
       data: {
-        merchantId: merchantAId,
         caseId: testCase.id,
         version: 2,
         diagnosisCode: 'HARD_DECLINE',
@@ -329,8 +328,6 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         proposedActionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE,
         proposedActionParams: {},
         confidence: 0.9,
-        llmPrompt: 'test prompt v2',
-        llmResponse: 'test response v2',
       },
     });
 
@@ -457,7 +454,6 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     // Replanned to v2
     await prisma.recoveryPlanVersion.create({
       data: {
-        merchantId: merchantAId,
         caseId: testCase.id,
         version: 2,
         diagnosisCode: 'HARD_DECLINE',
@@ -466,8 +462,6 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         proposedActionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE,
         proposedActionParams: {},
         confidence: 0.9,
-        llmPrompt: 'test prompt 2',
-        llmResponse: 'test response 2',
       },
     });
 
@@ -477,7 +471,9 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(approval.stale).toBe(true);
 
     // Zero actions created
-    const actions = await actionRepo.listActionsForCase(merchantAId, testCase.id);
+    const actions = await prisma.recoveryAction.findMany({
+      where: { caseId: testCase.id, case: { merchantId: merchantAId } },
+    });
     expect(actions).toHaveLength(0);
 
     // Verify REVIEW_STALE audit
@@ -503,7 +499,9 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(approval.approved).toBe(false);
     expect(approval.stale).toBe(true);
 
-    const actions = await actionRepo.listActionsForCase(merchantAId, testCase.id);
+    const actions = await prisma.recoveryAction.findMany({
+      where: { caseId: testCase.id, case: { merchantId: merchantAId } },
+    });
     expect(actions).toHaveLength(0);
   });
 
@@ -619,14 +617,15 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(audits.some((a) => a.eventType === 'REVIEW_TAKEN_OVER')).toBe(true);
 
     // When orchestrator tries to run iteration on this case, it halts due to active takeover
-    const claim = await triggerRepo.claimTrigger(merchantAId, testCase.id, `manual_${Date.now()}`, 'MANUAL_DISPATCH');
-    const iteration = await orchestrator.runIteration(merchantAId, testCase.id, claim);
+    const iteration = await orchestrator.runIteration(merchantAId, testCase.id, 'MANUAL_DISPATCH');
 
     expect(iteration.iterationCompleted).toBe(false);
     expect(iteration.error).toBe('CASE_TAKEN_OVER_BY_HUMAN');
 
     // Zero autonomous actions created
-    const actions = await actionRepo.listActionsForCase(merchantAId, testCase.id);
+    const actions = await prisma.recoveryAction.findMany({
+      where: { caseId: testCase.id, case: { merchantId: merchantAId } },
+    });
     expect(actions).toHaveLength(0);
   });
 });
