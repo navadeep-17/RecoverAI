@@ -33,6 +33,7 @@ export interface ObservationResult {
   caseStatus?: CaseStatus;
   replanTriggered?: boolean;
   deduplicated?: boolean;
+  isEarlyTimer?: boolean;
   reason?: string;
 }
 
@@ -356,13 +357,26 @@ export class OutcomeObserver {
         await this.caseRepo.compareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
       }
 
-      // 1. Create authoritative commitment first
-      const commitment = await this.commitmentRepo.createCommitment(merchantId, caseId, {
-        promisedAmount,
-        promisedDate,
-        extractedFromText: replyText,
-        status: 'PENDING',
-      });
+      // 1. Create authoritative commitment idempotently by sourceMessageId
+      const commitmentResult = typeof this.commitmentRepo.createCommitmentIdempotently === 'function'
+        ? await this.commitmentRepo.createCommitmentIdempotently(merchantId, caseId, {
+            sourceMessageId: messageId,
+            promisedAmount,
+            promisedDate,
+            extractedFromText: replyText,
+            status: 'PENDING',
+          })
+        : {
+            commitment: await this.commitmentRepo.createCommitment(merchantId, caseId, {
+              sourceMessageId: messageId,
+              promisedAmount,
+              promisedDate,
+              extractedFromText: replyText,
+              status: 'PENDING',
+            }),
+            created: true,
+          };
+      const commitment = commitmentResult.commitment;
 
       // 2. Record outcome with commitmentId bound in detailsJson for deterministic redelivery lookup
       const outcomeResult = await this.outcomeRepo.recordOutcome(merchantId, caseId, {
@@ -381,7 +395,7 @@ export class OutcomeObserver {
 
       if (!outcomeResult.created) {
         // Redelivery / duplicate message:
-        // Bind precisely to the commitment belonging to this message/outcome (never arbitrary first PENDING commitment!)
+        // Bind precisely to the commitment belonging to this message/outcome
         const details = (outcomeResult.outcome.detailsJson as Record<string, unknown> | null) || {};
         const boundCommitmentId = (details.commitmentId as string | undefined) || commitment.id;
 
@@ -392,10 +406,11 @@ export class OutcomeObserver {
             pendingCommitment = c;
           }
         }
-        if (!pendingCommitment) {
-          // Fallback: match strictly by extractedFromText (never arbitrary first PENDING commitment!)
-          const activeCommitments = await this.commitmentRepo.getActiveCommitmentsForCase(merchantId, caseId);
-          pendingCommitment = activeCommitments.find((c) => c.status === 'PENDING' && c.extractedFromText === replyText) || null;
+        if (!pendingCommitment && typeof this.commitmentRepo.findBySourceMessageId === 'function') {
+          const c = await this.commitmentRepo.findBySourceMessageId(merchantId, caseId, messageId);
+          if (c && c.status === 'PENDING') {
+            pendingCommitment = c;
+          }
         }
 
         if (pendingCommitment && this.jobScheduler) {
@@ -719,8 +734,37 @@ export class OutcomeObserver {
       const now = params.occurredAt || this.now();
       if (now.getTime() < commitment.promisedDate.getTime()) {
         // Early timer: do NOT mark promise BROKEN!
+        // Ensure a future timer exists at the authoritative promisedDate
+        if (this.jobScheduler) {
+          const jobs = await this.scheduledJobRepo.listJobsByCase(merchantId, caseId);
+          const hasFutureJob = jobs.some(
+            (j) =>
+              j.id !== scheduledJobId &&
+              j.jobType === 'PROMISE_TO_PAY_CHECK' &&
+              j.status === 'SCHEDULED' &&
+              (j.payloadJson as Record<string, unknown> | null)?.commitmentId === commitmentId,
+          );
+
+          if (!hasFutureJob) {
+            await this.jobScheduler.schedule({
+              merchantId,
+              caseId,
+              jobType: 'PROMISE_TO_PAY_CHECK',
+              scheduledFor: commitment.promisedDate,
+              payloadJson: {
+                caseId,
+                commitmentId: commitment.id,
+                promisedAmount: commitment.promisedAmount.toString(),
+                promisedDate: commitment.promisedDate.toISOString(),
+                sourceMessageId: commitment.sourceMessageId ?? null,
+              },
+            });
+          }
+        }
+
         return {
           observed: false,
+          isEarlyTimer: true,
           caseId,
           caseStatus: matchedCase.status,
           reason: `Early timer rejected: current time ${now.toISOString()} is before promisedDate ${commitment.promisedDate.toISOString()}`,

@@ -167,6 +167,11 @@ export class RecoveryWorkerService {
         });
 
         if (!result.observed) {
+          if (result.isEarlyTimer) {
+            this.logger.info({ msg: 'PROMISE_TO_PAY_CHECK fired early; future timer wake preserved/rescheduled', result, data });
+            await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+            return;
+          }
           this.logger.warn({ msg: 'PROMISE_TO_PAY_CHECK timer rejected/not observed', result, data });
           await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'FAILED');
           return;

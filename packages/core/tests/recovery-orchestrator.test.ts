@@ -298,10 +298,10 @@ describe('RecoveryOrchestrator Unit Tests', () => {
         inMemoryTriggers.set(key, trigger);
         return { claimed: true, trigger };
       }),
-      completeTrigger: vi.fn(async (_mId: string, _cId: string, triggerId: string, status: string, resultJson?: any, expectedAttemptCount?: number) => {
+      completeTrigger: vi.fn(async (_mId: string, _cId: string, triggerId: string, status: string, resultJson: any, expectedAttemptCount: number) => {
         for (const t of inMemoryTriggers.values()) {
           if (t.id === triggerId) {
-            if (expectedAttemptCount !== undefined && t.attemptCount !== expectedAttemptCount) {
+            if (t.attemptCount !== expectedAttemptCount) {
               return { completed: false, trigger: t };
             }
             t.status = status;
@@ -715,7 +715,7 @@ describe('RecoveryOrchestrator Unit Tests', () => {
       expect(claim3.trigger.attemptCount).toBe(2);
 
       // 4. Worker 3 completes the trigger
-      await mockTriggerRepo.completeTrigger(merchantId, caseId, claim3.trigger.id, 'COMPLETED');
+      await mockTriggerRepo.completeTrigger(merchantId, caseId, claim3.trigger.id, 'COMPLETED', undefined, claim3.trigger.attemptCount);
 
       // 5. COMPLETED trigger can never be reclaimed
       const claim4 = await mockTriggerRepo.claimTrigger(merchantId, caseId, triggerKey, 'REPLAN_TRIGGERED', {

@@ -347,17 +347,19 @@ model HumanReview {
 }
 
 model RecoveryCommitment {
-  id               String          @id @default(uuid())
-  caseId           String
-  promisedAmount   Decimal         @db.Decimal(12, 2)
-  promisedDate     DateTime
-  status           String          @default("PENDING")
+  id                String          @id @default(uuid())
+  caseId            String
+  sourceMessageId   String?
+  promisedAmount    Decimal         @db.Decimal(12, 2)
+  promisedDate      DateTime
+  status            String          @default("PENDING")
   extractedFromText String?
-  createdAt        DateTime        @default(now())
-  updatedAt        DateTime        @updatedAt
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
 
-  case             RevenueRiskCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  case              RevenueRiskCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
 
+  @@unique([caseId, sourceMessageId])
   @@index([caseId])
   @@map("recovery_commitments")
 }

@@ -115,15 +115,33 @@ describe('OutcomeObserver Unit Tests', () => {
     };
 
     mockCommitmentRepo = {
-      createCommitment: vi.fn(async (_mId: string, cId: string, params: any) => {
+      createCommitmentIdempotently: vi.fn(async (_mId: string, cId: string, params: any) => {
+        if (params.sourceMessageId) {
+          const existing = Array.from(inMemoryCommitments.values()).find(
+            (c: any) => c.caseId === cId && c.sourceMessageId === params.sourceMessageId,
+          );
+          if (existing) {
+            return { commitment: existing, created: false };
+          }
+        }
         const commitment = {
           id: params.id || `cmt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           caseId: cId,
+          sourceMessageId: params.sourceMessageId || null,
           ...params,
           createdAt: new Date(),
         };
         inMemoryCommitments.set(commitment.id, commitment);
-        return commitment;
+        return { commitment, created: true };
+      }),
+      createCommitment: vi.fn(async (_mId: string, cId: string, params: any) => {
+        const res = await mockCommitmentRepo.createCommitmentIdempotently(_mId, cId, params);
+        return res.commitment;
+      }),
+      findBySourceMessageId: vi.fn(async (_mId: string, cId: string, sourceMessageId: string) => {
+        return Array.from(inMemoryCommitments.values()).find(
+          (c: any) => c.caseId === cId && c.sourceMessageId === sourceMessageId,
+        ) || null;
       }),
       getActiveCommitmentsForCase: vi.fn(async () => Array.from(inMemoryCommitments.values())),
       getCommitmentById: vi.fn(async (_mId: string, _cId: string, id: string) => {
@@ -416,10 +434,11 @@ describe('OutcomeObserver Unit Tests', () => {
       });
 
       expect(result.observed).toBe(true);
-      expect(mockCommitmentRepo.createCommitment).toHaveBeenCalledWith(
+      expect(mockCommitmentRepo.createCommitmentIdempotently).toHaveBeenCalledWith(
         merchantId,
         caseId,
         expect.objectContaining({
+          sourceMessageId: 'msg_promise_01',
           promisedAmount: '14999.00',
           status: 'PENDING',
         }),

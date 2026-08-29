@@ -131,7 +131,7 @@ export class TriggerRepository {
 
   /**
    * Marks a claimed trigger as COMPLETED or FAILED with lease fencing.
-   * If expectedAttemptCount is specified, the update requires attemptCount to match.
+   * Requires expectedAttemptCount (fencing token) to match the claimed lease generation.
    * If the trigger was reclaimed by another worker while this worker was running (attemptCount incremented),
    * the update returns completed: false without overwriting the newer worker's claim.
    */
@@ -140,8 +140,8 @@ export class TriggerRepository {
     caseId: string,
     triggerId: string,
     status: 'COMPLETED' | 'FAILED',
-    resultJson?: Record<string, unknown>,
-    expectedAttemptCount?: number,
+    resultJson: Record<string, unknown> | undefined,
+    expectedAttemptCount: number,
   ): Promise<CompleteTriggerResult> {
     const updateResult = await prisma.recoveryIterationTrigger.updateMany({
       where: {
@@ -149,7 +149,7 @@ export class TriggerRepository {
         merchantId,
         caseId,
         status: 'CLAIMED',
-        ...(expectedAttemptCount !== undefined ? { attemptCount: expectedAttemptCount } : {}),
+        attemptCount: expectedAttemptCount,
       },
       data: {
         status,

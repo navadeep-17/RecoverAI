@@ -3,6 +3,10 @@ import { prisma } from '../client.js';
 
 export interface CreateCommitmentParams {
   /**
+   * Optional source message ID for message-idempotent deduplication.
+   */
+  sourceMessageId?: string | null;
+  /**
    * The promised amount. Must be a valid non-negative decimal string (e.g. "1500.00").
    */
   promisedAmount: string;
@@ -13,11 +17,16 @@ export interface CreateCommitmentParams {
   /**
    * Optional free-text extracted from conversation or context.
    */
-  extractedFromText?: string;
+  extractedFromText?: string | null;
   /**
    * Initial status (defaults to 'PENDING').
    */
   status?: string;
+}
+
+export interface CreateCommitmentResult {
+  commitment: RecoveryCommitment;
+  created: boolean;
 }
 
 /**
@@ -30,6 +39,50 @@ export interface CreateCommitmentParams {
  */
 export class CommitmentRepository {
   /**
+   * Persists an authoritative RecoveryCommitment idempotently under a tenant-scoped case.
+   *
+   * Verifies that the case belongs to the merchantId before creating.
+   * On unique constraint violation on [caseId, sourceMessageId], re-reads existing commitment.
+   */
+  async createCommitmentIdempotently(
+    merchantId: string,
+    caseId: string,
+    params: CreateCommitmentParams,
+  ): Promise<CreateCommitmentResult> {
+    // Assert tenant ownership of the parent case
+    await prisma.revenueRiskCase.findFirstOrThrow({
+      where: { id: caseId, merchantId },
+    });
+
+    try {
+      const commitment = await prisma.recoveryCommitment.create({
+        data: {
+          caseId,
+          sourceMessageId: params.sourceMessageId ?? null,
+          promisedAmount: new Prisma.Decimal(params.promisedAmount),
+          promisedDate: params.promisedDate,
+          extractedFromText: params.extractedFromText ?? null,
+          status: params.status || 'PENDING',
+        },
+      });
+      return { commitment, created: true };
+    } catch (error: unknown) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002' &&
+        params.sourceMessageId
+      ) {
+        // Unique constraint violation on [caseId, sourceMessageId]
+        const existing = await prisma.recoveryCommitment.findFirstOrThrow({
+          where: { caseId, sourceMessageId: params.sourceMessageId },
+        });
+        return { commitment: existing, created: false };
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Persists an authoritative RecoveryCommitment under a tenant-scoped case.
    *
    * Verifies that the case belongs to the merchantId before creating.
@@ -39,19 +92,24 @@ export class CommitmentRepository {
     caseId: string,
     params: CreateCommitmentParams,
   ): Promise<RecoveryCommitment> {
-    // Assert tenant ownership of the parent case
+    const result = await this.createCommitmentIdempotently(merchantId, caseId, params);
+    return result.commitment;
+  }
+
+  /**
+   * Finds a commitment by sourceMessageId scoped to tenant and case.
+   */
+  async findBySourceMessageId(
+    merchantId: string,
+    caseId: string,
+    sourceMessageId: string,
+  ): Promise<RecoveryCommitment | null> {
     await prisma.revenueRiskCase.findFirstOrThrow({
       where: { id: caseId, merchantId },
     });
 
-    return prisma.recoveryCommitment.create({
-      data: {
-        caseId,
-        promisedAmount: new Prisma.Decimal(params.promisedAmount),
-        promisedDate: params.promisedDate,
-        extractedFromText: params.extractedFromText,
-        status: params.status || 'PENDING',
-      },
+    return prisma.recoveryCommitment.findFirst({
+      where: { caseId, sourceMessageId },
     });
   }
 

@@ -636,7 +636,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     // 4. Winner completes trigger in database
     await triggerRepo.completeTrigger(merchantId, testCase.id, winners[0].trigger.id, 'COMPLETED', {
       success: true,
-    });
+    }, winners[0].trigger.attemptCount);
 
     // 5. Completed trigger cannot be claimed or reclaimed
     const finalClaim = await triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', {
@@ -848,5 +848,268 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const cmtBCheck = await commitmentRepo.getCommitmentById(merchantId, testCase.id, cmtCallerB.id);
     expect(cmtACheck?.status).toBe('PENDING');
     expect(cmtBCheck?.status).toBe('PENDING');
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('PROMISE CONCURRENCY: 5 concurrent observeCustomerReply calls produce exactly 1 commitment, 1 outcome, and 1 scheduled timer', async () => {
+    if (!dbAvailable) return;
+
+    const paymentId = `pay_promise_conc_${Date.now()}`;
+    const testCase = await caseRepo.createCase(merchantId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '85000.00',
+      currency: 'INR',
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'INSUFFICIENT_FUNDS' },
+    });
+
+    const msgId = `msg_conc_prom_${Date.now()}`;
+    const replyText = 'I will pay ₹85,000 on Friday without fail';
+
+    const results = await Promise.all([
+      observer.observeCustomerReply({ merchantId, caseId: testCase.id, messageId: msgId, replyText }),
+      observer.observeCustomerReply({ merchantId, caseId: testCase.id, messageId: msgId, replyText }),
+      observer.observeCustomerReply({ merchantId, caseId: testCase.id, messageId: msgId, replyText }),
+      observer.observeCustomerReply({ merchantId, caseId: testCase.id, messageId: msgId, replyText }),
+      observer.observeCustomerReply({ merchantId, caseId: testCase.id, messageId: msgId, replyText }),
+    ]);
+
+    // All 5 calls observe the customer reply (0 rejected promises)
+    expect(results.every((r) => r.observed)).toBe(true);
+
+    // Exactly 1 RecoveryOutcome in DB for that message
+    const outcomesInDb = await prisma.recoveryOutcome.findMany({
+      where: { caseId: testCase.id, dedupeKey: `promise:${testCase.id}:${msgId}` },
+    });
+    expect(outcomesInDb.length).toBe(1);
+
+    // Exactly 1 RecoveryCommitment in DB with sourceMessageId
+    const commitmentsInDb = await prisma.recoveryCommitment.findMany({
+      where: { caseId: testCase.id },
+    });
+    expect(commitmentsInDb.length).toBe(1);
+    expect(commitmentsInDb[0].sourceMessageId).toBe(msgId);
+    expect(commitmentsInDb[0].status).toBe('PENDING');
+    expect(new Prisma.Decimal(commitmentsInDb[0].promisedAmount).equals(new Prisma.Decimal('85000.00'))).toBe(true);
+
+    // Exactly 1 ScheduledJob for the commitment
+    const jobsInDb = await prisma.scheduledJob.findMany({
+      where: { caseId: testCase.id, jobType: 'PROMISE_TO_PAY_CHECK' },
+    });
+    expect(jobsInDb.length).toBe(1);
+    expect((jobsInDb[0].payloadJson as any)?.commitmentId).toBe(commitmentsInDb[0].id);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('PROMISE IDENTITY: same promise text across two distinct messageIds creates two distinct commitments and outcomes', async () => {
+    if (!dbAvailable) return;
+
+    const paymentId = `pay_diff_msg_${Date.now()}`;
+    const testCase = await caseRepo.createCase(merchantId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '85000.00',
+      currency: 'INR',
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'INSUFFICIENT_FUNDS' },
+    });
+
+    const msgIdA = `msg_text_A_${Date.now()}`;
+    const msgIdB = `msg_text_B_${Date.now()}`;
+    const replyText = 'Will pay ₹85,000 Friday';
+
+    const resA = await observer.observeCustomerReply({
+      merchantId,
+      caseId: testCase.id,
+      messageId: msgIdA,
+      replyText,
+    });
+
+    const resB = await observer.observeCustomerReply({
+      merchantId,
+      caseId: testCase.id,
+      messageId: msgIdB,
+      replyText,
+    });
+
+    expect(resA.observed).toBe(true);
+    expect(resB.observed).toBe(true);
+
+    // Two distinct outcomes in DB
+    const outcomes = await prisma.recoveryOutcome.findMany({
+      where: { caseId: testCase.id, outcomeType: 'PROMISE_TO_PAY' },
+    });
+    expect(outcomes.length).toBe(2);
+
+    // Two distinct commitments in DB
+    const commitments = await prisma.recoveryCommitment.findMany({
+      where: { caseId: testCase.id },
+    });
+    expect(commitments.length).toBe(2);
+    expect(commitments.map((c) => c.sourceMessageId).sort()).toEqual([msgIdA, msgIdB].sort());
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('REDELIVERY REPAIR: redelivery of promise with missing schedule repairs timer without creating duplicate commitment', async () => {
+    if (!dbAvailable) return;
+
+    const paymentId = `pay_repair_${Date.now()}`;
+    const testCase = await caseRepo.createCase(merchantId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '25000.00',
+      currency: 'INR',
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'INSUFFICIENT_FUNDS' },
+    });
+
+    const msgId = `msg_repair_${Date.now()}`;
+    const replyText = 'I will pay ₹25,000 on Friday';
+
+    // 1. Initial delivery creates commitment and outcome
+    const initialRes = await observer.observeCustomerReply({
+      merchantId,
+      caseId: testCase.id,
+      messageId: msgId,
+      replyText,
+    });
+    expect(initialRes.observed).toBe(true);
+
+    // Simulate scheduler failure / missed job by deleting the scheduled job
+    await prisma.scheduledJob.deleteMany({
+      where: { caseId: testCase.id, jobType: 'PROMISE_TO_PAY_CHECK' },
+    });
+    const jobsBefore = await prisma.scheduledJob.findMany({
+      where: { caseId: testCase.id, jobType: 'PROMISE_TO_PAY_CHECK' },
+    });
+    expect(jobsBefore.length).toBe(0);
+
+    // 2. Redelivery of identical messageId
+    const redeliveryRes = await observer.observeCustomerReply({
+      merchantId,
+      caseId: testCase.id,
+      messageId: msgId,
+      replyText,
+    });
+
+    expect(redeliveryRes.observed).toBe(true);
+    expect(redeliveryRes.deduplicated).toBe(true);
+
+    // Still exactly 1 commitment in DB
+    const commitments = await prisma.recoveryCommitment.findMany({
+      where: { caseId: testCase.id },
+    });
+    expect(commitments.length).toBe(1);
+    expect(commitments[0].sourceMessageId).toBe(msgId);
+
+    // ScheduledJob was repaired!
+    const jobsAfter = await prisma.scheduledJob.findMany({
+      where: { caseId: testCase.id, jobType: 'PROMISE_TO_PAY_CHECK' },
+    });
+    expect(jobsAfter.length).toBe(1);
+    expect((jobsAfter[0].payloadJson as any)?.commitmentId).toBe(commitments[0].id);
+
+    // Audit recorded SCHEDULING_REPAIRED
+    const repairAudits = await prisma.auditEvent.findMany({
+      where: { caseId: testCase.id, eventType: 'SCHEDULING_REPAIRED' },
+    });
+    expect(repairAudits.length).toBe(1);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('EARLY TIMER SEMANTICS: early timer preserves future wake, leaves commitment PENDING, and eventual timer breaks promise', async () => {
+    if (!dbAvailable) return;
+
+    const paymentId = `pay_early_timer_${Date.now()}`;
+    const testCase = await caseRepo.createCase(merchantId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '50000.00',
+      currency: 'INR',
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:${paymentId}`,
+      contextJson: { paymentId, verifiedPaymentFailureCode: 'INSUFFICIENT_FUNDS' },
+    });
+
+    const scheduledJobRepo = new ScheduledJobRepository();
+    // Promised date is 10 seconds in the future
+    const futureDate = new Date(Date.now() + 10000);
+
+    const commitment = await commitmentRepo.createCommitment(merchantId, testCase.id, {
+      sourceMessageId: `msg_early_${Date.now()}`,
+      promisedAmount: '50000.00',
+      promisedDate: futureDate,
+      status: 'PENDING',
+      extractedFromText: 'Pay 50000 later',
+    });
+
+    const earlyJob = await scheduledJobRepo.createJob(merchantId, {
+      caseId: testCase.id,
+      jobType: 'PROMISE_TO_PAY_CHECK',
+      scheduledFor: new Date(Date.now() - 1000), // premature dispatch
+      payloadJson: {
+        caseId: testCase.id,
+        commitmentId: commitment.id,
+      },
+    });
+
+    // 1. Early timer fires before futureDate
+    const earlyResult = await observer.observeTimerFired({
+      merchantId,
+      caseId: testCase.id,
+      scheduledJobId: earlyJob.id,
+      timerType: 'PROMISE_TO_PAY_CHECK',
+      occurredAt: new Date(Date.now() - 5000), // before futureDate
+      payload: { commitmentId: commitment.id },
+    });
+
+    // Early timer is rejected (not observed as broken promise) and isEarlyTimer is true
+    expect(earlyResult.observed).toBe(false);
+    expect((earlyResult as any).isEarlyTimer).toBe(true);
+
+    // Commitment remains PENDING in DB
+    const cmtCheck = await commitmentRepo.getCommitmentById(merchantId, testCase.id, commitment.id);
+    expect(cmtCheck?.status).toBe('PENDING');
+
+    // No PROMISE_TO_PAY_BROKEN outcome in DB
+    const brokenOutcomes = await prisma.recoveryOutcome.findMany({
+      where: { caseId: testCase.id, outcomeType: 'PROMISE_TO_PAY_BROKEN' },
+    });
+    expect(brokenOutcomes.length).toBe(0);
+
+    // Future scheduled job exists for futureDate
+    const jobs = await prisma.scheduledJob.findMany({
+      where: { caseId: testCase.id, jobType: 'PROMISE_TO_PAY_CHECK' },
+    });
+    expect(jobs.length).toBeGreaterThanOrEqual(1);
+
+    // 2. Due timer fires at or after futureDate
+    const dueJob = await scheduledJobRepo.createJob(merchantId, {
+      caseId: testCase.id,
+      jobType: 'PROMISE_TO_PAY_CHECK',
+      scheduledFor: futureDate,
+      payloadJson: {
+        caseId: testCase.id,
+        commitmentId: commitment.id,
+      },
+    });
+
+    const dueResult = await observer.observeTimerFired({
+      merchantId,
+      caseId: testCase.id,
+      scheduledJobId: dueJob.id,
+      timerType: 'PROMISE_TO_PAY_CHECK',
+      occurredAt: new Date(futureDate.getTime() + 1000), // after futureDate
+      payload: { commitmentId: commitment.id },
+    });
+
+    expect(dueResult.observed).toBe(true);
+    expect(dueResult.caseStatus).toBe(CaseStatus.NEEDS_REVIEW);
+
+    // Commitment is now BROKEN in DB
+    const cmtFinal = await commitmentRepo.getCommitmentById(merchantId, testCase.id, commitment.id);
+    expect(cmtFinal?.status).toBe('BROKEN');
+
+    // CASE_ESCALATED audit was emitted with reasonCode BROKEN_PROMISE_TO_PAY
+    const escalatedAudits = await prisma.auditEvent.findMany({
+      where: { caseId: testCase.id, eventType: 'CASE_ESCALATED', reasonCode: 'BROKEN_PROMISE_TO_PAY' },
+    });
+    expect(escalatedAudits.length).toBe(1);
   });
 });

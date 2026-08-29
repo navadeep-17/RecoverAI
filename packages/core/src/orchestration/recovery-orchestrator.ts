@@ -127,7 +127,7 @@ export class RecoveryOrchestrator {
     if (!caseRecord) {
       await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
         error: 'Case not found',
-      });
+      }, claimResult.trigger.attemptCount);
       throw new Error(`Case "${caseId}" not found for merchant "${merchantId}"`);
     }
 
