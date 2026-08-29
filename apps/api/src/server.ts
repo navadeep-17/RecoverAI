@@ -4,8 +4,12 @@ import sensible from '@fastify/sensible';
 import { generateCorrelationId, createLogger, loadEnv } from '@recoverai/shared';
 import { checkDatabaseConnection } from '@recoverai/db';
 
+import { HumanReviewService } from '@recoverai/core';
+import { reviewRoutes } from './routes/review-routes.js';
+
 export interface BuildServerOptions {
   checkDbConnection?: () => Promise<boolean>;
+  reviewService?: HumanReviewService;
 }
 
 export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
@@ -75,6 +79,14 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       timestamp: new Date().toISOString(),
     });
   });
+
+  // Human Review Routes
+  if (options.reviewService) {
+    app.register(reviewRoutes, {
+      prefix: '/reviews',
+      reviewService: options.reviewService,
+    });
+  }
 
   return app;
 }

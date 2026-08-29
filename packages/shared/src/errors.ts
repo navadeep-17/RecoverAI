@@ -38,3 +38,25 @@ export class ActionExecutionError extends Error {
   }
 }
 
+export class ReviewStateConflictError extends Error {
+  constructor(
+    public readonly reviewId: string,
+    public readonly expectedStatus: string,
+    public readonly actualStatus: string,
+  ) {
+    super(`Review "${reviewId}" state conflict: expected "${expectedStatus}", but current status is "${actualStatus}"`);
+    this.name = 'ReviewStateConflictError';
+  }
+}
+
+export class UnauthorizedReviewerError extends Error {
+  constructor(
+    public readonly reviewerId: string,
+    public readonly merchantId: string,
+    public readonly reason: string,
+  ) {
+    super(`Reviewer "${reviewerId}" unauthorized for merchant "${merchantId}": ${reason}`);
+    this.name = 'UnauthorizedReviewerError';
+  }
+}
+

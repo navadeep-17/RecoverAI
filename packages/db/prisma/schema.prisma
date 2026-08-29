@@ -222,6 +222,7 @@ model RecoveryPlanVersion {
 
   case                 RevenueRiskCase    @relation(fields: [caseId], references: [id], onDelete: Cascade)
   actions              RecoveryAction[]
+  reviews              HumanReview[]
 
   @@unique([caseId, version])
   @@map("recovery_plan_versions")
@@ -326,6 +327,7 @@ model HumanReview {
   merchantId       String
   caseId           String
   actionId         String?
+  planVersionId    String?
   reviewerId       String?
   reasonForReview  String
   status           ReviewStatus    @default(PENDING)
@@ -337,12 +339,14 @@ model HumanReview {
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
 
-  merchant         Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
-  case             RevenueRiskCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
-  action           RecoveryAction? @relation(fields: [actionId], references: [id], onDelete: SetNull)
-  reviewer         User?           @relation(fields: [reviewerId], references: [id], onDelete: SetNull)
+  merchant         Merchant             @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  case             RevenueRiskCase      @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  action           RecoveryAction?      @relation(fields: [actionId], references: [id], onDelete: SetNull)
+  planVersion      RecoveryPlanVersion? @relation(fields: [planVersionId], references: [id], onDelete: SetNull)
+  reviewer         User?                @relation(fields: [reviewerId], references: [id], onDelete: SetNull)
 
   @@index([merchantId, status])
+  @@index([caseId, planVersionId])
   @@map("human_reviews")
 }
 

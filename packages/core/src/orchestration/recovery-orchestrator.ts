@@ -10,6 +10,7 @@ import {
   CaseRepository,
   CommitmentRepository,
   CustomerRepository,
+  HumanReviewRepository,
   MerchantRepository,
   PolicyConfigRepository,
   TriggerRepository,
@@ -38,6 +39,7 @@ export interface RecoveryOrchestratorOptions {
   policyConfigRepo: PolicyConfigRepository;
   commitmentRepo: CommitmentRepository;
   auditRepo: AuditRepository;
+  humanReviewRepo?: HumanReviewRepository;
   recoveryAgent: RecoveryAgent;
   policyEngine: IPolicyEngine;
   actionExecutor: ActionExecutor;
@@ -54,6 +56,7 @@ export class RecoveryOrchestrator {
   private policyConfigRepo: PolicyConfigRepository;
   private commitmentRepo: CommitmentRepository;
   private auditRepo: AuditRepository;
+  private humanReviewRepo?: HumanReviewRepository;
   private recoveryAgent: RecoveryAgent;
   private policyEngine: IPolicyEngine;
   private actionExecutor: ActionExecutor;
@@ -69,6 +72,7 @@ export class RecoveryOrchestrator {
     this.policyConfigRepo = options.policyConfigRepo;
     this.commitmentRepo = options.commitmentRepo;
     this.auditRepo = options.auditRepo;
+    this.humanReviewRepo = options.humanReviewRepo;
     this.recoveryAgent = options.recoveryAgent;
     this.policyEngine = options.policyEngine;
     this.actionExecutor = options.actionExecutor;
@@ -129,6 +133,23 @@ export class RecoveryOrchestrator {
         error: 'Case not found',
       }, claimResult.trigger.attemptCount);
       throw new Error(`Case "${caseId}" not found for merchant "${merchantId}"`);
+    }
+
+    // 1.1 Check for active human takeover (automation halts when human has taken over)
+    if (this.humanReviewRepo) {
+      const activeTakeover = await this.humanReviewRepo.findActiveTakeoverForCase(merchantId, caseId);
+      if (activeTakeover) {
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+          status: caseRecord.status,
+          takenOver: true,
+        }, claimResult.trigger.attemptCount);
+        return {
+          caseId,
+          status: caseRecord.status,
+          iterationCompleted: false,
+          error: 'CASE_TAKEN_OVER_BY_HUMAN',
+        };
+      }
     }
 
     // 2. Kill Switch MUST FAIL CLOSED: if merchant cannot be retrieved, fail closed
@@ -633,6 +654,29 @@ export class RecoveryOrchestrator {
 
     if (policyEvaluation.decision === PolicyDecision.REVIEW) {
       await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+
+      if (this.humanReviewRepo) {
+        const review = await this.humanReviewRepo.createReview(merchantId, {
+          caseId,
+          planVersionId: planVersion.id,
+          reasonForReview: policyEvaluation.rationale,
+        });
+
+        await this.auditRepo.record(merchantId, {
+          caseId,
+          eventType: 'REVIEW_REQUESTED',
+          actorType: AuditActorType.POLICY,
+          inputSummaryJson: {
+            reviewId: review.id,
+            planVersionId: planVersion.id,
+            planVersion: planVersion.version,
+            reasonForReview: policyEvaluation.rationale,
+            reasonCode: policyEvaluation.reasonCode,
+          },
+          reasonCode: policyEvaluation.reasonCode,
+        });
+      }
+
       await this.auditRepo.record(merchantId, {
         caseId,
         eventType: 'CASE_ESCALATED',
