@@ -886,12 +886,6 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const finalCase = await caseRepo.getCaseById(merchantId, testCase.id);
     expect(finalCase?.status).toBe(CaseStatus.OPEN);
 
-    // Exactly 1 RecoveryOutcome in DB for that message
-    const outcomesInDb = await prisma.recoveryOutcome.findMany({
-      where: { caseId: testCase.id, dedupeKey: `promise:${testCase.id}:${msgId}` },
-    });
-    expect(outcomesInDb.length).toBe(1);
-
     // Exactly 1 RecoveryCommitment in DB with sourceMessageId
     const commitmentsInDb = await prisma.recoveryCommitment.findMany({
       where: { caseId: testCase.id },
@@ -900,6 +894,15 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     expect(commitmentsInDb[0].sourceMessageId).toBe(msgId);
     expect(commitmentsInDb[0].status).toBe('PENDING');
     expect(new Prisma.Decimal(commitmentsInDb[0].promisedAmount).equals(new Prisma.Decimal('85000.00'))).toBe(true);
+
+    // Exactly 1 RecoveryOutcome in DB for that message with canonical customer-message:${msgId} key
+    const outcomeDedupeKey = `customer-message:${msgId}`;
+    const outcomesInDb = await prisma.recoveryOutcome.findMany({
+      where: { caseId: testCase.id, dedupeKey: outcomeDedupeKey },
+    });
+    expect(outcomesInDb).toHaveLength(1);
+    expect(outcomesInDb[0].outcomeType).toBe('PROMISE_TO_PAY');
+    expect((outcomesInDb[0].detailsJson as any)?.commitmentId).toBe(commitmentsInDb[0].id);
 
     // Exactly 1 ScheduledJob for the commitment
     const jobsInDb = await prisma.scheduledJob.findMany({
