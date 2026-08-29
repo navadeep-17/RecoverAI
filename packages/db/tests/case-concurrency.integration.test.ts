@@ -101,6 +101,36 @@ describe("Case Concurrent Creation & Unique Incident Key Invariants", () => {
     expect(dbCases[0].id).toBe(firstCaseId);
   });
 
+  it('handles 5 concurrent getOrCreateCustomer calls with identical externalCustomerId idempotently', async () => {
+    if (!dbAvailable) return;
+
+    const externalCustomerId = `cust_5way_${Date.now()}`;
+    const email = `cust_5way_${Date.now()}@example.com`;
+
+    const customerPromises = Array.from({ length: 5 }, () =>
+      customerRepo.getOrCreateCustomer(merchantAId, {
+        externalCustomerId,
+        email,
+        name: '5-Way Concurrent Customer',
+        contactConsent: true,
+      }),
+    );
+
+    const customers = await Promise.all(customerPromises);
+
+    // All return the exact same customer ID
+    const firstCustomerId = customers[0].id;
+    expect(firstCustomerId).toBeDefined();
+    expect(customers.every((c) => c.id === firstCustomerId)).toBe(true);
+
+    // Exactly ONE Customer record exists in PostgreSQL
+    const dbCustomers = await prisma.customer.findMany({
+      where: { merchantId: merchantAId, externalCustomerId },
+    });
+    expect(dbCustomers.length).toBe(1);
+    expect(dbCustomers[0].id).toBe(firstCustomerId);
+  });
+
   it('proves RiskDetector handles simultaneous detection of the same payment incident concurrency-safely', async () => {
     if (!dbAvailable) return;
 

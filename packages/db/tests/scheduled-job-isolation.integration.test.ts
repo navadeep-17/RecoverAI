@@ -72,7 +72,10 @@ describe('ScheduledJob Tenant Isolation & Lifecycle Integration Tests', () => {
     const fetchedB = await scheduledJobRepo.getJobById(merchantBId, jobA.id);
     expect(fetchedB).toBeNull();
 
-    // Listing jobs is tenant-scoped
+    // Transition to SCHEDULED (simulating successful pg-boss dispatch)
+    await scheduledJobRepo.updateJobStatus(merchantAId, jobA.id, 'SCHEDULED', 'pg_boss_uuid_001');
+
+    // Listing scheduled jobs is tenant-scoped
     const listA = await scheduledJobRepo.listScheduledJobs(merchantAId);
     expect(listA.some((j) => j.id === jobA.id)).toBe(true);
 

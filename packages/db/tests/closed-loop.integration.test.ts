@@ -207,10 +207,11 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       },
     };
 
-    const persistedMethodRecord = await eventRepo.recordEvent(merchantId, {
+    const methodResult = await eventRepo.recordMerchantEvent(merchantId, {
       source: MerchantEventSource.MERCHANT,
-      eventType: NormalizedEventType.PAYMENT_METHOD_UPDATED,
+      type: NormalizedEventType.PAYMENT_METHOD_UPDATED,
       externalEventId: `ext_method_${paymentId}`,
+      dedupeKey: `method_updated:${merchantId}:${paymentId}`,
       payloadJson: methodUpdatedEvent,
       occurredAt: new Date(),
     });
@@ -228,7 +229,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       shouldEscalate: false,
     });
 
-    const observationResult = await observer.observeMerchantEvent(methodUpdatedEvent, persistedMethodRecord.id);
+    const observationResult = await observer.observeMerchantEvent(methodUpdatedEvent, methodResult.event.id);
 
     expect(observationResult.observed).toBe(true);
     expect(observationResult.replanTriggered).toBe(true);
@@ -253,15 +254,16 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       },
     };
 
-    const persistedSuccessRecord = await eventRepo.recordEvent(merchantId, {
+    const succResult = await eventRepo.recordMerchantEvent(merchantId, {
       source: MerchantEventSource.RAZORPAY,
-      eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+      type: NormalizedEventType.PAYMENT_SUCCEEDED,
       externalEventId: `ext_succ_${paymentId}`,
+      dedupeKey: `pay_succ:${merchantId}:${paymentId}`,
       payloadJson: successEvent,
       occurredAt: new Date(),
     });
 
-    const successObsResult = await observer.observeMerchantEvent(successEvent, persistedSuccessRecord.id);
+    const successObsResult = await observer.observeMerchantEvent(successEvent, succResult.event.id);
 
     expect(successObsResult.observed).toBe(true);
     expect(successObsResult.caseResolved).toBe(true);
@@ -282,8 +284,16 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   it('FLOW B: ₹8,499 Checkout Abandonment -> SEND_CHECKOUT_RECOVERY -> CHECKOUT_COMPLETED -> RECOVERED', async () => {
     if (!dbAvailable) return;
 
+    const customer = await customerRepo.getOrCreateCustomer(merchantId, {
+      name: 'Flow B Customer',
+      email: `flow_b_${Date.now()}@example.com`,
+      phone: '+919876543210',
+      contactConsent: true,
+    });
+
     const checkoutSessionId = `cs_${Date.now()}`;
     const testCase = await caseRepo.createCase(merchantId, {
+      customerId: customer.id,
       riskType: RiskType.CHECKOUT_ABANDONMENT,
       amountAtRisk: '8499.00',
       currency: 'INR',
@@ -323,15 +333,16 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       },
     };
 
-    const persistedCheckoutRecord = await eventRepo.recordEvent(merchantId, {
+    const chkResult = await eventRepo.recordMerchantEvent(merchantId, {
       source: MerchantEventSource.MERCHANT,
-      eventType: NormalizedEventType.CHECKOUT_COMPLETED,
+      type: NormalizedEventType.CHECKOUT_COMPLETED,
       externalEventId: `ext_chk_${checkoutSessionId}`,
+      dedupeKey: `checkout_completed:${merchantId}:${checkoutSessionId}`,
       payloadJson: checkoutCompletedEvent,
       occurredAt: new Date(),
     });
 
-    const obsResult = await observer.observeMerchantEvent(checkoutCompletedEvent, persistedCheckoutRecord.id);
+    const obsResult = await observer.observeMerchantEvent(checkoutCompletedEvent, chkResult.event.id);
 
     expect(obsResult.observed).toBe(true);
     expect(obsResult.caseResolved).toBe(true);
@@ -348,6 +359,12 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   it('FLOW C: ₹85,000 Overdue Receivable -> REMINDER -> PROMISE_TO_PAY -> BROKEN -> NEEDS_REVIEW', async () => {
     if (!dbAvailable) return;
 
+    const customer = await customerRepo.getOrCreateCustomer(merchantId, {
+      name: 'Flow C Customer',
+      email: `flow_c_${Date.now()}@example.com`,
+      contactConsent: true,
+    });
+
     // Configure policyConfig with highValueThreshold = 100,000 so the initial reminder is authorized
     await prisma.policyConfig.upsert({
       where: { merchantId },
@@ -362,6 +379,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
 
     const invoiceId = `inv_${Date.now()}`;
     const testCase = await caseRepo.createCase(merchantId, {
+      customerId: customer.id,
       riskType: RiskType.OVERDUE_RECEIVABLE,
       amountAtRisk: '85000.00',
       currency: 'INR',
@@ -474,21 +492,22 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       },
     };
 
-    const sharedEventRecord = await eventRepo.recordEvent(merchantId, {
+    const sharedEventResult = await eventRepo.recordMerchantEvent(merchantId, {
       source: MerchantEventSource.RAZORPAY,
-      eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+      type: NormalizedEventType.PAYMENT_SUCCEEDED,
       externalEventId: `ext_conc_${paymentId}`,
+      dedupeKey: `pay_succ_conc:${merchantId}:${paymentId}`,
       payloadJson: paymentEvent,
       occurredAt: new Date(),
     });
 
     // Concurrently observe the exact same payment event across 5 workers
     const results = await Promise.all([
-      observer.observeMerchantEvent(paymentEvent, sharedEventRecord.id),
-      observer.observeMerchantEvent(paymentEvent, sharedEventRecord.id),
-      observer.observeMerchantEvent(paymentEvent, sharedEventRecord.id),
-      observer.observeMerchantEvent(paymentEvent, sharedEventRecord.id),
-      observer.observeMerchantEvent(paymentEvent, sharedEventRecord.id),
+      observer.observeMerchantEvent(paymentEvent, sharedEventResult.event.id),
+      observer.observeMerchantEvent(paymentEvent, sharedEventResult.event.id),
+      observer.observeMerchantEvent(paymentEvent, sharedEventResult.event.id),
+      observer.observeMerchantEvent(paymentEvent, sharedEventResult.event.id),
+      observer.observeMerchantEvent(paymentEvent, sharedEventResult.event.id),
     ]);
 
     // Case is RECOVERED
@@ -700,6 +719,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   it('LEASE FENCING: Stale worker with expired lease cannot complete trigger reclaimed by newer worker', async () => {
     if (!dbAvailable) return;
 
+    const triggerRepo = new TriggerRepository();
     const paymentId = `pay_fencing_${Date.now()}`;
     const testCase = await caseRepo.createCase(merchantId, {
       riskType: RiskType.PAYMENT_FAILURE,

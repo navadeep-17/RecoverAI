@@ -26,16 +26,39 @@ export class CustomerRepository {
       }
     }
 
-    return prisma.customer.create({
-      data: {
-        merchantId,
-        externalCustomerId: data.externalCustomerId,
-        email: data.email,
-        phone: data.phone,
-        name: data.name,
-        contactConsent: data.contactConsent !== undefined ? data.contactConsent : null,
-      },
-    });
+    try {
+      return await prisma.customer.create({
+        data: {
+          merchantId,
+          externalCustomerId: data.externalCustomerId,
+          email: data.email,
+          phone: data.phone,
+          name: data.name,
+          contactConsent: data.contactConsent !== undefined ? data.contactConsent : null,
+        },
+      });
+    } catch (err: unknown) {
+      if (
+        data.externalCustomerId &&
+        err &&
+        typeof err === 'object' &&
+        'code' in err &&
+        (err as { code: string }).code === 'P2002'
+      ) {
+        const existing = await prisma.customer.findUnique({
+          where: {
+            merchantId_externalCustomerId: {
+              merchantId,
+              externalCustomerId: data.externalCustomerId,
+            },
+          },
+        });
+        if (existing) {
+          return existing;
+        }
+      }
+      throw err;
+    }
   }
 
   async updateContactTimestamp(merchantId: string, customerId: string, timestamp = new Date()): Promise<Customer> {

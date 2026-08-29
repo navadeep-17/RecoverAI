@@ -336,7 +336,7 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
     });
     expect(commitments.length).toBe(1);
     expect(commitments[0].status).toBe('PENDING');
-    expect(commitments[0].promisedAmount.toString()).toBe('8000.00');
+    expect(new prisma.Prisma.Decimal(commitments[0].promisedAmount).equals(new prisma.Prisma.Decimal('8000.00'))).toBe(true);
     expect(commitments[0].extractedFromText).toBe('Customer agreed to pay by 15th September');
 
     // executionMetadata references the commitmentId
