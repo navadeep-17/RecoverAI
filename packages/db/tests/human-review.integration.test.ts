@@ -227,6 +227,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         confidence: 0.85,
         llmPrompt: 'test prompt',
         llmResponse: 'test response',
+        reasoningSummary: 'Verified case facts support payment-link recovery; human review required before execution.',
       },
     });
 
@@ -323,6 +324,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         version: 2,
         diagnosisCode: 'HARD_DECLINE',
         diagnosisSummary: 'Card expired',
+        reasoningSummary: 'Version 2 plan requires elevated review due to card expiration.',
         proposedActionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE,
         proposedActionParams: {},
         confidence: 0.9,
@@ -414,7 +416,8 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(authResult.action?.status).toBe(ActionExecutionStatus.PENDING);
 
     // RACE CONDITION OCCURS: Customer opts out in DB before ActionExecutor.executeAction executes
-    await customerRepo.updateConsent(merchantAId, customer.id, false, true);
+    await customerRepo.setOptOut(merchantAId, customer.id, true);
+    await customerRepo.setContactConsent(merchantAId, customer.id, false);
 
     // ActionExecutor claims and runs fresh policy revalidation
     const executionResult = await actionExecutor.executeAction(merchantAId, authResult.action!.id, {
@@ -460,6 +463,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         version: 2,
         diagnosisCode: 'HARD_DECLINE',
         diagnosisSummary: 'Card expired',
+        reasoningSummary: 'Stale version 2 plan for card expiration, requiring fresh review before execution.',
         proposedActionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE,
         proposedActionParams: {},
         confidence: 0.9,
