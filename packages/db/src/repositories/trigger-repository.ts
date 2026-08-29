@@ -6,26 +6,42 @@ export interface ClaimTriggerResult {
   trigger: RecoveryIterationTrigger;
 }
 
+export interface ClaimTriggerOptions {
+  leaseDurationMs?: number;
+  maxAttempts?: number;
+  now?: Date;
+}
+
 export class TriggerRepository {
   /**
-   * Atomically claims an orchestration iteration trigger for a given (merchantId, caseId, triggerKey).
+   * Atomically claims or reclaims an orchestration iteration trigger for a given (merchantId, caseId, triggerKey).
    *
-   * Invariants:
+   * Invariants & Rules:
    * - Strict tenant ownership (caseId belongs to merchantId).
-   * - Atomic: Uses unique index [merchantId, caseId, triggerKey].
-   * - If already claimed (P2002 error), re-reads the existing trigger and returns claimed: false.
-   * - Winner returns claimed: true.
+   * - Initial Claim: Uses unique constraint [merchantId, caseId, triggerKey].
+   * - COMPLETED: Duplicate event -> NEVER rerun -> returns claimed: false.
+   * - CLAIMED with unexpired lease: Owned by another worker -> returns claimed: false.
+   * - CLAIMED with expired lease: Atomically reclaimed via DB CAS (updateMany with leaseExpiresAt <= now) -> increment attemptCount -> returns claimed: true.
+   * - FAILED with attemptCount < maxAttempts: Atomically reclaimed via DB CAS (updateMany with status = 'FAILED') -> increment attemptCount -> returns claimed: true.
+   * - Concurrent Reclaim: Exactly one worker wins the DB CAS update; other workers return claimed: false.
+   * - No in-memory locks.
    */
   async claimTrigger(
     merchantId: string,
     caseId: string,
     triggerKey: string,
     triggerType: string,
+    options?: ClaimTriggerOptions,
   ): Promise<ClaimTriggerResult> {
     // Assert tenant ownership of parent case
     await prisma.revenueRiskCase.findFirstOrThrow({
       where: { id: caseId, merchantId },
     });
+
+    const now = options?.now || new Date();
+    const leaseDurationMs = options?.leaseDurationMs ?? 300_000; // 5 minutes default
+    const maxAttempts = options?.maxAttempts ?? 3;
+    const leaseExpiresAt = new Date(now.getTime() + leaseDurationMs);
 
     try {
       const trigger = await prisma.recoveryIterationTrigger.create({
@@ -35,6 +51,9 @@ export class TriggerRepository {
           triggerKey,
           triggerType,
           status: 'CLAIMED',
+          attemptCount: 1,
+          claimedAt: now,
+          leaseExpiresAt,
         },
       });
       return { claimed: true, trigger };
@@ -54,7 +73,52 @@ export class TriggerRepository {
             },
           },
         });
-        return { claimed: false, trigger: existing };
+
+        // 1. COMPLETED: duplicate event, never rerun
+        if (existing.status === 'COMPLETED') {
+          return { claimed: false, trigger: existing };
+        }
+
+        // 2. CLAIMED with unexpired lease: another active worker owns it
+        if (existing.status === 'CLAIMED' && existing.leaseExpiresAt.getTime() > now.getTime()) {
+          return { claimed: false, trigger: existing };
+        }
+
+        // 3. CLAIMED with expired lease OR FAILED with attemptCount < maxAttempts
+        const isExpiredClaim = existing.status === 'CLAIMED' && existing.leaseExpiresAt.getTime() <= now.getTime();
+        const isRetryableFailure = existing.status === 'FAILED' && existing.attemptCount < maxAttempts;
+
+        if (isExpiredClaim || isRetryableFailure) {
+          // Atomic database CAS reclaim
+          const updateResult = await prisma.recoveryIterationTrigger.updateMany({
+            where: {
+              id: existing.id,
+              merchantId,
+              caseId,
+              status: existing.status,
+              ...(existing.status === 'CLAIMED' ? { leaseExpiresAt: { lte: now } } : {}),
+            },
+            data: {
+              status: 'CLAIMED',
+              attemptCount: { increment: 1 },
+              claimedAt: now,
+              leaseExpiresAt,
+            },
+          });
+
+          if (updateResult.count > 0) {
+            const reloaded = await prisma.recoveryIterationTrigger.findUniqueOrThrow({
+              where: { id: existing.id },
+            });
+            return { claimed: true, trigger: reloaded };
+          }
+        }
+
+        // CAS lost or not reclaimable: return current state
+        const fresh = await prisma.recoveryIterationTrigger.findUniqueOrThrow({
+          where: { id: existing.id },
+        });
+        return { claimed: false, trigger: fresh };
       }
       throw err;
     }

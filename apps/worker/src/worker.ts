@@ -8,7 +8,7 @@ import {
   EventRepository,
   ScheduledJobRepository,
 } from '@recoverai/db';
-import { RiskDetector } from '@recoverai/core';
+import { RiskDetector, OutcomeObserver } from '@recoverai/core';
 import { PgBossJobScheduler } from './scheduler.js';
 
 export interface RecoveryWorkerConfig {
@@ -21,6 +21,7 @@ export interface RecoveryWorkerConfig {
   auditRepo?: AuditRepository;
   eventRepo?: EventRepository;
   scheduledJobRepo?: ScheduledJobRepository;
+  outcomeObserver?: OutcomeObserver;
 }
 
 export class RecoveryWorkerService {
@@ -29,10 +30,14 @@ export class RecoveryWorkerService {
   private isRunning = false;
   private scheduler: PgBossJobScheduler | null = null;
   private riskDetector: RiskDetector | null = null;
+  private outcomeObserver: OutcomeObserver | null = null;
 
   constructor(private config?: RecoveryWorkerConfig) {
     if (config?.bossInstance) {
       this.boss = config.bossInstance;
+    }
+    if (config?.outcomeObserver) {
+      this.outcomeObserver = config.outcomeObserver;
     }
   }
 
@@ -88,7 +93,7 @@ export class RecoveryWorkerService {
   }
 
   private async registerJobHandlers(scheduledJobRepo: ScheduledJobRepository): Promise<void> {
-    if (!this.boss || !this.riskDetector) return;
+    if (!this.boss) return;
 
     // 1. Checkout Abandonment Recheck
     await this.boss.work('CHECKOUT_ABANDONMENT_CHECK', async (job) => {
@@ -127,6 +132,57 @@ export class RecoveryWorkerService {
         await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
       }
     });
+
+    // 3. Promise to Pay Check
+    await this.boss.work('PROMISE_TO_PAY_CHECK', async (job) => {
+      const data = job.data as {
+        merchantId: string;
+        caseId: string;
+        jobRecordId?: string;
+        commitmentId?: string;
+        [key: string]: unknown;
+      };
+      this.logger.info({ msg: 'Processing PROMISE_TO_PAY_CHECK', data });
+
+      if (this.outcomeObserver && data.jobRecordId) {
+        await this.outcomeObserver.observeTimerFired({
+          merchantId: data.merchantId,
+          caseId: data.caseId,
+          scheduledJobId: data.jobRecordId,
+          timerType: 'PROMISE_TO_PAY_CHECK',
+          payload: data,
+        });
+      }
+
+      if (data.jobRecordId) {
+        await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+      }
+    });
+
+    // 4. Recovery Follow-up Check
+    await this.boss.work('RECOVERY_FOLLOWUP_CHECK', async (job) => {
+      const data = job.data as {
+        merchantId: string;
+        caseId: string;
+        jobRecordId?: string;
+        [key: string]: unknown;
+      };
+      this.logger.info({ msg: 'Processing RECOVERY_FOLLOWUP_CHECK', data });
+
+      if (this.outcomeObserver && data.jobRecordId) {
+        await this.outcomeObserver.observeTimerFired({
+          merchantId: data.merchantId,
+          caseId: data.caseId,
+          scheduledJobId: data.jobRecordId,
+          timerType: 'RECOVERY_FOLLOWUP_CHECK',
+          payload: data,
+        });
+      }
+
+      if (data.jobRecordId) {
+        await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+      }
+    });
   }
 
   async stop(): Promise<void> {
@@ -154,5 +210,9 @@ export class RecoveryWorkerService {
 
   getRiskDetector(): RiskDetector | null {
     return this.riskDetector;
+  }
+
+  getOutcomeObserver(): OutcomeObserver | null {
+    return this.outcomeObserver;
   }
 }

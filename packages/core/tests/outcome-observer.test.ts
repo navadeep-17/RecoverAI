@@ -425,12 +425,12 @@ describe('OutcomeObserver Unit Tests', () => {
     });
 
     it('PROMISE_TO_PAY_CHECK timer on unpaid case marks commitment BROKEN and wakes orchestrator', async () => {
-      // Create pending commitment
+      // Create pending commitment whose promisedDate has passed relative to test clock (2026-08-28T14:00:00+05:30)
       inMemoryCommitments.set('cmt_01', {
         id: 'cmt_01',
         caseId,
         promisedAmount: '14999.00',
-        promisedDate: new Date(Date.now() - 3600000), // passed
+        promisedDate: new Date('2026-08-28T12:00:00+05:30'), // passed
         status: 'PENDING',
       });
 
@@ -458,12 +458,35 @@ describe('OutcomeObserver Unit Tests', () => {
       );
     });
 
+    it('early timer delivery is rejected without breaking commitment', async () => {
+      // Commitment date is in the FUTURE relative to test clock (2026-08-28T14:00:00+05:30)
+      inMemoryCommitments.set('cmt_early', {
+        id: 'cmt_early',
+        caseId,
+        promisedAmount: '14999.00',
+        promisedDate: new Date('2026-08-28T18:00:00+05:30'), // future
+        status: 'PENDING',
+      });
+
+      const result = await observer.observeTimerFired({
+        merchantId,
+        caseId,
+        scheduledJobId: 'job_timer_early',
+        timerType: 'PROMISE_TO_PAY_CHECK',
+        payload: { commitmentId: 'cmt_early' },
+      });
+
+      expect(result.observed).toBe(false);
+      expect(result.reason).toContain('Early timer rejected');
+      expect(mockCommitmentRepo.updateCommitmentStatus).not.toHaveBeenCalled();
+    });
+
     it('repeated timer delivery with same scheduledJobId is deduplicated', async () => {
       inMemoryCommitments.set('cmt_02', {
         id: 'cmt_02',
         caseId,
         promisedAmount: '14999.00',
-        promisedDate: new Date(Date.now() - 3600000),
+        promisedDate: new Date('2026-08-28T12:00:00+05:30'),
         status: 'PENDING',
       });
 
@@ -487,6 +510,58 @@ describe('OutcomeObserver Unit Tests', () => {
       expect(second.deduplicated).toBe(true);
       // updateCommitmentStatus called only once
       expect(mockCommitmentRepo.updateCommitmentStatus).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects observation when authoritative identity is missing to prevent undefined dedupeKey', async () => {
+      // Event correlates to case via paymentId but has no eventId, merchantEventId, or externalEventId
+      const invalidEvent: any = {
+        merchantId,
+        source: MerchantEventSource.RAZORPAY,
+        eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
+        occurredAt: new Date(),
+        amount: '14999.00',
+        currency: 'INR',
+        payment: { paymentId: 'pay_123456' },
+      };
+
+      await expect(observer.observeMerchantEvent(invalidEvent)).rejects.toThrow(
+        'Cannot observe merchant event without an authoritative event identifier',
+      );
+
+      // Customer reply without messageId
+      await expect(
+        observer.observeCustomerReply({
+          merchantId,
+          caseId,
+          messageId: '' as any,
+          replyText: 'hello',
+        }),
+      ).rejects.toThrow('Cannot observe customer reply without authoritative messageId');
+
+      // Timer without scheduledJobId
+      await expect(
+        observer.observeTimerFired({
+          merchantId,
+          caseId,
+          scheduledJobId: '' as any,
+          timerType: 'PROMISE_TO_PAY_CHECK',
+        }),
+      ).rejects.toThrow('Cannot observe timer fired without authoritative scheduledJobId');
+    });
+
+    it('routes to NEEDS_REVIEW if job scheduler throws during promise-to-pay recording', async () => {
+      mockJobScheduler.schedule.mockRejectedValueOnce(new Error('Redis connection down'));
+
+      const result = await observer.observeCustomerReply({
+        merchantId,
+        caseId,
+        messageId: 'msg_fail_sched_01',
+        replyText: 'I will pay INR 14999 on 2026-08-30',
+      });
+
+      expect(result.observed).toBe(true);
+      expect(result.caseStatus).toBe(CaseStatus.NEEDS_REVIEW);
+      expect(inMemoryAudits.some((a) => a.eventType === 'SCHEDULING_FAILED')).toBe(true);
     });
   });
 });

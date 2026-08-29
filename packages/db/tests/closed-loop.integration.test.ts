@@ -127,6 +127,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
         commitmentRepo,
         eventRepo,
         auditRepo,
+        scheduledJobRepo,
         jobScheduler,
         orchestrator,
         clock: () => new Date('2026-08-28T14:00:00+05:30'),
@@ -510,5 +511,140 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       where: { caseId: testCase.id },
     });
     expect(plansInDb.length).toBe(1);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('CRASH RECOVERY: Trigger with expired lease is atomically reclaimed via DB CAS with attemptCount incremented', async () => {
+    if (!dbAvailable) return;
+
+    const testCase = await caseRepo.createCase(merchantId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '4000.00',
+      currency: 'INR',
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_crash_${Date.now()}`,
+    });
+
+    const triggerRepo = new TriggerRepository();
+    const triggerKey = `replan_crash_${Date.now()}`;
+
+    // 1. Worker 1 claims trigger at T=0 with 1000ms lease
+    const t0 = new Date();
+    const claim1 = await triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', {
+      now: t0,
+      leaseDurationMs: 1000,
+    });
+    expect(claim1.claimed).toBe(true);
+    expect(claim1.trigger.status).toBe('CLAIMED');
+    expect(claim1.trigger.attemptCount).toBe(1);
+
+    // 2. Worker 2 attempts claim while lease is active (T=0) -> rejected
+    const claim2 = await triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', {
+      now: t0,
+    });
+    expect(claim2.claimed).toBe(false);
+
+    // 3. Lease expires at T + 2000ms. 5 concurrent workers attempt reclaim
+    const tExpired = new Date(t0.getTime() + 2000);
+    const concurrentReclaims = await Promise.all([
+      triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', { now: tExpired, leaseDurationMs: 5000 }),
+      triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', { now: tExpired, leaseDurationMs: 5000 }),
+      triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', { now: tExpired, leaseDurationMs: 5000 }),
+      triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', { now: tExpired, leaseDurationMs: 5000 }),
+      triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', { now: tExpired, leaseDurationMs: 5000 }),
+    ]);
+
+    // Exactly 1 winner won the lease via CAS updateMany
+    const winners = concurrentReclaims.filter((c) => c.claimed);
+    const losers = concurrentReclaims.filter((c) => !c.claimed);
+    expect(winners.length).toBe(1);
+    expect(losers.length).toBe(4);
+    expect(winners[0].trigger.attemptCount).toBe(2);
+
+    // 4. Winner completes trigger in database
+    await triggerRepo.completeTrigger(merchantId, testCase.id, winners[0].trigger.id, 'COMPLETED', {
+      success: true,
+    });
+
+    // 5. Completed trigger cannot be claimed or reclaimed
+    const finalClaim = await triggerRepo.claimTrigger(merchantId, testCase.id, triggerKey, 'REPLAN_TRIGGERED', {
+      now: new Date(tExpired.getTime() + 10000),
+    });
+    expect(finalClaim.claimed).toBe(false);
+    expect(finalClaim.trigger.status).toBe('COMPLETED');
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('AUTHORITATIVE TIMERS: OutcomeObserver enforces PostgreSQL ScheduledJob existence, tenant boundary, and non-early delivery', async () => {
+    if (!dbAvailable) return;
+
+    const testCase = await caseRepo.createCase(merchantId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '7500.00',
+      currency: 'INR',
+      incidentKey: `${merchantId}:PAYMENT_FAILURE:pay_timer_auth_${Date.now()}`,
+    });
+
+    const scheduledJobRepo = new ScheduledJobRepository();
+    const futureDate = new Date('2026-08-28T18:00:00+05:30'); // future relative to observer clock 14:00
+
+    // 1. Create commitment in DB
+    const commitment = await commitmentRepo.createCommitment(merchantId, testCase.id, {
+      promisedAmount: '7500.00',
+      promisedDate: futureDate,
+      status: 'PENDING',
+      extractedFromText: 'I will pay 7500 by 6pm',
+    });
+
+    // 2. Create authoritative ScheduledJob in DB
+    const job = await scheduledJobRepo.createJob(merchantId, {
+      caseId: testCase.id,
+      jobType: 'PROMISE_TO_PAY_CHECK',
+      scheduledFor: futureDate,
+      payloadJson: {
+        caseId: testCase.id,
+        commitmentId: commitment.id,
+      },
+    });
+
+    // 3. Early timer delivery (current time 14:00 < promisedDate 18:00) is rejected
+    const earlyResult = await observer.observeTimerFired({
+      merchantId,
+      caseId: testCase.id,
+      scheduledJobId: job.id,
+      timerType: 'PROMISE_TO_PAY_CHECK',
+      payload: { commitmentId: commitment.id },
+      occurredAt: new Date('2026-08-28T14:00:00+05:30'),
+    });
+    expect(earlyResult.observed).toBe(false);
+    expect(earlyResult.reason).toContain('Early timer rejected');
+
+    // Commitment in DB remains PENDING
+    const cmtStillPending = await commitmentRepo.getCommitmentById(merchantId, testCase.id, commitment.id);
+    expect(cmtStillPending?.status).toBe('PENDING');
+
+    // 4. Cross-tenant attempt is rejected
+    const crossTenantResult = await observer.observeTimerFired({
+      merchantId: 'mch_other_tenant',
+      caseId: testCase.id,
+      scheduledJobId: job.id,
+      timerType: 'PROMISE_TO_PAY_CHECK',
+      payload: { commitmentId: commitment.id },
+      occurredAt: new Date('2026-08-28T19:00:00+05:30'),
+    }).catch((err) => ({ observed: false, reason: err.message }));
+    expect(crossTenantResult.observed).toBe(false);
+
+    // 5. Legitimate on-time timer delivery (19:00 >= 18:00) marks commitment BROKEN
+    const legitimateResult = await observer.observeTimerFired({
+      merchantId,
+      caseId: testCase.id,
+      scheduledJobId: job.id,
+      timerType: 'PROMISE_TO_PAY_CHECK',
+      payload: { commitmentId: commitment.id },
+      occurredAt: new Date('2026-08-28T19:00:00+05:30'),
+    });
+    expect(legitimateResult.observed).toBe(true);
+
+    const cmtBroken = await commitmentRepo.getCommitmentById(merchantId, testCase.id, commitment.id);
+    expect(cmtBroken?.status).toBe('BROKEN');
   });
 });

@@ -13,7 +13,6 @@ import {
   MerchantRepository,
   PolicyConfigRepository,
   TriggerRepository,
-  ClaimTriggerResult,
   CaseWithRelations,
 } from '@recoverai/db';
 import { PolicyReasonCodes } from '@recoverai/shared';
@@ -42,7 +41,7 @@ export interface RecoveryOrchestratorOptions {
   recoveryAgent: RecoveryAgent;
   policyEngine: IPolicyEngine;
   actionExecutor: ActionExecutor;
-  triggerRepo?: TriggerRepository;
+  triggerRepo: TriggerRepository;
   jobScheduler?: IJobScheduler;
   clock?: () => Date;
 }
@@ -58,7 +57,7 @@ export class RecoveryOrchestrator {
   private recoveryAgent: RecoveryAgent;
   private policyEngine: IPolicyEngine;
   private actionExecutor: ActionExecutor;
-  private triggerRepo?: TriggerRepository;
+  private triggerRepo: TriggerRepository;
   private jobScheduler?: IJobScheduler;
   private clock?: () => Date;
 
@@ -97,39 +96,38 @@ export class RecoveryOrchestrator {
   ): Promise<OrchestrationIterationResult> {
     const currentTime = this.now();
 
-    // 0. Deduplicate trigger wake via DB-backed trigger claim
+    // 0. Deduplicate trigger wake via mandatory DB-backed trigger claim
     const triggerPayload: OrchestrationTriggerPayload =
       typeof trigger === 'string'
-        ? { triggerKey: `${trigger}:${caseId}`, triggerType: trigger }
+        ? {
+            triggerKey: trigger === 'CASE_OPENED' ? `CASE_OPENED:${caseId}` : `${trigger}:${caseId}`,
+            triggerType: trigger,
+          }
         : trigger;
 
-    let claimResult: ClaimTriggerResult | undefined;
-    if (this.triggerRepo) {
-      claimResult = await this.triggerRepo.claimTrigger(
-        merchantId,
+    const claimResult = await this.triggerRepo.claimTrigger(
+      merchantId,
+      caseId,
+      triggerPayload.triggerKey,
+      triggerPayload.triggerType,
+      { now: currentTime },
+    );
+    if (!claimResult.claimed) {
+      const existingCase = await this.caseRepo.getCaseById(merchantId, caseId);
+      return {
         caseId,
-        triggerPayload.triggerKey,
-        triggerPayload.triggerType,
-      );
-      if (!claimResult.claimed) {
-        const existingCase = await this.caseRepo.getCaseById(merchantId, caseId);
-        return {
-          caseId,
-          status: existingCase?.status || CaseStatus.OPEN,
-          iterationCompleted: false,
-          error: 'TRIGGER_ALREADY_CLAIMED',
-        };
-      }
+        status: existingCase?.status || CaseStatus.OPEN,
+        iterationCompleted: false,
+        error: 'TRIGGER_ALREADY_CLAIMED',
+      };
     }
 
     // 1. Load fresh case with relations from DB
     const caseRecord = await this.caseRepo.getCaseById(merchantId, caseId);
     if (!caseRecord) {
-      if (claimResult && this.triggerRepo) {
-        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
-          error: 'Case not found',
-        });
-      }
+      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
+        error: 'Case not found',
+      });
       throw new Error(`Case "${caseId}" not found for merchant "${merchantId}"`);
     }
 
@@ -149,11 +147,9 @@ export class RecoveryOrchestrator {
         inputSummaryJson: { reason: 'Merchant safety state unavailable; failing closed' },
         reasonCode: 'MERCHANT_SAFETY_STATE_UNAVAILABLE',
       });
-      if (claimResult && this.triggerRepo) {
-        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
-          error: 'Merchant safety state unavailable',
-        });
-      }
+      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
+        error: 'Merchant safety state unavailable',
+      });
       return {
         caseId,
         status: caseRecord.status,
@@ -173,11 +169,9 @@ export class RecoveryOrchestrator {
         inputSummaryJson: { trigger: triggerPayload.triggerType, reason: 'Merchant kill switch is active' },
         reasonCode: 'KILL_SWITCH_ACTIVE',
       });
-      if (claimResult && this.triggerRepo) {
-        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-          status: CaseStatus.STOPPED,
-        });
-      }
+      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+        status: CaseStatus.STOPPED,
+      });
       return {
         caseId,
         status: CaseStatus.STOPPED,
@@ -202,11 +196,9 @@ export class RecoveryOrchestrator {
           inputSummaryJson: { trigger: triggerPayload.triggerType, reason: eligibility.reason },
           reasonCode: 'CASE_STOPPED_BY_RULE',
         });
-        if (claimResult && this.triggerRepo) {
-          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-            status: CaseStatus.STOPPED,
-          });
-        }
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+          status: CaseStatus.STOPPED,
+        });
         return {
           caseId,
           status: CaseStatus.STOPPED,
@@ -226,11 +218,9 @@ export class RecoveryOrchestrator {
           inputSummaryJson: { trigger: triggerPayload.triggerType, reason: eligibility.reason },
           reasonCode: 'CASE_LIMITS_EXHAUSTED',
         });
-        if (claimResult && this.triggerRepo) {
-          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-            status: CaseStatus.EXHAUSTED,
-          });
-        }
+        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+          status: CaseStatus.EXHAUSTED,
+        });
         return {
           caseId,
           status: CaseStatus.EXHAUSTED,
@@ -239,11 +229,9 @@ export class RecoveryOrchestrator {
         };
       }
 
-      if (claimResult && this.triggerRepo) {
-        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-          status: caseRecord.status,
-        });
-      }
+      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+        status: caseRecord.status,
+      });
       return {
         caseId,
         status: caseRecord.status,
@@ -284,11 +272,9 @@ export class RecoveryOrchestrator {
         inputSummaryJson: { reason: 'No legal actions remain compatible with case status and limits' },
         reasonCode: 'NO_ALLOWED_ACTIONS_REMAIN',
       });
-      if (claimResult && this.triggerRepo) {
-        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-          status: CaseStatus.EXHAUSTED,
-        });
-      }
+      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+        status: CaseStatus.EXHAUSTED,
+      });
       return {
         caseId,
         status: CaseStatus.EXHAUSTED,
@@ -466,11 +452,9 @@ export class RecoveryOrchestrator {
         case PolicyReasonCodes.KILL_SWITCH_ACTIVE:
         case PolicyReasonCodes.CUSTOMER_OPTED_OUT: {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.STOPPED);
-          if (claimResult && this.triggerRepo) {
-            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-              status: CaseStatus.STOPPED,
-            });
-          }
+          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+            status: CaseStatus.STOPPED,
+          });
           return {
             caseId,
             status: CaseStatus.STOPPED,
@@ -482,11 +466,9 @@ export class RecoveryOrchestrator {
         }
 
         case PolicyReasonCodes.CASE_ALREADY_TERMINAL: {
-          if (claimResult && this.triggerRepo) {
-            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-              status: currentStatus,
-            });
-          }
+          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+            status: currentStatus,
+          });
           return {
             caseId,
             status: currentStatus,
@@ -501,11 +483,9 @@ export class RecoveryOrchestrator {
         case PolicyReasonCodes.REQUIRED_FACTS_MISSING:
         case PolicyReasonCodes.INCOMPATIBLE_ACTION_FOR_RISK: {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
-          if (claimResult && this.triggerRepo) {
-            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-              status: CaseStatus.NEEDS_REVIEW,
-            });
-          }
+          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+            status: CaseStatus.NEEDS_REVIEW,
+          });
           return {
             caseId,
             status: CaseStatus.NEEDS_REVIEW,
@@ -523,11 +503,9 @@ export class RecoveryOrchestrator {
         case PolicyReasonCodes.MAX_ACTIONS_EXCEEDED:
         case PolicyReasonCodes.EXPIRED_RECOVERY_WINDOW: {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.EXHAUSTED);
-          if (claimResult && this.triggerRepo) {
-            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-              status: CaseStatus.EXHAUSTED,
-            });
-          }
+          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+            status: CaseStatus.EXHAUSTED,
+          });
           return {
             caseId,
             status: CaseStatus.EXHAUSTED,
@@ -551,11 +529,9 @@ export class RecoveryOrchestrator {
                 payloadJson: { caseId, reason: 'COOLDOWN_ELAPSED' },
               });
               await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.WAITING);
-              if (claimResult && this.triggerRepo) {
-                await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-                  status: CaseStatus.WAITING,
-                });
-              }
+              await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+                status: CaseStatus.WAITING,
+              });
               return {
                 caseId,
                 status: CaseStatus.WAITING,
@@ -569,11 +545,9 @@ export class RecoveryOrchestrator {
             }
           }
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
-          if (claimResult && this.triggerRepo) {
-            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-              status: CaseStatus.NEEDS_REVIEW,
-            });
-          }
+          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+            status: CaseStatus.NEEDS_REVIEW,
+          });
           return {
             caseId,
             status: CaseStatus.NEEDS_REVIEW,
@@ -596,11 +570,9 @@ export class RecoveryOrchestrator {
                 payloadJson: { caseId, reason: 'QUIET_HOURS_ELAPSED' },
               });
               await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.WAITING);
-              if (claimResult && this.triggerRepo) {
-                await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-                  status: CaseStatus.WAITING,
-                });
-              }
+              await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+                status: CaseStatus.WAITING,
+              });
               return {
                 caseId,
                 status: CaseStatus.WAITING,
@@ -614,11 +586,9 @@ export class RecoveryOrchestrator {
             }
           }
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
-          if (claimResult && this.triggerRepo) {
-            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-              status: CaseStatus.NEEDS_REVIEW,
-            });
-          }
+          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+            status: CaseStatus.NEEDS_REVIEW,
+          });
           return {
             caseId,
             status: CaseStatus.NEEDS_REVIEW,
@@ -631,11 +601,9 @@ export class RecoveryOrchestrator {
 
         case PolicyReasonCodes.DUPLICATE_ACTION_IN_FLIGHT: {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.WAITING);
-          if (claimResult && this.triggerRepo) {
-            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-              status: CaseStatus.WAITING,
-            });
-          }
+          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+            status: CaseStatus.WAITING,
+          });
           return {
             caseId,
             status: CaseStatus.WAITING,
@@ -648,11 +616,9 @@ export class RecoveryOrchestrator {
 
         default: {
           await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
-          if (claimResult && this.triggerRepo) {
-            await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-              status: CaseStatus.NEEDS_REVIEW,
-            });
-          }
+          await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+            status: CaseStatus.NEEDS_REVIEW,
+          });
           return {
             caseId,
             status: CaseStatus.NEEDS_REVIEW,
@@ -678,11 +644,9 @@ export class RecoveryOrchestrator {
         },
         reasonCode: policyEvaluation.reasonCode,
       });
-      if (claimResult && this.triggerRepo) {
-        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-          status: CaseStatus.NEEDS_REVIEW,
-        });
-      }
+      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+        status: CaseStatus.NEEDS_REVIEW,
+      });
 
       return {
         caseId,
@@ -704,11 +668,9 @@ export class RecoveryOrchestrator {
     });
 
     if (!authResult.authorized || !authResult.action) {
-      if (claimResult && this.triggerRepo) {
-        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
-          error: authResult.reason,
-        });
-      }
+      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'FAILED', {
+        error: authResult.reason,
+      });
       return {
         caseId,
         status: currentStatus,
@@ -722,11 +684,9 @@ export class RecoveryOrchestrator {
     // If proposed action was STOP_RECOVERY and policy permitted it:
     if (proposal.proposedActionType === RecoveryActionType.STOP_RECOVERY) {
       const actionExecution = await this.actionExecutor.executeAction(merchantId, authResult.action.id);
-      if (claimResult && this.triggerRepo) {
-        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-          status: CaseStatus.STOPPED,
-        });
-      }
+      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+        status: CaseStatus.STOPPED,
+      });
       return {
         caseId,
         status: CaseStatus.STOPPED,
@@ -741,11 +701,9 @@ export class RecoveryOrchestrator {
     // If proposed action was ESCALATE_TO_HUMAN and policy permitted it:
     if (proposal.proposedActionType === RecoveryActionType.ESCALATE_TO_HUMAN) {
       const actionExecution = await this.actionExecutor.executeAction(merchantId, authResult.action.id);
-      if (claimResult && this.triggerRepo) {
-        await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-          status: CaseStatus.NEEDS_REVIEW,
-        });
-      }
+      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+        status: CaseStatus.NEEDS_REVIEW,
+      });
       return {
         caseId,
         status: CaseStatus.NEEDS_REVIEW,
@@ -830,11 +788,9 @@ export class RecoveryOrchestrator {
       }
     }
 
-    if (claimResult && this.triggerRepo) {
-      await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
-        status: finalStatus,
-      });
-    }
+    await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
+      status: finalStatus,
+    });
 
     return {
       caseId,

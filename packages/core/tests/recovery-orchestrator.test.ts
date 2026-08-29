@@ -25,6 +25,7 @@ describe('RecoveryOrchestrator Unit Tests', () => {
   let mockAuditRepo: any;
   let mockMerchantRepo: any;
   let mockCommitmentRepo: any;
+  let mockTriggerRepo: any;
   let mockJobScheduler: any;
   let policyEngine: PolicyEngine;
   let mockLLM: MockLLMProvider;
@@ -262,6 +263,57 @@ describe('RecoveryOrchestrator Unit Tests', () => {
       clock: () => new Date('2026-08-28T14:00:00+05:30'),
     });
 
+    let inMemoryTriggers = new Map<string, any>();
+    mockTriggerRepo = {
+      claimTrigger: vi.fn(async (mId: string, cId: string, triggerKey: string, triggerType: string, options?: any) => {
+        const key = `${mId}:${cId}:${triggerKey}`;
+        const existing = inMemoryTriggers.get(key);
+        const now = options?.now || new Date('2026-08-28T14:00:00+05:30');
+        const leaseExpiresAt = new Date(now.getTime() + (options?.leaseDurationMs ?? 300_000));
+        if (existing) {
+          if (existing.status === 'COMPLETED') {
+            return { claimed: false, trigger: existing };
+          }
+          if (existing.status === 'CLAIMED' && existing.leaseExpiresAt.getTime() > now.getTime()) {
+            return { claimed: false, trigger: existing };
+          }
+          // Expired or retryable: reclaim
+          existing.status = 'CLAIMED';
+          existing.attemptCount += 1;
+          existing.claimedAt = now;
+          existing.leaseExpiresAt = leaseExpiresAt;
+          return { claimed: true, trigger: existing };
+        }
+        const trigger = {
+          id: `trig_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          merchantId: mId,
+          caseId: cId,
+          triggerKey,
+          triggerType,
+          status: 'CLAIMED',
+          attemptCount: 1,
+          claimedAt: now,
+          leaseExpiresAt,
+        };
+        inMemoryTriggers.set(key, trigger);
+        return { claimed: true, trigger };
+      }),
+      completeTrigger: vi.fn(async (_mId: string, _cId: string, triggerId: string, status: string, resultJson?: any) => {
+        for (const t of inMemoryTriggers.values()) {
+          if (t.id === triggerId) {
+            t.status = status;
+            t.resultJson = resultJson;
+            t.completedAt = new Date();
+            return t;
+          }
+        }
+        return { id: triggerId, status, resultJson };
+      }),
+      findTrigger: vi.fn(async (mId: string, cId: string, triggerKey: string) => {
+        return inMemoryTriggers.get(`${mId}:${cId}:${triggerKey}`) || null;
+      }),
+    };
+
     orchestrator = new RecoveryOrchestrator({
       caseRepo: mockCaseRepo,
       actionRepo: mockActionRepo,
@@ -273,6 +325,7 @@ describe('RecoveryOrchestrator Unit Tests', () => {
       recoveryAgent,
       policyEngine,
       actionExecutor,
+      triggerRepo: mockTriggerRepo,
       jobScheduler: mockJobScheduler,
       clock: () => new Date('2026-08-28T14:00:00+05:30'),
     });
@@ -620,6 +673,52 @@ describe('RecoveryOrchestrator Unit Tests', () => {
       expect(first.iterationCompleted).toBe(true);
       expect(second.iterationCompleted).toBe(false);
       expect(second.error).toBe('TRIGGER_ALREADY_CLAIMED');
+    });
+
+    it('allows atomic crash recovery when trigger lease expires', async () => {
+      mockLLM.setMockResponse({
+        diagnosisCode: 'TEST_DIAG',
+        diagnosisSummary: 'Test diagnosis',
+        confidence: 0.9,
+        proposedActionType: RecoveryActionType.SCHEDULE_FOLLOWUP,
+        proposedActionParams: {},
+        reasoningSummary: 'Test follow-up',
+      });
+
+      // 1. Worker 1 claims trigger at T=0 with 1 minute lease
+      const t0 = new Date('2026-08-28T14:00:00Z');
+      const triggerKey = 'replan_crash_test';
+      const claim1 = await mockTriggerRepo.claimTrigger(merchantId, caseId, triggerKey, 'REPLAN_TRIGGERED', {
+        now: t0,
+        leaseDurationMs: 60_000,
+      });
+      expect(claim1.claimed).toBe(true);
+      expect(claim1.trigger.attemptCount).toBe(1);
+
+      // 2. Worker 2 attempts claim while lease is active (T = +30s) -> rejected
+      const t30s = new Date('2026-08-28T14:00:30Z');
+      const claim2 = await mockTriggerRepo.claimTrigger(merchantId, caseId, triggerKey, 'REPLAN_TRIGGERED', {
+        now: t30s,
+      });
+      expect(claim2.claimed).toBe(false);
+
+      // 3. Worker 1 crashed without completing; lease expires at T = +70s -> Worker 3 successfully reclaims!
+      const t70s = new Date('2026-08-28T14:01:10Z');
+      const claim3 = await mockTriggerRepo.claimTrigger(merchantId, caseId, triggerKey, 'REPLAN_TRIGGERED', {
+        now: t70s,
+        leaseDurationMs: 60_000,
+      });
+      expect(claim3.claimed).toBe(true);
+      expect(claim3.trigger.attemptCount).toBe(2);
+
+      // 4. Worker 3 completes the trigger
+      await mockTriggerRepo.completeTrigger(merchantId, caseId, claim3.trigger.id, 'COMPLETED');
+
+      // 5. COMPLETED trigger can never be reclaimed
+      const claim4 = await mockTriggerRepo.claimTrigger(merchantId, caseId, triggerKey, 'REPLAN_TRIGGERED', {
+        now: new Date('2026-08-28T14:05:00Z'),
+      });
+      expect(claim4.claimed).toBe(false);
     });
   });
 });

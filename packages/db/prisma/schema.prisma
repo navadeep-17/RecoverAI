@@ -275,18 +275,21 @@ model RecoveryOutcome {
 }
 
 model RecoveryIterationTrigger {
-  id          String          @id @default(uuid())
-  merchantId  String
-  caseId      String
-  triggerKey  String
-  triggerType String
-  status      String          @default("CLAIMED")
-  resultJson  Json?
-  createdAt   DateTime        @default(now())
-  completedAt DateTime?
+  id             String          @id @default(uuid())
+  merchantId     String
+  caseId         String
+  triggerKey     String
+  triggerType    String
+  status         String          @default("CLAIMED")
+  attemptCount   Int             @default(1)
+  claimedAt      DateTime        @default(now())
+  leaseExpiresAt DateTime        @default(now())
+  resultJson     Json?
+  createdAt      DateTime        @default(now())
+  completedAt    DateTime?
 
-  merchant    Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
-  case        RevenueRiskCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  merchant       Merchant        @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  case           RevenueRiskCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
 
   @@unique([merchantId, caseId, triggerKey])
   @@index([merchantId, caseId])
