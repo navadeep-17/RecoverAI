@@ -123,17 +123,7 @@ export class HumanReviewService {
     caseStatus: CaseStatus,
     reasonCode: string,
   ): Promise<void> {
-    const reason = `Case became ${caseStatus} while human-review gate reconciliation was in progress.`;
-    const closedCount = await this.humanReviewRepo.closeActiveReviewsForCase(merchantId, caseId, reason);
-    if (closedCount > 0) {
-      await this.auditRepo.record(merchantId, {
-        caseId,
-        eventType: 'REVIEW_STALE',
-        actorType: AuditActorType.SYSTEM,
-        inputSummaryJson: { caseStatus, closedReviewCount: closedCount },
-        reasonCode,
-      });
-    }
+    await this.reviewGate.reconcileTerminalCase(merchantId, caseId, caseStatus, reasonCode);
   }
 
   private async hasActiveHumanReviewGate(
