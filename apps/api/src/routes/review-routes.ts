@@ -9,9 +9,11 @@ export interface ReviewRoutesOptions {
   reviewService: HumanReviewService;
 }
 
-const safeParams = (value: unknown): Record<string, unknown> => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([key]) => !/(secret|token|password|credential|authorization|api.?key)/i.test(key)));
+const sensitiveKey = /(secret|token|password|credential|authorization|api.?key|access.?key|private.?key|client.?secret)/i;
+const safeParams = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(safeParams);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([key]) => !sensitiveKey.test(key)).map(([key, item]) => [key, safeParams(item)]));
 };
 const reviewDto = (review: any) => ({
   id: review.id, caseId: review.caseId, status: review.status, reviewKey: review.reviewKey,
