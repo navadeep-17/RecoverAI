@@ -113,7 +113,7 @@ describe('Human Review API Routes & AuthenticatedPrincipal Boundary', () => {
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.payload);
     expect(body.review.id).toBe(reviewAId);
-    expect(body.review.merchantId).toBe(merchantAId);
+    expect(body.review.merchantId).toBeUndefined();
   });
 
   it('Merchant B principal cannot read Merchant A review (returns 404)', async () => {

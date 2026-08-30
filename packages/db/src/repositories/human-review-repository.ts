@@ -134,7 +134,7 @@ export class HumanReviewRepository {
     return prisma.humanReview.findFirstOrThrow({
       where: { id: reviewId, merchantId },
       include: {
-        case: true,
+        case: { include: { customer: true } },
         planVersion: true,
         action: true,
         reviewer: true,
@@ -159,7 +159,7 @@ export class HumanReviewRepository {
         ...(filter?.caseId ? { caseId: filter.caseId } : {}),
       },
       include: {
-        case: true,
+        case: { include: { customer: true } },
         planVersion: true,
         action: true,
         reviewer: true,
@@ -186,7 +186,7 @@ export class HumanReviewRepository {
         status: ReviewStatus.PENDING,
       },
       include: {
-        case: true,
+        case: { include: { customer: true } },
         planVersion: true,
         action: true,
         reviewer: true,
@@ -205,7 +205,7 @@ export class HumanReviewRepository {
         status: ReviewStatus.TAKEN_OVER,
       },
       include: {
-        case: true,
+        case: { include: { customer: true } },
         planVersion: true,
         action: true,
         reviewer: true,

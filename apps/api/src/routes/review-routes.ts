@@ -9,6 +9,20 @@ export interface ReviewRoutesOptions {
   reviewService: HumanReviewService;
 }
 
+const safeParams = (value: unknown): Record<string, unknown> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([key]) => !/(secret|token|password|credential|authorization|api.?key)/i.test(key)));
+};
+const reviewDto = (review: any) => ({
+  id: review.id, caseId: review.caseId, status: review.status, reviewKey: review.reviewKey,
+  reasonForReview: review.reasonForReview, planVersionId: review.planVersionId, actionId: review.actionId,
+  createdAt: review.createdAt, resolvedAt: review.resolvedAt, reviewDecision: review.reviewDecision,
+  reviewNotes: review.reviewNotes, revalidatedPolicyDecision: review.revalidatedPolicyDecision,
+  case: review.case ? { id: review.case.id, status: review.case.status, riskType: review.case.riskType, amountAtRisk: review.case.amountAtRisk?.toString?.() ?? review.case.amountAtRisk, currency: review.case.currency, customer: review.case.customer ? { id: review.case.customer.id, name: review.case.customer.name, email: review.case.customer.email } : undefined } : undefined,
+  planVersion: review.planVersion ? { id: review.planVersion.id, version: review.planVersion.version, diagnosisSummary: review.planVersion.diagnosisSummary, confidence: review.planVersion.confidence, proposedActionType: review.planVersion.proposedActionType, proposedActionParams: safeParams(review.planVersion.proposedActionParams) } : undefined,
+  action: review.action ? { id: review.action.id, actionType: review.action.actionType, policyRationale: review.action.policyRationale, actionParams: safeParams(review.action.actionParams) } : undefined,
+});
+
 export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
   app: FastifyInstance,
   options: ReviewRoutesOptions,
@@ -26,7 +40,7 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
       const query = querySchema.parse(req.query);
 
       const reviews = await reviewService.listReviews(principal.merchantId, query);
-      return reply.status(200).send({ reviews });
+      return reply.status(200).send({ reviews: reviews.map(reviewDto) });
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       if (errorMessage.startsWith('UNAUTHORIZED')) {
@@ -49,7 +63,7 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
       const { reviewId } = paramsSchema.parse(req.params);
 
       const review = await reviewService.getReviewById(principal.merchantId, reviewId);
-      return reply.status(200).send({ review });
+      return reply.status(200).send({ review: reviewDto(review) });
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       if (errorMessage.startsWith('UNAUTHORIZED')) {
