@@ -111,6 +111,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         actionExecutor,
         clock: testClock,
       });
+      actionExecutor.setReviewGateRequester(reviewService);
 
       orchestrator = new RecoveryOrchestrator({
         caseRepo,
@@ -125,6 +126,7 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
         policyEngine,
         actionExecutor,
         triggerRepo,
+        reviewGateRequester: reviewService,
       });
 
       // Clean up previous test runs
@@ -259,6 +261,56 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     const audits = await auditRepo.listByCase(merchantAId, testCase.id);
     const reviewAudit = audits.find((a) => a.eventType === 'REVIEW_REQUESTED');
     expect(reviewAudit).toBeDefined();
+  });
+
+  it('Scenario A1: ₹85,000 overdue case routes through orchestrator review, then exact approval dispatches once', async () => {
+    if (!dbAvailable) return;
+
+    await prisma.policyConfig.update({
+      where: { merchantId: merchantAId },
+      data: { highValueThreshold: '50000.00', reviewFirstMode: false },
+    });
+    const customer = await customerRepo.getOrCreateCustomer(merchantAId, {
+      externalCustomerId: `high-value-${Date.now()}`,
+      name: 'High Value Customer',
+      email: `high-value-${Date.now()}@example.com`,
+      contactConsent: true,
+    });
+    const testCase = await caseRepo.createCase(merchantAId, {
+      customerId: customer.id,
+      riskType: RiskType.OVERDUE_RECEIVABLE,
+      amountAtRisk: '85000.00',
+      currency: 'INR',
+      incidentKey: `high-value-overdue-${Date.now()}`,
+      contextJson: { invoiceId: `inv_${Date.now()}` },
+    });
+    mockLLM.setMockResponse({
+      diagnosisCode: 'OVERDUE_RECEIVABLE',
+      diagnosisSummary: 'Invoice remains unpaid.',
+      confidence: 0.9,
+      proposedActionType: RecoveryActionType.SEND_RECEIVABLE_REMINDER,
+      proposedActionParams: { channel: 'EMAIL' },
+      reasoningSummary: 'Send a compliant payment reminder.',
+      shouldStop: false,
+      shouldEscalate: false,
+    });
+
+    const iteration = await orchestrator.runIteration(merchantAId, testCase.id, 'CASE_OPENED');
+    expect(iteration.status).toBe(CaseStatus.NEEDS_REVIEW);
+    const storedCase = await caseRepo.getCaseById(merchantAId, testCase.id);
+    const review = await reviewRepo.findPendingReviewForCase(merchantAId, testCase.id);
+    expect(storedCase?.status).toBe(CaseStatus.NEEDS_REVIEW);
+    expect(review).toMatchObject({ merchantId: merchantAId, caseId: testCase.id, status: ReviewStatus.PENDING });
+    expect(review?.planVersionId).toBe(iteration.planVersion?.id);
+
+    const approval = await reviewService.approveReview(merchantAId, review!.id, userReviewerAId, {
+      notes: 'Exact high-value proposal reviewed.',
+    });
+    expect(approval.approved).toBe(true);
+    expect(approval.action?.actionType).toBe(RecoveryActionType.SEND_RECEIVABLE_REMINDER);
+    expect(approval.action?.actionParams).toEqual({ channel: 'EMAIL' });
+    expect(simulatedProvider.dispatchedCalls).toHaveLength(1);
+    expect(await reviewRepo.findPendingReviewForCase(merchantAId, testCase.id)).toBeNull();
   });
 
   // A2. 5-Way Concurrent DB Creation Proof
@@ -542,6 +594,26 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(blockedAudit?.reasonCode).toBe('CUSTOMER_OPTED_OUT');
   });
 
+  it('Scenario C2: merchant kill switch enabled after review creation blocks approval with zero provider calls', async () => {
+    if (!dbAvailable) return;
+
+    const { testCase, planVersion } = await createTestCase(merchantAId);
+    const req = await reviewService.requestReview(merchantAId, testCase.id, {
+      planVersionId: planVersion.id,
+      reasonForReview: 'Kill-switch race test',
+    });
+    await merchantRepo.setKillSwitch(merchantAId, true);
+    try {
+      const approval = await reviewService.approveReview(merchantAId, req.review!.id, userReviewerAId);
+      expect(approval.approved).toBe(false);
+      expect(approval.blockedByPolicy).toBe(true);
+      expect(approval.policyReasonCode).toBe('KILL_SWITCH_ACTIVE');
+      expect(simulatedProvider.dispatchedCalls).toHaveLength(0);
+    } finally {
+      await merchantRepo.setKillSwitch(merchantAId, false);
+    }
+  });
+
   // D. Stale Proposal Rejection
   it('Scenario D: Case replanned to version 2 -> human attempts to approve review for v1 -> fails safely with zero execution and REVIEW_STALE audit', async () => {
     if (!dbAvailable) return;
@@ -567,7 +639,6 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     });
 
     const approval = await reviewService.approveReview(merchantAId, req.review!.id, userReviewerAId);
-
     expect(approval.approved).toBe(false);
     expect(approval.stale).toBe(true);
 
@@ -594,11 +665,15 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
 
     // External recovery occurs
     await caseRepo.compareAndSetStatus(merchantAId, testCase.id, CaseStatus.NEEDS_REVIEW, CaseStatus.RECOVERED);
+    await reviewService.reconcileTerminalCase(merchantAId, testCase.id, CaseStatus.RECOVERED);
+    await reviewService.reconcileTerminalCase(merchantAId, testCase.id, CaseStatus.RECOVERED);
 
-    const approval = await reviewService.approveReview(merchantAId, req.review!.id, userReviewerAId);
+    const reconciledReview = await reviewRepo.getReviewById(merchantAId, req.review!.id);
+    expect(reconciledReview?.status).toBe(ReviewStatus.CLOSED);
 
-    expect(approval.approved).toBe(false);
-    expect(approval.stale).toBe(true);
+    await expect(
+      reviewService.approveReview(merchantAId, req.review!.id, userReviewerAId),
+    ).rejects.toThrow(ReviewStateConflictError);
 
     const actions = await prisma.recoveryAction.findMany({
       where: { caseId: testCase.id, case: { merchantId: merchantAId } },

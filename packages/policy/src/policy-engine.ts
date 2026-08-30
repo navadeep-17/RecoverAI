@@ -113,17 +113,20 @@ export class PolicyEngine implements IPolicyEngine {
       };
     }
 
-    // 2. Evaluate REVIEW Rules in deterministic order
-    for (const rule of this.reviewRules) {
-      const result = rule.evaluate(context, evaluatedFacts);
-      if (result && result.decision === PolicyDecision.REVIEW) {
-        return {
-          decision: PolicyDecision.REVIEW,
-          reasonCode: result.reasonCode,
-          rationale: result.rationale,
-          evaluatedFacts,
-          evaluatedAt,
-        };
+    // 2. A valid HumanReview approval satisfies only the review-routing gate for
+    // its exact bound proposal. All hard DENY rules above still execute fresh.
+    if (context.executionSource !== 'HUMAN_REVIEW_APPROVAL') {
+      for (const rule of this.reviewRules) {
+        const result = rule.evaluate(context, evaluatedFacts);
+        if (result && result.decision === PolicyDecision.REVIEW) {
+          return {
+            decision: PolicyDecision.REVIEW,
+            reasonCode: result.reasonCode,
+            rationale: result.rationale,
+            evaluatedFacts,
+            evaluatedAt,
+          };
+        }
       }
     }
 

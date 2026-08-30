@@ -224,6 +224,19 @@ export class HumanReviewService {
     return this.humanReviewRepo.listReviews(merchantId, filter);
   }
 
+  /** Reuses the canonical Phase-6 stale-gate reconciliation for external terminal transitions. */
+  async reconcileTerminalCase(merchantId: string, caseId: string, caseStatus: CaseStatus): Promise<void> {
+    if (!this.isTerminalCaseStatus(caseStatus)) {
+      return;
+    }
+    await this.invalidateActiveReviewGatesForCaseState(
+      merchantId,
+      caseId,
+      caseStatus,
+      'TERMINAL_CASE_REVIEW_RECONCILIATION',
+    );
+  }
+
   /**
    * Requests a human review for a case.
    * Enforces tenant scoping, idempotency, terminal state rejection,

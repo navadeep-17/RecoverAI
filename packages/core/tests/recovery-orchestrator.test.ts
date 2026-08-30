@@ -27,6 +27,7 @@ describe('RecoveryOrchestrator Unit Tests', () => {
   let mockCommitmentRepo: any;
   let mockTriggerRepo: any;
   let mockJobScheduler: any;
+  let mockReviewGateRequester: any;
   let policyEngine: PolicyEngine;
   let mockLLM: MockLLMProvider;
   let recoveryAgent: RecoveryAgent;
@@ -218,6 +219,25 @@ describe('RecoveryOrchestrator Unit Tests', () => {
       }),
     };
 
+    const reviewsByKey = new Map<string, any>();
+    mockReviewGateRequester = {
+      requestReview: vi.fn(async (_mId: string, cId: string, data: any) => {
+        const current = inMemoryCases.get(cId);
+        if (current.status === CaseStatus.OPEN || current.status === CaseStatus.WAITING) {
+          current.status = CaseStatus.NEEDS_REVIEW;
+        }
+        const key = data.reviewKey || (data.planVersionId ? `plan:${data.planVersionId}` : `case:${cId}`);
+        let review = reviewsByKey.get(key);
+        const created = !review;
+        if (!review) {
+          review = { id: `review_${key}`, merchantId: _mId, caseId: cId, ...data, status: 'PENDING' };
+          reviewsByKey.set(key, review);
+        }
+        return { created, review, caseStatus: current.status };
+      }),
+      reconcileTerminalCase: vi.fn(async () => {}),
+    };
+
     mockMerchantRepo = {
       getMerchantById: vi.fn(async (mId: string) => ({
         id: mId,
@@ -329,6 +349,7 @@ describe('RecoveryOrchestrator Unit Tests', () => {
       policyEngine,
       actionExecutor,
       triggerRepo: mockTriggerRepo,
+      reviewGateRequester: mockReviewGateRequester,
       jobScheduler: mockJobScheduler,
       clock: () => new Date('2026-08-28T14:00:00+05:30'),
     });

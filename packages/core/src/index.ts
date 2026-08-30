@@ -19,3 +19,4 @@ export * from './orchestration/customer-reply-classifier.js';
 export * from './orchestration/recovery-orchestrator.js';
 export * from './orchestration/outcome-observer.js';
 export * from './review/human-review-service.js';
+export * from './review/review-gate-requester.js';

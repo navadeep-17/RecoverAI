@@ -21,6 +21,7 @@ describe('OutcomeObserver Unit Tests', () => {
   let mockAuditRepo: any;
   let mockJobScheduler: any;
   let mockOrchestrator: any;
+  let mockReviewGateRequester: any;
 
   const merchantId = 'mch_obs_test_01';
   const caseId = 'case_obs_test_01';
@@ -164,6 +165,24 @@ describe('OutcomeObserver Unit Tests', () => {
 
     mockEventRepo = {};
 
+    const reviewsByCase = new Map<string, any>();
+    mockReviewGateRequester = {
+      requestReview: vi.fn(async (_mId: string, cId: string, data: any) => {
+        const current = inMemoryCases.get(cId);
+        if (current.status === CaseStatus.OPEN || current.status === CaseStatus.WAITING) {
+          current.status = CaseStatus.NEEDS_REVIEW;
+        }
+        let review = reviewsByCase.get(cId);
+        const created = !review;
+        if (!review) {
+          review = { id: `review_${cId}`, merchantId: _mId, caseId: cId, ...data, status: 'PENDING' };
+          reviewsByCase.set(cId, review);
+        }
+        return { created, review, caseStatus: current.status };
+      }),
+      reconcileTerminalCase: vi.fn(async () => {}),
+    };
+
     const mockScheduledJobRepo = {
       getJobById: vi.fn(async (_mId: string, id: string) => {
         return inMemoryScheduledJobs.get(id) || null;
@@ -209,6 +228,7 @@ describe('OutcomeObserver Unit Tests', () => {
       scheduledJobRepo: mockScheduledJobRepo as any,
       jobScheduler: mockJobScheduler,
       orchestrator: mockOrchestrator as any,
+      reviewGateRequester: mockReviewGateRequester,
       clock: () => new Date('2026-08-28T14:00:00+05:30'),
     });
   });

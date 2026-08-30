@@ -399,17 +399,23 @@ describe('Deterministic PolicyEngine Specification & Invariant Tests', () => {
       expect(result.reasonCode).toBe(PolicyReasonCodes.QUIET_HOURS_VIOLATION);
     });
 
-    it('DENY: duplicate action already pending/running', () => {
-      const context = createBaseContext({
-        proposedActionType: RecoveryActionType.RETRY_PAYMENT,
-        priorActions: [
-          { actionType: RecoveryActionType.RETRY_PAYMENT, executedAt: new Date('2026-08-28T07:00:00Z'), status: 'PENDING' },
-        ],
-      });
-      const result = engine.evaluate(context);
+    it('DENY: duplicate action is prohibited only while PENDING or EXECUTING', () => {
+      for (const status of ['PENDING', 'EXECUTING']) {
+        const result = engine.evaluate(createBaseContext({
+          proposedActionType: RecoveryActionType.RETRY_PAYMENT,
+          priorActions: [{ actionType: RecoveryActionType.RETRY_PAYMENT, executedAt: new Date('2026-08-28T07:00:00Z'), status }],
+        }));
+        expect(result.decision).toBe(PolicyDecision.DENY);
+        expect(result.reasonCode).toBe(PolicyReasonCodes.DUPLICATE_ACTION_IN_FLIGHT);
+      }
 
-      expect(result.decision).toBe(PolicyDecision.DENY);
-      expect(result.reasonCode).toBe(PolicyReasonCodes.DUPLICATE_ACTION_IN_FLIGHT);
+      for (const status of ['FAILED', 'CANCELLED']) {
+        const result = engine.evaluate(createBaseContext({
+          proposedActionType: RecoveryActionType.RETRY_PAYMENT,
+          priorActions: [{ actionType: RecoveryActionType.RETRY_PAYMENT, executedAt: new Date('2026-08-28T07:00:00Z'), status }],
+        }));
+        expect(result.reasonCode).not.toBe(PolicyReasonCodes.DUPLICATE_ACTION_IN_FLIGHT);
+      }
     });
 
     it('DENY: action incompatible with risk type', () => {
@@ -455,6 +461,25 @@ describe('Deterministic PolicyEngine Specification & Invariant Tests', () => {
         case: { ...createBaseContext().case, amountAtRisk: '50000.01' },
       });
       expect(engine.evaluate(contextAbove).decision).toBe(PolicyDecision.REVIEW);
+    });
+
+    it('valid exact human approval satisfies high-value review routing, but not hard denials', () => {
+      const autonomous = createBaseContext({ case: { ...createBaseContext().case, amountAtRisk: '85000.00' } });
+      const approved = { ...autonomous, case: { ...autonomous.case, status: CaseStatus.NEEDS_REVIEW }, executionSource: 'HUMAN_REVIEW_APPROVAL' as const };
+      expect(engine.evaluate({ ...autonomous, executionSource: 'AUTONOMOUS' }).decision).toBe(PolicyDecision.REVIEW);
+      expect(engine.evaluate(approved).decision).toBe(PolicyDecision.ALLOW);
+      expect(engine.evaluate({ ...approved, killSwitchActive: true }).decision).toBe(PolicyDecision.DENY);
+    });
+
+    it('valid exact human approval satisfies review-first routing without bypassing consent', () => {
+      const autonomous = createBaseContext({
+        proposedActionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+        policyConfig: { ...createBaseContext().policyConfig, reviewFirstMode: true },
+      });
+      const approved = { ...autonomous, case: { ...autonomous.case, status: CaseStatus.NEEDS_REVIEW }, executionSource: 'HUMAN_REVIEW_APPROVAL' as const };
+      expect(engine.evaluate({ ...autonomous, executionSource: 'AUTONOMOUS' }).decision).toBe(PolicyDecision.REVIEW);
+      expect(engine.evaluate(approved).decision).toBe(PolicyDecision.ALLOW);
+      expect(engine.evaluate({ ...approved, customer: { id: 'cust_1', contactConsent: false, optedOut: false } }).decision).toBe(PolicyDecision.DENY);
     });
 
     it('REVIEW: proposal confidence is below minConfidenceThreshold (0.65)', () => {

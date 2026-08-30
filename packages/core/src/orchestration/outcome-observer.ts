@@ -28,6 +28,7 @@ import { generateIncidentKey } from '../detection/incident-identity.js';
 import { IJobScheduler } from '../detection/job-scheduler-interface.js';
 import { CustomerReplyClassifier, CustomerReplyIntent } from './customer-reply-classifier.js';
 import { RecoveryOrchestrator } from './recovery-orchestrator.js';
+import { ReviewGateRequester } from '../review/review-gate-requester.js';
 
 export interface ObservationResult {
   observed: boolean;
@@ -78,6 +79,8 @@ export interface OutcomeObserverOptions {
   scheduledJobRepo: ScheduledJobRepository;
   jobScheduler?: IJobScheduler;
   orchestrator?: RecoveryOrchestrator;
+  /** Required before an observation may route a case into NEEDS_REVIEW. */
+  reviewGateRequester?: ReviewGateRequester;
   clock?: () => Date;
 }
 
@@ -92,6 +95,7 @@ export class OutcomeObserver {
   private scheduledJobRepo: ScheduledJobRepository;
   private jobScheduler?: IJobScheduler;
   private orchestrator?: RecoveryOrchestrator;
+  private reviewGateRequester?: ReviewGateRequester;
   private classifier: CustomerReplyClassifier;
   private clock?: () => Date;
 
@@ -106,6 +110,7 @@ export class OutcomeObserver {
     this.scheduledJobRepo = options.scheduledJobRepo;
     this.jobScheduler = options.jobScheduler;
     this.orchestrator = options.orchestrator;
+    this.reviewGateRequester = options.reviewGateRequester;
     this.classifier = new CustomerReplyClassifier();
     this.clock = options.clock;
   }
@@ -116,6 +121,39 @@ export class OutcomeObserver {
 
   private now(): Date {
     return this.clock ? this.clock() : new Date();
+  }
+
+  private async routeToHumanReview(
+    merchantId: string,
+    caseId: string,
+    caseStatus: CaseStatus,
+    reasonForReview: string,
+  ): Promise<void> {
+    if (caseStatus !== CaseStatus.OPEN && caseStatus !== CaseStatus.WAITING && caseStatus !== CaseStatus.NEEDS_REVIEW) {
+      return;
+    }
+    if (!this.reviewGateRequester) {
+      throw new Error('Review gate requester is required before routing a case to NEEDS_REVIEW');
+    }
+    const result = await this.reviewGateRequester.requestReview(merchantId, caseId, {
+      reviewKey: `case:${caseId}`,
+      reasonForReview,
+      actorType: AuditActorType.SYSTEM,
+    });
+    if (result.caseStatus !== CaseStatus.NEEDS_REVIEW || !result.review) {
+      throw new Error(result.reason || 'Human review gate could not be made authoritative');
+    }
+  }
+
+  private async reconcileTerminalReviewGates(
+    merchantId: string,
+    caseId: string,
+    caseStatus: CaseStatus,
+  ): Promise<void> {
+    if (!this.reviewGateRequester) {
+      throw new Error('Review gate requester is required before a terminal case transition');
+    }
+    await this.reviewGateRequester.reconcileTerminalCase(merchantId, caseId, caseStatus);
   }
 
   /**
@@ -342,9 +380,7 @@ export class OutcomeObserver {
           };
         }
 
-        if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-          await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
-        }
+        await this.routeToHumanReview(merchantId, caseId, matchedCase.status, 'Customer promise did not include a payment date');
 
         await this.auditRepo.record(merchantId, {
           caseId,
@@ -373,9 +409,7 @@ export class OutcomeObserver {
           observedAt: params.occurredAt || this.now(),
         });
 
-        if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-          await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
-        }
+        await this.routeToHumanReview(merchantId, caseId, matchedCase.status, 'Promise-to-pay timer cannot be scheduled');
 
         await this.auditRepo.record(merchantId, {
           caseId,
@@ -498,9 +532,7 @@ export class OutcomeObserver {
                 caseStatus: matchedCase.status,
               };
             } catch {
-              if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-                await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
-              }
+              await this.routeToHumanReview(merchantId, caseId, matchedCase.status, 'Promise-to-pay timer repair failed');
               return {
                 observed: true,
                 deduplicated: true,
@@ -540,9 +572,7 @@ export class OutcomeObserver {
         });
       } catch (scheduleErr) {
         // Scheduler failed: route safely to NEEDS_REVIEW so commitment is never silently orphaned without human or timer wake!
-        if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-          await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
-        }
+        await this.routeToHumanReview(merchantId, caseId, matchedCase.status, 'Promise-to-pay timer scheduling failed');
 
         await this.auditRepo.record(merchantId, {
           caseId,
@@ -630,9 +660,7 @@ export class OutcomeObserver {
       }
 
       // Escalate to human review
-      if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-        await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
-      }
+      await this.routeToHumanReview(merchantId, caseId, matchedCase.status, 'Customer refused payment');
 
       return {
         observed: true,
@@ -848,9 +876,7 @@ export class OutcomeObserver {
       });
 
       // Transition case to NEEDS_REVIEW
-      if (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING) {
-        await this.safeCompareAndSetStatus(merchantId, caseId, matchedCase.status, CaseStatus.NEEDS_REVIEW);
-      }
+      await this.routeToHumanReview(merchantId, caseId, matchedCase.status, 'Promise-to-pay expired unpaid');
 
       // Emit canonical CASE_ESCALATED audit with reasonCode BROKEN_PROMISE_TO_PAY
       await this.auditRepo.record(merchantId, {
@@ -1179,6 +1205,7 @@ export class OutcomeObserver {
           resolvedAt: event.occurredAt || this.now(),
         },
       );
+      await this.reconcileTerminalReviewGates(merchantId, caseId, CaseStatus.RECOVERED);
 
       // Audit with source-specific truthful event name
       let auditEventType = 'CASE_RECOVERED';

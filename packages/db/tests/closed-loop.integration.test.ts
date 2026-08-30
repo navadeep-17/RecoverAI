@@ -9,6 +9,7 @@ import {
   AuditRepository,
   PolicyConfigRepository,
   CommitmentRepository,
+  HumanReviewRepository,
   OutcomeRepository,
   EventRepository,
   ScheduledJobRepository,
@@ -23,6 +24,7 @@ import {
   RecoveryOrchestrator,
   OutcomeObserver,
   RecoveryAgent,
+  HumanReviewService,
   MockLLMProvider,
 } from '@recoverai/core';
 import { PolicyEngine } from '@recoverai/policy';
@@ -49,6 +51,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   let simulatedProvider: SimulatedRecoveryProvider;
   let providerRegistry: ProviderRegistry;
   let actionExecutor: ActionExecutor;
+  let reviewService: HumanReviewService;
   let orchestrator: RecoveryOrchestrator;
   let observer: OutcomeObserver;
 
@@ -66,6 +69,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       auditRepo = new AuditRepository();
       policyConfigRepo = new PolicyConfigRepository();
       commitmentRepo = new CommitmentRepository();
+      const reviewRepo = new HumanReviewRepository();
       outcomeRepo = new OutcomeRepository();
       eventRepo = new EventRepository();
 
@@ -108,6 +112,20 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
         jobScheduler,
         clock: () => new Date('2026-08-28T14:00:00+05:30'),
       });
+      reviewService = new HumanReviewService({
+        humanReviewRepo: reviewRepo,
+        caseRepo,
+        actionRepo,
+        customerRepo,
+        merchantRepo,
+        policyConfigRepo,
+        commitmentRepo,
+        outcomeRepo,
+        auditRepo,
+        policyEngine,
+        actionExecutor,
+      });
+      actionExecutor.setReviewGateRequester(reviewService);
 
       orchestrator = new RecoveryOrchestrator({
         caseRepo,
@@ -122,6 +140,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
         actionExecutor,
         jobScheduler,
         triggerRepo,
+        reviewGateRequester: reviewService,
         clock: () => new Date('2026-08-28T14:00:00+05:30'),
       });
 
@@ -136,6 +155,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
         scheduledJobRepo,
         jobScheduler,
         orchestrator,
+        reviewGateRequester: reviewService,
         clock: () => new Date('2026-08-28T14:00:00+05:30'),
       });
 
@@ -469,6 +489,10 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     // 4. PolicyEngine evaluated BrokenPromiseToPayRule -> Decision REVIEW -> Case transitioned to NEEDS_REVIEW!
     const finalDbCase = await caseRepo.getCaseById(merchantId, testCase.id);
     expect(finalDbCase?.status).toBe(CaseStatus.NEEDS_REVIEW);
+    const activeReviewCount = await prisma.humanReview.count({
+      where: { merchantId, caseId: testCase.id, status: 'PENDING' },
+    });
+    expect(activeReviewCount).toBe(1);
 
     // Verify CASE_ESCALATED audit exists
     const escalationAudits = await prisma.auditEvent.findMany({

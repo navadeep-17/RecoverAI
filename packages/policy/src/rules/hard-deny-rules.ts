@@ -166,7 +166,7 @@ export class DuplicateActionRule implements IPolicyRule {
   readonly name = 'DuplicateActionRule';
   evaluate(context: PolicyExecutionContext): RuleResult | null {
     const hasPendingDuplicate = context.priorActions.some(
-      (a) => a.actionType === context.proposedActionType && (a.status === 'PENDING' || a.status === 'RUNNING'),
+      (a) => a.actionType === context.proposedActionType && (a.status === 'PENDING' || a.status === 'EXECUTING'),
     );
     if (hasPendingDuplicate) {
       return {

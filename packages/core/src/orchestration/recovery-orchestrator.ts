@@ -24,6 +24,7 @@ import { ActionExecutor } from '../execution/action-executor.js';
 import { RecoveryAgent } from '../agent/recovery-agent.js';
 import { AgentContext } from '../agent/agent-contracts.js';
 import { IJobScheduler } from '../detection/job-scheduler-interface.js';
+import { ReviewGateRequester } from '../review/review-gate-requester.js';
 import {
   EligibilityCheckResult,
   OrchestrationIterationResult,
@@ -40,6 +41,8 @@ export interface RecoveryOrchestratorOptions {
   commitmentRepo: CommitmentRepository;
   auditRepo: AuditRepository;
   humanReviewRepo?: HumanReviewRepository;
+  /** Required before this component may route a case into NEEDS_REVIEW. */
+  reviewGateRequester?: ReviewGateRequester;
   recoveryAgent: RecoveryAgent;
   policyEngine: IPolicyEngine;
   actionExecutor: ActionExecutor;
@@ -57,6 +60,7 @@ export class RecoveryOrchestrator {
   private commitmentRepo: CommitmentRepository;
   private auditRepo: AuditRepository;
   private humanReviewRepo?: HumanReviewRepository;
+  private reviewGateRequester?: ReviewGateRequester;
   private recoveryAgent: RecoveryAgent;
   private policyEngine: IPolicyEngine;
   private actionExecutor: ActionExecutor;
@@ -73,6 +77,7 @@ export class RecoveryOrchestrator {
     this.commitmentRepo = options.commitmentRepo;
     this.auditRepo = options.auditRepo;
     this.humanReviewRepo = options.humanReviewRepo;
+    this.reviewGateRequester = options.reviewGateRequester;
     this.recoveryAgent = options.recoveryAgent;
     this.policyEngine = options.policyEngine;
     this.actionExecutor = options.actionExecutor;
@@ -83,6 +88,23 @@ export class RecoveryOrchestrator {
 
   private now(): Date {
     return this.clock ? this.clock() : new Date();
+  }
+
+  private async routeToHumanReview(
+    merchantId: string,
+    caseId: string,
+    data: { planVersionId?: string; actionId?: string; reasonForReview: string; reviewKey?: string },
+  ): Promise<void> {
+    if (!this.reviewGateRequester) {
+      throw new Error('Review gate requester is required before routing a case to NEEDS_REVIEW');
+    }
+    const result = await this.reviewGateRequester.requestReview(merchantId, caseId, {
+      ...data,
+      actorType: AuditActorType.POLICY,
+    });
+    if (result.caseStatus !== CaseStatus.NEEDS_REVIEW || !result.review) {
+      throw new Error(result.reason || 'Human review gate could not be made authoritative');
+    }
   }
 
   /**
@@ -503,7 +525,7 @@ export class RecoveryOrchestrator {
         case PolicyReasonCodes.CASE_NEEDS_REVIEW:
         case PolicyReasonCodes.REQUIRED_FACTS_MISSING:
         case PolicyReasonCodes.INCOMPATIBLE_ACTION_FOR_RISK: {
-          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+          await this.routeToHumanReview(merchantId, caseId, { planVersionId: planVersion.id, reasonForReview: policyEvaluation.rationale });
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.NEEDS_REVIEW,
           }, claimResult.trigger.attemptCount);
@@ -565,7 +587,7 @@ export class RecoveryOrchestrator {
               // fallback to NEEDS_REVIEW
             }
           }
-          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+          await this.routeToHumanReview(merchantId, caseId, { planVersionId: planVersion.id, reasonForReview: policyEvaluation.rationale });
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.NEEDS_REVIEW,
           }, claimResult.trigger.attemptCount);
@@ -606,7 +628,7 @@ export class RecoveryOrchestrator {
               // fallback to NEEDS_REVIEW
             }
           }
-          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+          await this.routeToHumanReview(merchantId, caseId, { planVersionId: planVersion.id, reasonForReview: policyEvaluation.rationale });
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.NEEDS_REVIEW,
           }, claimResult.trigger.attemptCount);
@@ -636,7 +658,7 @@ export class RecoveryOrchestrator {
         }
 
         default: {
-          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+          await this.routeToHumanReview(merchantId, caseId, { planVersionId: planVersion.id, reasonForReview: policyEvaluation.rationale });
           await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', {
             status: CaseStatus.NEEDS_REVIEW,
           }, claimResult.trigger.attemptCount);
@@ -653,31 +675,10 @@ export class RecoveryOrchestrator {
     }
 
     if (policyEvaluation.decision === PolicyDecision.REVIEW) {
-      await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
-
-      if (this.humanReviewRepo) {
-        const createResult = await this.humanReviewRepo.createReview(merchantId, {
-          caseId,
-          planVersionId: planVersion.id,
-          reasonForReview: policyEvaluation.rationale,
-        });
-
-        if (createResult.created) {
-          await this.auditRepo.record(merchantId, {
-            caseId,
-            eventType: 'REVIEW_REQUESTED',
-            actorType: AuditActorType.POLICY,
-            inputSummaryJson: {
-              reviewId: createResult.review.id,
-              planVersionId: planVersion.id,
-              planVersion: planVersion.version,
-              reasonForReview: policyEvaluation.rationale,
-              reasonCode: policyEvaluation.reasonCode,
-            },
-            reasonCode: policyEvaluation.reasonCode,
-          });
-        }
-      }
+      await this.routeToHumanReview(merchantId, caseId, {
+        planVersionId: planVersion.id,
+        reasonForReview: policyEvaluation.rationale,
+      });
 
       await this.auditRepo.record(merchantId, {
         caseId,
@@ -770,7 +771,7 @@ export class RecoveryOrchestrator {
       if (this.isWaitingAction(proposal.proposedActionType)) {
         if (!this.jobScheduler) {
           // Scheduler unavailable: fail closed, do not leave false WAITING state
-          await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+          await this.routeToHumanReview(merchantId, caseId, { planVersionId: planVersion.id, actionId: authResult.action.id, reasonForReview: 'Job scheduler unavailable for waiting action' });
           finalStatus = CaseStatus.NEEDS_REVIEW;
           await this.auditRepo.record(merchantId, {
             caseId,
@@ -818,7 +819,7 @@ export class RecoveryOrchestrator {
             });
           } catch (schedErr) {
             // Scheduling failed: route safely to NEEDS_REVIEW
-            await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.NEEDS_REVIEW);
+            await this.routeToHumanReview(merchantId, caseId, { planVersionId: planVersion.id, actionId: authResult.action.id, reasonForReview: 'Durable follow-up scheduling failed' });
             finalStatus = CaseStatus.NEEDS_REVIEW;
             await this.auditRepo.record(merchantId, {
               caseId,

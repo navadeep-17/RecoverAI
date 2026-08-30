@@ -20,6 +20,7 @@ import {
 } from '@recoverai/db';
 import { ActionExecutionError, jsonStructurallyEqual } from '@recoverai/shared';
 import { IJobScheduler } from '../detection/job-scheduler-interface.js';
+import { ReviewGateRequester } from '../review/review-gate-requester.js';
 import { generateActionIdempotencyKey } from './idempotency-generator.js';
 import {
     IPolicyEngine,
@@ -51,6 +52,8 @@ export interface ActionExecutorOptions {
   merchantRepo: MerchantRepository;
   /** Required whenever a persisted action claims human-review authority. */
   humanReviewRepo?: HumanReviewRepository;
+  /** Required for the internal ESCALATE_TO_HUMAN transition. */
+  reviewGateRequester?: ReviewGateRequester;
   /**
    * CommitmentRepository for authoritative RECORD_PROMISE_TO_PAY persistence.
    * If absent, RECORD_PROMISE_TO_PAY will fail safely (action marked FAILED).
@@ -118,6 +121,7 @@ export class ActionExecutor {
   /** MANDATORY: Absent merchantRepo fails closed. */
   private merchantRepo: MerchantRepository;
   private humanReviewRepo?: HumanReviewRepository;
+  private reviewGateRequester?: ReviewGateRequester;
   private commitmentRepo?: CommitmentRepository;
   private policyEngine: IPolicyEngine;
   private providerRegistry: ProviderRegistry;
@@ -132,11 +136,36 @@ export class ActionExecutor {
     this.auditRepo = options.auditRepo;
     this.merchantRepo = options.merchantRepo;
     this.humanReviewRepo = options.humanReviewRepo;
+    this.reviewGateRequester = options.reviewGateRequester;
     this.commitmentRepo = options.commitmentRepo;
     this.policyEngine = options.policyEngine;
     this.providerRegistry = options.providerRegistry;
     this.jobScheduler = options.jobScheduler;
     this.clock = options.clock;
+  }
+
+  /** Allows composition roots to attach HumanReviewService after both services exist. */
+  public setReviewGateRequester(reviewGateRequester: ReviewGateRequester): void {
+    this.reviewGateRequester = reviewGateRequester;
+  }
+
+  private async routeToHumanReview(
+    merchantId: string,
+    caseId: string,
+    actionId: string,
+  ): Promise<void> {
+    if (!this.reviewGateRequester) {
+      throw new Error('Review gate requester is required before ESCALATE_TO_HUMAN can transition a case');
+    }
+    const result = await this.reviewGateRequester.requestReview(merchantId, caseId, {
+      actionId,
+      reviewKey: `action:${actionId}`,
+      reasonForReview: 'Recovery action explicitly escalated the case to a human reviewer',
+      actorType: AuditActorType.SYSTEM,
+    });
+    if (result.caseStatus !== CaseStatus.NEEDS_REVIEW || !result.review) {
+      throw new Error(result.reason || 'Human review gate could not be made authoritative');
+    }
   }
 
   // ────────────────────────────────────────────────────────────────────────────
@@ -1105,12 +1134,7 @@ export class ActionExecutor {
 
     // ── ESCALATE_TO_HUMAN ─────────────────────────────────────────────────────
     if (action.actionType === RecoveryActionType.ESCALATE_TO_HUMAN) {
-      await this.caseRepo.compareAndSetStatus(
-        merchantId,
-        caseRecord.id,
-        caseRecord.status,
-        CaseStatus.NEEDS_REVIEW,
-      );
+      await this.routeToHumanReview(merchantId, caseRecord.id, actionId);
 
       const succeededAction = await this.actionRepo.updateActionStatus(merchantId, actionId, {
         status: ActionExecutionStatus.SUCCESS,
