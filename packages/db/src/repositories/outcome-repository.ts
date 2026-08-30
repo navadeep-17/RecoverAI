@@ -1,4 +1,4 @@
-import { CaseStatus, Prisma, RecoveryOutcome } from '@prisma/client';
+import { ActionExecutionStatus, CaseStatus, Prisma, RecoveryActionType, RecoveryOutcome } from '@prisma/client';
 import { prisma } from '../client.js';
 import { Money, CurrencyMismatchError } from '@recoverai/shared';
 import { ExactMonetaryInput, toPrismaDecimal } from './case-repository.js';
@@ -38,23 +38,57 @@ export class OutcomeRepository {
   ): Promise<MonetaryRecoveryClaimResult> {
     try {
       return await prisma.$transaction(async (tx) => {
-        const parentCase = await tx.revenueRiskCase.findFirstOrThrow({
-          where: { id: caseId, merchantId },
-          select: { currency: true, status: true, recoveryOutcomeId: true },
-        });
+        // Lock the parent before inserting an outcome. A child FK insert takes a
+        // parent relationship lock, so taking the exclusive parent row lock first
+        // gives every contender one deterministic lock order and prevents a cycle.
+        const [parentCase] = await tx.$queryRaw<Array<{
+          id: string;
+          currency: string;
+          status: CaseStatus;
+          recoveryOutcomeId: string | null;
+          amountAtRisk: Prisma.Decimal;
+        }>>(Prisma.sql`
+          SELECT "id", "currency", "status", "recoveryOutcomeId", "amountAtRisk"
+          FROM "revenue_risk_cases"
+          WHERE "id" = ${caseId} AND "merchantId" = ${merchantId}
+          FOR UPDATE
+        `);
+        if (!parentCase) {
+          throw new Error(`RevenueRiskCase not found for merchant: ${caseId}`);
+        }
         if (parentCase.recoveryOutcomeId || parentCase.status === CaseStatus.RECOVERED) {
           const winner = parentCase.recoveryOutcomeId
             ? await tx.recoveryOutcome.findUnique({ where: { id: parentCase.recoveryOutcomeId } })
             : null;
           return { wonRecovery: false, deduplicated: !!winner && winner.dedupeKey === params.dedupeKey, outcome: winner, caseStatus: parentCase.status };
         }
+        if (parentCase.status === CaseStatus.STOPPED || parentCase.status === CaseStatus.EXHAUSTED) {
+          throw new Error(`Cannot claim recovery for terminal case status: ${parentCase.status}`);
+        }
+        if (![CaseStatus.OPEN, CaseStatus.WAITING, CaseStatus.NEEDS_REVIEW].includes(parentCase.status)) {
+          throw new Error(`Cannot claim recovery for non-recoverable case status: ${parentCase.status}`);
+        }
+        if (params.amountRecovered === undefined) {
+          throw new Error('Cannot claim monetary recovery without an exact recovered amount');
+        }
         if (params.amountRecovered instanceof Money && params.amountRecovered.currency !== parentCase.currency) {
           throw new CurrencyMismatchError(
             `RecoveryOutcome amountRecovered currency "${params.amountRecovered.currency}" does not match case currency "${parentCase.currency}"`,
           );
         }
+        const exactRecoveredAmount = toPrismaDecimal(params.amountRecovered);
+        if (!exactRecoveredAmount.greaterThan(0) || !exactRecoveredAmount.equals(parentCase.amountAtRisk)) {
+          throw new Error('Monetary recovery must exactly and positively settle the authoritative case amount');
+        }
         if (params.actionId) {
-          await tx.recoveryAction.findFirstOrThrow({ where: { id: params.actionId, caseId } });
+          await tx.recoveryAction.findFirstOrThrow({
+            where: {
+              id: params.actionId,
+              caseId,
+              status: ActionExecutionStatus.SUCCESS,
+              actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+            },
+          });
         }
         if (params.merchantEventId) {
           await tx.merchantEvent.findFirstOrThrow({ where: { id: params.merchantEventId, merchantId } });
@@ -67,28 +101,20 @@ export class OutcomeRepository {
             merchantEventId: params.merchantEventId,
             dedupeKey: params.dedupeKey,
             outcomeType: params.outcomeType,
-            amountRecovered: params.amountRecovered !== undefined ? toPrismaDecimal(params.amountRecovered) : null,
+            amountRecovered: exactRecoveredAmount,
             detailsJson: params.detailsJson as Prisma.InputJsonValue,
             observedAt: params.observedAt || new Date(),
           },
         });
-        const claimed = await tx.revenueRiskCase.updateMany({
-          where: {
-            id: caseId,
-            merchantId,
-            recoveryOutcomeId: null,
-            status: { in: [CaseStatus.OPEN, CaseStatus.WAITING, CaseStatus.NEEDS_REVIEW] },
-          },
+        await tx.revenueRiskCase.update({
+          where: { id: caseId },
           data: {
             status: CaseStatus.RECOVERED,
-            recoveredAmount: params.amountRecovered !== undefined ? toPrismaDecimal(params.amountRecovered) : undefined,
+            recoveredAmount: exactRecoveredAmount,
             resolvedAt: params.observedAt || new Date(),
             recoveryOutcomeId: candidate.id,
           },
         });
-        if (claimed.count !== 1) {
-          throw new Error('RECOVERY_CREDIT_CLAIM_LOST');
-        }
         return { wonRecovery: true, deduplicated: false, outcome: candidate, caseStatus: CaseStatus.RECOVERED };
       });
     } catch (error) {

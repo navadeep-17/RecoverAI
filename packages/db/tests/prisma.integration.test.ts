@@ -151,36 +151,70 @@ describe('PostgreSQL + Prisma Real Integration Smoke Test', () => {
 
   it('allows only one winner when distinct attributed events race', async () => {
     if (!dbAvailable) throw new Error('PostgreSQL must be available for recovery winner evidence');
+    await prisma.revenueRiskCase.deleteMany({ where: { merchantId: testMerchantId } });
+    const amount = Money.fromDecimalString('14999.00', 'INR');
+    for (let iteration = 0; iteration < 10; iteration += 1) {
+      const recoveryCase = await prisma.revenueRiskCase.create({
+        data: { merchantId: testMerchantId, riskType: RiskType.PAYMENT_FAILURE, amountAtRisk: '14999.00', currency: 'INR', status: CaseStatus.WAITING, contextJson: {}, incidentKey: `recovery-winner-race-${iteration}` },
+      });
+      const action = await prisma.recoveryAction.create({
+        data: { caseId: recoveryCase.id, actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK, actionParams: {}, idempotencyKey: `race-action-${iteration}`, policyDecision: PolicyDecision.ALLOW, policyRationale: 'test', status: ActionExecutionStatus.SUCCESS },
+      });
+      const [first, second] = await Promise.all([
+        new OutcomeRepository().claimMonetaryRecovery(testMerchantId, recoveryCase.id, { actionId: action.id, dedupeKey: `race-one-${iteration}`, outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: amount }),
+        new OutcomeRepository().claimMonetaryRecovery(testMerchantId, recoveryCase.id, { actionId: action.id, dedupeKey: `race-two-${iteration}`, outcomeType: 'INVOICE_PAID', amountRecovered: amount }),
+      ]);
+      expect([first, second].filter((result) => result.wonRecovery)).toHaveLength(1);
+      const storedCase = await prisma.revenueRiskCase.findUniqueOrThrow({ where: { id: recoveryCase.id }, include: { outcomes: true, recoveryOutcome: true } });
+      expect(storedCase.status).toBe(CaseStatus.RECOVERED);
+      expect(storedCase.outcomes).toHaveLength(1);
+      expect(storedCase.recoveryOutcome?.id).toBe(storedCase.outcomes[0].id);
+      expect(storedCase.recoveryOutcome?.actionId).toBe(action.id);
+    }
+    const metrics = await new CaseRepository().getRevenueRadarMetrics(testMerchantId);
+    expect(metrics).toMatchObject({ verifiedRecovered: '149990.00', agentAttributedRecovered: '149990.00' });
+  });
+
+  it('credits one conditional winner when organic and attributed events race', async () => {
+    if (!dbAvailable) throw new Error('PostgreSQL must be available for recovery winner evidence');
+    await prisma.revenueRiskCase.deleteMany({ where: { merchantId: testMerchantId } });
     const recoveryCase = await prisma.revenueRiskCase.create({
-      data: { merchantId: testMerchantId, riskType: RiskType.PAYMENT_FAILURE, amountAtRisk: '10.00', currency: 'INR', status: CaseStatus.WAITING, contextJson: {}, incidentKey: 'recovery-winner-race' },
+      data: { merchantId: testMerchantId, riskType: RiskType.PAYMENT_FAILURE, amountAtRisk: '14999.00', currency: 'INR', status: CaseStatus.OPEN, contextJson: {}, incidentKey: 'organic-attributed-race' },
     });
-    const [firstAction, secondAction] = await Promise.all(['race-action-one', 'race-action-two'].map((idempotencyKey) => prisma.recoveryAction.create({
-      data: { caseId: recoveryCase.id, actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK, actionParams: {}, idempotencyKey, policyDecision: PolicyDecision.ALLOW, policyRationale: 'test', status: ActionExecutionStatus.SUCCESS },
-    })));
-    const [first, second] = await Promise.all([
-      new OutcomeRepository().claimMonetaryRecovery(testMerchantId, recoveryCase.id, { actionId: firstAction.id, dedupeKey: 'race-one', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: Money.fromDecimalString('10.00', 'INR') }),
-      new OutcomeRepository().claimMonetaryRecovery(testMerchantId, recoveryCase.id, { actionId: secondAction.id, dedupeKey: 'race-two', outcomeType: 'INVOICE_PAID', amountRecovered: Money.fromDecimalString('10.00', 'INR') }),
+    const action = await prisma.recoveryAction.create({
+      data: { caseId: recoveryCase.id, actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK, actionParams: {}, idempotencyKey: 'organic-attributed-race-action', policyDecision: PolicyDecision.ALLOW, policyRationale: 'test', status: ActionExecutionStatus.SUCCESS },
+    });
+    const amount = Money.fromDecimalString('14999.00', 'INR');
+    const [organic, attributed] = await Promise.all([
+      new OutcomeRepository().claimMonetaryRecovery(testMerchantId, recoveryCase.id, { dedupeKey: 'organic-race', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: amount }),
+      new OutcomeRepository().claimMonetaryRecovery(testMerchantId, recoveryCase.id, { actionId: action.id, dedupeKey: 'attributed-race', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: amount }),
     ]);
-    expect([first, second].filter((result) => result.wonRecovery)).toHaveLength(1);
+    expect([organic, attributed].filter((result) => result.wonRecovery)).toHaveLength(1);
     const storedCase = await prisma.revenueRiskCase.findUniqueOrThrow({ where: { id: recoveryCase.id }, include: { outcomes: true, recoveryOutcome: true } });
-    expect(storedCase.status).toBe(CaseStatus.RECOVERED);
     expect(storedCase.outcomes).toHaveLength(1);
-    expect(storedCase.recoveryOutcome?.id).toBe(storedCase.outcomes[0].id);
+    const metrics = await new CaseRepository().getRevenueRadarMetrics(testMerchantId);
+    expect(metrics.verifiedRecovered).toBe('14999.00');
+    expect(metrics.agentAttributedRecovered).toBe(storedCase.recoveryOutcome?.actionId === action.id ? '14999.00' : '0.00');
   });
 
   it('counts a winning attributed recovery exactly once', async () => {
     if (!dbAvailable) throw new Error('PostgreSQL must be available for recovery winner evidence');
+    await prisma.revenueRiskCase.deleteMany({ where: { merchantId: testMerchantId } });
     const recoveryCase = await prisma.revenueRiskCase.create({
-      data: { merchantId: testMerchantId, riskType: RiskType.PAYMENT_FAILURE, amountAtRisk: '20.00', currency: 'INR', status: CaseStatus.WAITING, contextJson: {}, incidentKey: 'recovery-winner-attributed' },
+      data: { merchantId: testMerchantId, riskType: RiskType.PAYMENT_FAILURE, amountAtRisk: '14999.00', currency: 'INR', status: CaseStatus.WAITING, contextJson: {}, incidentKey: 'recovery-winner-attributed' },
     });
     const action = await prisma.recoveryAction.create({
       data: { caseId: recoveryCase.id, actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK, actionParams: {}, idempotencyKey: 'recovery-winner-attributed-action', policyDecision: PolicyDecision.ALLOW, policyRationale: 'test', status: ActionExecutionStatus.SUCCESS },
     });
     const result = await new OutcomeRepository().claimMonetaryRecovery(testMerchantId, recoveryCase.id, {
-      actionId: action.id, dedupeKey: 'attributed-success', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: Money.fromDecimalString('20.00', 'INR'),
+      actionId: action.id, dedupeKey: 'attributed-success', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: Money.fromDecimalString('14999.00', 'INR'),
+    });
+    const laterOrganic = await new OutcomeRepository().claimMonetaryRecovery(testMerchantId, recoveryCase.id, {
+      dedupeKey: 'later-organic-success', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: Money.fromDecimalString('14999.00', 'INR'),
     });
     expect(result).toMatchObject({ wonRecovery: true, outcome: { actionId: action.id } });
+    expect(laterOrganic).toMatchObject({ wonRecovery: false, deduplicated: false });
     const metrics = await new CaseRepository().getRevenueRadarMetrics(testMerchantId);
-    expect(metrics.agentAttributedRecovered).toBe('30.00');
+    expect(metrics).toMatchObject({ verifiedRecovered: '14999.00', agentAttributedRecovered: '14999.00' });
   });
 });
