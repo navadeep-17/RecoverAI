@@ -106,6 +106,33 @@ export class HumanReviewService {
     return this.clock ? this.clock() : new Date();
   }
 
+  private isTerminalCaseStatus(status: CaseStatus): boolean {
+    return (
+      status === CaseStatus.RECOVERED ||
+      status === CaseStatus.STOPPED ||
+      status === CaseStatus.EXHAUSTED
+    );
+  }
+
+  private async invalidateActiveReviewGatesForCaseState(
+    merchantId: string,
+    caseId: string,
+    caseStatus: CaseStatus,
+    reasonCode: string,
+  ): Promise<void> {
+    const reason = `Case became ${caseStatus} while human-review gate reconciliation was in progress.`;
+    const closedCount = await this.humanReviewRepo.closeActiveReviewsForCase(merchantId, caseId, reason);
+    if (closedCount > 0) {
+      await this.auditRepo.record(merchantId, {
+        caseId,
+        eventType: 'REVIEW_STALE',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { caseStatus, closedReviewCount: closedCount },
+        reasonCode,
+      });
+    }
+  }
+
   private async hasActiveHumanReviewGate(
     merchantId: string,
     caseId: string,
@@ -161,7 +188,15 @@ export class HumanReviewService {
           CaseStatus.NEEDS_REVIEW,
         );
       } catch {
-        // A concurrent transition won; its resulting state is authoritative.
+        const authoritativeCase = await this.caseRepo.getCaseById(merchantId, caseId);
+        if (authoritativeCase && this.isTerminalCaseStatus(authoritativeCase.status)) {
+          await this.invalidateActiveReviewGatesForCaseState(
+            merchantId,
+            caseId,
+            authoritativeCase.status,
+            'REVIEW_GATE_INVALIDATED_TERMINAL_CASE',
+          );
+        }
       }
       return false;
     }
@@ -273,23 +308,6 @@ export class HumanReviewService {
 
     const effectiveReview = createResult.review;
 
-    // The review row is the durable authority. A closer may have just
-    // reopened the case after our initial status check; repair that race only
-    // after the review exists, and never revive a terminal case.
-    const currentCase = await this.caseRepo.getCaseById(merchantId, caseId);
-    if (currentCase && (currentCase.status === CaseStatus.OPEN || currentCase.status === CaseStatus.WAITING)) {
-      try {
-        await this.caseRepo.compareAndSetStatus(
-          merchantId,
-          caseId,
-          currentCase.status,
-          CaseStatus.NEEDS_REVIEW,
-        );
-      } catch {
-        // A concurrent transition won; never overwrite its authoritative state.
-      }
-    }
-
     if (createResult.created) {
       await this.auditRepo.record(merchantId, {
         caseId,
@@ -305,10 +323,77 @@ export class HumanReviewService {
       });
     }
 
+    // Reconcile the durable review gate against the authoritative case with a
+    // bounded retry. Never report NEEDS_REVIEW unless it is still authoritative
+    // at return time, and never leave a gate active on a terminal case.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const currentCase = await this.caseRepo.getCaseById(merchantId, caseId);
+      if (!currentCase) {
+        throw new Error(`Case "${caseId}" not found for merchant "${merchantId}"`);
+      }
+
+      if (currentCase.status === CaseStatus.NEEDS_REVIEW) {
+        return {
+          created: createResult.created,
+          review: effectiveReview,
+          caseStatus: CaseStatus.NEEDS_REVIEW,
+        };
+      }
+
+      if (this.isTerminalCaseStatus(currentCase.status)) {
+        await this.invalidateActiveReviewGatesForCaseState(
+          merchantId,
+          caseId,
+          currentCase.status,
+          'REVIEW_CREATION_TERMINAL_CASE_RACE',
+        );
+        return {
+          created: false,
+          review: await this.humanReviewRepo.getReviewById(merchantId, effectiveReview.id),
+          caseStatus: currentCase.status,
+          reason: `Case became terminal (${currentCase.status}) during review creation; active review gate was invalidated`,
+        };
+      }
+
+      if (currentCase.status === CaseStatus.OPEN || currentCase.status === CaseStatus.WAITING) {
+        try {
+          await this.caseRepo.compareAndSetStatus(
+            merchantId,
+            caseId,
+            currentCase.status,
+            CaseStatus.NEEDS_REVIEW,
+          );
+        } catch {
+          // Reload on the next bounded attempt; a terminal transition wins.
+        }
+      }
+    }
+
+    const finalCase = await this.caseRepo.getCaseById(merchantId, caseId);
+    if (!finalCase) {
+      throw new Error(`Case "${caseId}" not found for merchant "${merchantId}"`);
+    }
+    if (this.isTerminalCaseStatus(finalCase.status)) {
+      await this.invalidateActiveReviewGatesForCaseState(
+        merchantId,
+        caseId,
+        finalCase.status,
+        'REVIEW_CREATION_TERMINAL_CASE_RACE',
+      );
+    } else {
+      await this.invalidateActiveReviewGatesForCaseState(
+        merchantId,
+        caseId,
+        finalCase.status,
+        'REVIEW_CREATION_GATE_RECONCILIATION_FAILED',
+      );
+    }
+
     return {
-      created: createResult.created,
-      review: effectiveReview,
-      caseStatus: CaseStatus.NEEDS_REVIEW,
+      created: false,
+      review: await this.humanReviewRepo.getReviewById(merchantId, effectiveReview.id),
+      caseStatus: finalCase.status,
+      reason: `Review gate reconciliation did not converge; authoritative case status is "${finalCase.status}"`,
     };
   }
 

@@ -367,6 +367,81 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(finalCase?.status).toBe(CaseStatus.NEEDS_REVIEW);
   });
 
+  it('Scenario A4: terminal transition winning the post-create repair closes the new review gate', async () => {
+    if (!dbAvailable) return;
+
+    const { testCase, planVersion } = await createTestCase(merchantAId);
+    let caseReads = 0;
+    const racingCaseRepo = new Proxy(caseRepo, {
+      get(target, property, receiver) {
+        if (property !== 'getCaseById') {
+          return Reflect.get(target, property, receiver);
+        }
+        return async (merchantId: string, caseId: string) => {
+          caseReads += 1;
+          const current = await target.getCaseById(merchantId, caseId);
+          if (caseReads === 2 && current?.status === CaseStatus.NEEDS_REVIEW) {
+            // Simulate a terminal worker winning between the post-create read
+            // and the OPEN/WAITING -> NEEDS_REVIEW repair CAS.
+            await target.compareAndSetStatus(
+              merchantId,
+              caseId,
+              CaseStatus.NEEDS_REVIEW,
+              CaseStatus.RECOVERED,
+            );
+            return { ...current, status: CaseStatus.OPEN };
+          }
+          return current;
+        };
+      },
+    });
+    const racingReviewService = new HumanReviewService({
+      humanReviewRepo: reviewRepo,
+      caseRepo: racingCaseRepo as CaseRepository,
+      actionRepo,
+      customerRepo,
+      merchantRepo,
+      policyConfigRepo,
+      commitmentRepo,
+      outcomeRepo,
+      auditRepo,
+      policyEngine,
+      actionExecutor,
+      clock: testClock,
+    });
+
+    const result = await racingReviewService.requestReview(merchantAId, testCase.id, {
+      planVersionId: planVersion.id,
+      reasonForReview: 'Controlled terminal race',
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.caseStatus).toBe(CaseStatus.RECOVERED);
+    expect(result.reason).toContain('terminal');
+    expect(result.review?.status).toBe(ReviewStatus.CLOSED);
+    expect(simulatedProvider.dispatchedCalls).toHaveLength(0);
+
+    const finalCase = await caseRepo.getCaseById(merchantAId, testCase.id);
+    expect(finalCase?.status).toBe(CaseStatus.RECOVERED);
+    const activeReviews = await prisma.humanReview.count({
+      where: {
+        merchantId: merchantAId,
+        caseId: testCase.id,
+        status: { in: [ReviewStatus.PENDING, ReviewStatus.TAKEN_OVER] },
+      },
+    });
+    expect(activeReviews).toBe(0);
+
+    const audits = await auditRepo.listByCase(merchantAId, testCase.id);
+    expect(audits.filter((audit) => audit.eventType === 'REVIEW_REQUESTED')).toHaveLength(1);
+    expect(audits).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        eventType: 'REVIEW_STALE',
+        reasonCode: 'REVIEW_CREATION_TERMINAL_CASE_RACE',
+      }),
+    ]));
+  });
+
   // B. Approval Happy Path & Double Revalidation
   it('Scenario B: Reviewer approves pending review -> fresh policy ALLOW -> ActionExecutor executes -> review APPROVED -> provider called once', async () => {
     if (!dbAvailable) return;

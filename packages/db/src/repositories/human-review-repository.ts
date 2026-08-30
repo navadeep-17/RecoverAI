@@ -26,6 +26,33 @@ export interface CreateReviewResult {
 
 export class HumanReviewRepository {
   /**
+   * Closes active review gates when the authoritative case can no longer be
+   * reviewed. This is a system reconciliation path, not a human resolution,
+   * so it deliberately does not require a reviewer identity.
+   */
+  async closeActiveReviewsForCase(
+    merchantId: string,
+    caseId: string,
+    reason: string,
+  ): Promise<number> {
+    const result = await prisma.humanReview.updateMany({
+      where: {
+        merchantId,
+        caseId,
+        status: { in: [ReviewStatus.PENDING, ReviewStatus.TAKEN_OVER] },
+      },
+      data: {
+        status: ReviewStatus.CLOSED,
+        reviewDecision: 'INVALIDATED_BY_CASE_STATE',
+        reviewNotes: reason,
+        resolvedAt: new Date(),
+      },
+    });
+
+    return result.count;
+  }
+
+  /**
    * Creates a durable HumanReview idempotently bound to a case and authoritative proposal/version.
    * Catches unique constraint collisions (P2002 on [merchantId, caseId, reviewKey]) and returns existing review.
    */
