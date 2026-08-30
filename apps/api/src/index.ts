@@ -3,11 +3,13 @@ import { loadEnv, createLogger } from '@recoverai/shared';
 import { AuditRepository, EventRepository } from '@recoverai/db';
 import { RazorpayWebhookService } from '@recoverai/integrations';
 import { PgBossRazorpayWebhookQueue } from './razorpay-webhook-queue.js';
+import { composeApiReviewService } from './runtime.js';
 
 const env = loadEnv();
 const logger = createLogger({ level: env.LOG_LEVEL });
 const webhookQueue = new PgBossRazorpayWebhookQueue(env.DATABASE_URL, env.PG_BOSS_SCHEMA);
 const server = buildServer({
+  reviewService: composeApiReviewService(env),
   razorpayWebhookService: new RazorpayWebhookService({
     merchantId: env.RAZORPAY_TEST_MERCHANT_ID,
     webhookSecret: env.RAZORPAY_WEBHOOK_SECRET,

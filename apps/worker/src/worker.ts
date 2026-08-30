@@ -28,6 +28,9 @@ export interface RecoveryWorkerConfig {
   scheduledJobRepo?: ScheduledJobRepository;
   outcomeObserver?: OutcomeObserver;
   reviewGateRequester?: ReviewGateRequester;
+  scheduler?: PgBossJobScheduler;
+  riskDetector?: RiskDetector;
+  eventIngestionService?: EventIngestionService;
 }
 
 export class RecoveryWorkerService {
@@ -83,8 +86,8 @@ export class RecoveryWorkerService {
         auditRepo,
       );
 
-      this.scheduler = new PgBossJobScheduler(this.boss, scheduledJobRepo);
-      this.riskDetector = new RiskDetector(
+      this.scheduler = this.config?.scheduler || new PgBossJobScheduler(this.boss, scheduledJobRepo);
+      this.riskDetector = this.config?.riskDetector || new RiskDetector(
         caseRepo,
         customerRepo,
         policyConfigRepo,
@@ -92,7 +95,7 @@ export class RecoveryWorkerService {
         eventRepo,
         this.scheduler,
       );
-      this.eventIngestionService = new EventIngestionService(eventRepo, auditRepo, this.riskDetector);
+      this.eventIngestionService = this.config?.eventIngestionService || new EventIngestionService(eventRepo, auditRepo, this.riskDetector);
       if (!this.outcomeObserver) {
         this.outcomeObserver = new OutcomeObserver({
           caseRepo,
