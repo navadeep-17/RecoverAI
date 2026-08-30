@@ -2,18 +2,21 @@ import fastify, { FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import sensible from '@fastify/sensible';
 import { generateCorrelationId, createLogger, loadEnv } from '@recoverai/shared';
-import { checkDatabaseConnection, AuditRepository, EventRepository } from '@recoverai/db';
+import { checkDatabaseConnection, AuditRepository, CaseRepository, EventRepository } from '@recoverai/db';
 import { RazorpayWebhookService } from '@recoverai/integrations';
 
 import { HumanReviewService } from '@recoverai/core';
 import { reviewRoutes } from './routes/review-routes.js';
 import { authenticatePrincipalHook } from './auth/principal.js';
 import { razorpayWebhookRoutes } from './routes/razorpay-webhook-routes.js';
+import { caseRoutes } from './routes/case-routes.js';
 
 export interface BuildServerOptions {
   checkDbConnection?: () => Promise<boolean>;
   reviewService?: HumanReviewService;
   razorpayWebhookService?: RazorpayWebhookService;
+  caseRepo?: CaseRepository;
+  auditRepo?: AuditRepository;
 }
 
 export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
@@ -101,6 +104,12 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       reviewService: options.reviewService,
     });
   }
+
+  app.register(caseRoutes, {
+    prefix: '/cases',
+    caseRepo: options.caseRepo || new CaseRepository(),
+    auditRepo: options.auditRepo || new AuditRepository(),
+  });
 
   app.register(razorpayWebhookRoutes, {
     prefix: '/webhooks',

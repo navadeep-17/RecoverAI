@@ -1,82 +1,20 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { ShieldCheck, Activity, AlertCircle, ArrowUpRight } from 'lucide-react';
+import { Activity, BarChart3, BrainCircuit, ClipboardCheck, ShieldCheck } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { RevenueRadarPage } from './pages/RevenueRadarPage';
+import { RecoveriesPage } from './pages/RecoveriesPage';
+import { CaseDetailPage } from './pages/CaseDetailPage';
+import './index.css';
 
 const queryClient = new QueryClient();
 
-export function AppShell() {
-  return (
-    <div className="min-h-screen bg-slate-50 flex flex-col">
-      <header className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between shadow-sm">
-        <div className="flex items-center space-x-3">
-          <div className="bg-sky-600 text-white p-2 rounded-lg font-bold">RAI</div>
-          <div>
-            <h1 className="text-lg font-semibold text-slate-900">RecoverAI</h1>
-            <p className="text-xs text-slate-500">Autonomous Revenue Recovery Control Plane</p>
-          </div>
-        </div>
-        <div className="flex items-center space-x-2">
-          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
-            <span className="w-2 h-2 mr-1.5 bg-green-500 rounded-full"></span>
-            Policy Firewall Active
-          </span>
-        </div>
-      </header>
-
-      <main className="flex-1 max-w-7xl w-full mx-auto p-6 space-y-6">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-slate-500">Revenue at Risk</span>
-              <AlertCircle className="w-5 h-5 text-amber-500" />
-            </div>
-            <p className="text-2xl font-bold text-slate-900 mt-2">₹0.00</p>
-            <span className="text-xs text-slate-400">Across active cases</span>
-          </div>
-
-          <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-slate-500">Recovered by RecoverAI</span>
-              <ArrowUpRight className="w-5 h-5 text-emerald-500" />
-            </div>
-            <p className="text-2xl font-bold text-emerald-600 mt-2">₹0.00</p>
-            <span className="text-xs text-emerald-600">Verified safe recoveries</span>
-          </div>
-
-          <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-slate-500">Active Recoveries</span>
-              <Activity className="w-5 h-5 text-sky-500" />
-            </div>
-            <p className="text-2xl font-bold text-slate-900 mt-2">0</p>
-            <span className="text-xs text-slate-400">Open & waiting workflows</span>
-          </div>
-
-          <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-slate-500">Needs Attention</span>
-              <ShieldCheck className="w-5 h-5 text-indigo-500" />
-            </div>
-            <p className="text-2xl font-bold text-slate-900 mt-2">0</p>
-            <span className="text-xs text-slate-400">Human review inbox</span>
-          </div>
-        </div>
-
-        <section className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm text-center py-12">
-          <h2 className="text-lg font-semibold text-slate-800">Command Center Bootstrapped</h2>
-          <p className="text-sm text-slate-500 mt-1 max-w-md mx-auto">
-            Phase 0 Foundation established. Ready for Core Domain, Policy Engine, Event Ingestion,
-            and Closed-Loop Recovery.
-          </p>
-        </section>
-      </main>
-    </div>
-  );
+function Shell() {
+  const [path, setPath] = useState(window.location.pathname);
+  const navigate = (next: string) => { window.history.pushState({}, '', next); setPath(next); };
+  useEffect(() => { const handler = () => setPath(window.location.pathname); window.addEventListener('popstate', handler); return () => window.removeEventListener('popstate', handler); }, []);
+  const detail = path.match(/^\/recoveries\/([^/]+)$/);
+  const activePath = detail ? '/recoveries' : path;
+  const nav = [{ label: 'Revenue Radar', path: '/', icon: BarChart3 }, { label: 'Active Recoveries', path: '/recoveries', icon: Activity }, { label: 'Human Review', icon: ClipboardCheck }, { label: 'Evaluation', icon: BrainCircuit }, { label: 'Policy Settings', icon: ShieldCheck }];
+  return <div className="min-h-screen bg-slate-50 text-slate-900"><aside className="fixed inset-y-0 hidden w-64 border-r border-slate-200 bg-white p-5 lg:block"><div className="flex items-center gap-3"><div className="rounded-lg bg-slate-950 p-2 text-xs font-bold text-white">RAI</div><div><p className="font-bold">RecoverAI</p><p className="text-xs text-slate-500">Revenue recovery control plane</p></div></div><nav className="mt-10 space-y-1">{nav.map((item) => <button key={item.label} disabled={!item.path} onClick={() => item.path && navigate(item.path)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium ${item.path === activePath ? 'bg-slate-950 text-white' : item.path ? 'text-slate-600 hover:bg-slate-100' : 'cursor-not-allowed text-slate-400'}`}><item.icon className="h-4 w-4"/>{item.label}{!item.path && <span className="ml-auto text-[10px]">Soon</span>}</button>)}</nav><div className="absolute bottom-5 text-xs text-slate-500"><p className="font-semibold text-slate-700">Razorpay Test Mode</p><p>DEV / HACKATHON ADAPTER ONLY</p></div></aside><div className="lg:pl-64"><header className="sticky top-0 z-10 flex h-16 items-center justify-between border-b border-slate-200 bg-white/95 px-5 backdrop-blur"><p className="text-sm font-medium text-slate-600">Policy-Governed Autonomous Revenue Recovery</p><span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">Policy controls active</span></header><main className="mx-auto max-w-7xl p-5 md:p-8">{detail ? <CaseDetailPage caseId={decodeURIComponent(detail[1])} navigate={navigate}/> : path === '/recoveries' ? <RecoveriesPage navigate={navigate}/> : <RevenueRadarPage/>}</main></div></div>;
 }
-
-export default function App() {
-  return (
-    <QueryClientProvider client={queryClient}>
-      <AppShell />
-    </QueryClientProvider>
-  );
-}
+export default function App() { return <QueryClientProvider client={queryClient}><Shell/></QueryClientProvider>; }
