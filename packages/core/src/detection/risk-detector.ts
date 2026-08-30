@@ -40,6 +40,32 @@ export class RiskDetector {
     private jobScheduler?: IJobScheduler,
   ) {}
 
+  /** Revenue-risk cases require authoritative, positive, exactly representable money. */
+  private async validateRevenueRiskMoney(
+    merchantId: string,
+    eventType: string,
+    amount: unknown,
+    currency: unknown,
+    identity: Record<string, unknown>,
+  ): Promise<{ amount: string; currency: string } | null> {
+    const normalizedCurrency = typeof currency === 'string' ? currency.toUpperCase() : '';
+    if (
+      typeof amount !== 'string' ||
+      !Money.isValidDecimalString(amount) ||
+      !/^[A-Z]{3}$/.test(normalizedCurrency) ||
+      Money.fromDecimalString(amount, normalizedCurrency).toPaise() <= 0n
+    ) {
+      await this.auditRepo.record(merchantId, {
+        eventType: 'DETECTION_ERROR',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { eventType, amount: typeof amount === 'string' ? amount : null, currency: typeof currency === 'string' ? currency : null, ...identity },
+        reasonCode: 'REVENUE_RISK_MONEY_REQUIRED',
+      });
+      return null;
+    }
+    return { amount, currency: normalizedCurrency };
+  }
+
   /**
    * Main entrypoint for processing normalized merchant events.
    * Deterministically identifies revenue risk or suppresses false cases.
@@ -133,6 +159,11 @@ export class RiskDetector {
       };
     }
 
+    const money = await this.validateRevenueRiskMoney(merchantId, 'PAYMENT_FAILED', event.amount, event.currency, { paymentId });
+    if (!money) {
+      return { riskDetected: false, caseCreated: false, suppressed: true, reason: 'Payment failure lacks authoritative positive amount and ISO currency; risk case suppressed' };
+    }
+
     // 3. Resolve or create customer if customer reference is present
     let customerId: string | undefined = undefined;
     if (event.customer && (event.customer.externalCustomerId || event.customer.email || event.customer.phone)) {
@@ -147,8 +178,8 @@ export class RiskDetector {
     }
 
     // 4. Create new PAYMENT_FAILURE RevenueRiskCase
-    const amountAtRisk = event.amount || '0.00';
-    const currency = (event.currency || 'INR').toUpperCase();
+    const amountAtRisk = money.amount;
+    const currency = money.currency;
     const verifiedFailureCode = event.payment?.verifiedFailureCode || null;
 
     const { case: newCase, created } = await this.caseRepo.createCaseIdempotently(merchantId, {
@@ -252,6 +283,11 @@ export class RiskDetector {
       };
     }
 
+    const money = await this.validateRevenueRiskMoney(merchantId, 'SUBSCRIPTION_RENEWAL_FAILED', event.amount, event.currency, { subscriptionId });
+    if (!money) {
+      return { riskDetected: false, caseCreated: false, suppressed: true, reason: 'Subscription failure lacks authoritative positive amount and ISO currency; risk case suppressed' };
+    }
+
     // 2. Resolve or create customer
     let customerId: string | undefined = undefined;
     if (event.customer && (event.customer.externalCustomerId || event.customer.email || event.customer.phone)) {
@@ -266,8 +302,8 @@ export class RiskDetector {
     }
 
     // 3. Create SUBSCRIPTION_FAILURE RevenueRiskCase with authoritative incidentKey
-    const amountAtRisk = event.amount || '0.00';
-    const currency = (event.currency || 'INR').toUpperCase();
+    const amountAtRisk = money.amount;
+    const currency = money.currency;
     const verifiedFailureCode = event.payment?.verifiedFailureCode || null;
 
     const { case: newCase, created } = await this.caseRepo.createCaseIdempotently(merchantId, {
@@ -532,6 +568,17 @@ export class RiskDetector {
       };
     }
 
+    const money = await this.validateRevenueRiskMoney(
+      merchantId,
+      'CHECKOUT_ABANDONMENT_CHECK',
+      context?.amount,
+      context?.currency,
+      { checkoutSessionId },
+    );
+    if (!money) {
+      return { riskDetected: false, caseCreated: false, suppressed: true, reason: 'Checkout abandonment lacks authoritative positive amount and ISO currency; risk case suppressed' };
+    }
+
     // 3. Resolve customer if provided
     let customerId: string | undefined = undefined;
     const customerData = context?.customer as Record<string, unknown> | undefined;
@@ -547,8 +594,8 @@ export class RiskDetector {
     }
 
     // 4. Create CHECKOUT_ABANDONMENT case with authoritative incidentKey
-    const amountAtRisk = (context?.amount as string) || '0.00';
-    const currency = ((context?.currency as string) || 'INR').toUpperCase();
+    const amountAtRisk = money.amount;
+    const currency = money.currency;
 
     const { case: newCase, created } = await this.caseRepo.createCaseIdempotently(merchantId, {
       customerId,
@@ -796,6 +843,17 @@ export class RiskDetector {
       };
     }
 
+    const money = await this.validateRevenueRiskMoney(
+      merchantId,
+      'INVOICE_OVERDUE_CHECK',
+      context?.amount,
+      context?.currency,
+      { invoiceId },
+    );
+    if (!money) {
+      return { riskDetected: false, caseCreated: false, suppressed: true, reason: 'Overdue invoice lacks authoritative positive amount and ISO currency; risk case suppressed' };
+    }
+
     // 3. Resolve customer if provided
     let customerId: string | undefined = undefined;
     const customerData = context?.customer as Record<string, unknown> | undefined;
@@ -811,8 +869,8 @@ export class RiskDetector {
     }
 
     // 4. Create OVERDUE_RECEIVABLE case with authoritative incidentKey
-    const amountAtRisk = (context?.amount as string) || '0.00';
-    const currency = ((context?.currency as string) || 'INR').toUpperCase();
+    const amountAtRisk = money.amount;
+    const currency = money.currency;
 
     const { case: newCase, created } = await this.caseRepo.createCaseIdempotently(merchantId, {
       customerId,
@@ -873,245 +931,40 @@ export class RiskDetector {
     };
   }
 
-  /**
-   * 7. PAYMENT_SUCCEEDED -> Resolve active case or record observation
-   */
+  /** Monetary success is persisted for suppression; OutcomeObserver owns recovery credit and terminal state. */
   private async handlePaymentSucceeded(event: NormalizedMerchantEvent): Promise<DetectionResult> {
-    const merchantId = event.merchantId;
-    const paymentId = event.payment?.paymentId || event.externalEventId;
-    const subscriptionId = event.payment?.subscriptionId;
-
-    let matchedCase: RevenueRiskCase | null = null;
-    if (paymentId) {
-      const paymentIncidentKey = generateIncidentKey(merchantId, RiskType.PAYMENT_FAILURE, paymentId);
-      matchedCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, paymentIncidentKey);
-    }
-    if (!matchedCase && subscriptionId) {
-      const subIncidentKey = generateIncidentKey(merchantId, RiskType.SUBSCRIPTION_FAILURE, subscriptionId);
-      matchedCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, subIncidentKey);
-    }
-
-    if (matchedCase && (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING)) {
-      let recoveredAmount: Money | undefined = undefined;
-      if (event.amount) {
-        const eventCurrency = (event.currency || '').toUpperCase();
-        if (eventCurrency !== matchedCase.currency.toUpperCase()) {
-          await this.auditRepo.record(merchantId, {
-            caseId: matchedCase.id,
-            eventType: 'CURRENCY_MISMATCH_REJECTED',
-            actorType: AuditActorType.SYSTEM,
-            inputSummaryJson: {
-              eventCurrency,
-              caseCurrency: matchedCase.currency,
-              amount: event.amount,
-            },
-            reasonCode: 'PAYMENT_CURRENCY_MISMATCH',
-          });
-          return {
-            riskDetected: false,
-            caseCreated: false,
-            caseId: matchedCase.id,
-            case: matchedCase,
-            reason: `Currency mismatch: event currency "${eventCurrency}" does not match case currency "${matchedCase.currency}"; case remains open`,
-          };
-        }
-        recoveredAmount = Money.fromDecimalString(event.amount, eventCurrency);
-      }
-
-      const updatedCase = await this.caseRepo.compareAndSetStatus(
-        merchantId,
-        matchedCase.id,
-        matchedCase.status,
-        CaseStatus.RECOVERED,
-        {
-          recoveredAmount,
-          resolvedAt: event.occurredAt,
-        },
-      );
-
-      await this.auditRepo.record(merchantId, {
-        caseId: updatedCase.id,
-        eventType: 'CASE_RESOLVED_BY_PAYMENT',
-        actorType: AuditActorType.SYSTEM,
-        inputSummaryJson: { paymentId, amount: event.amount, currency: event.currency },
-        outputSummaryJson: { status: CaseStatus.RECOVERED, recoveredAmount: event.amount },
-        reasonCode: 'PAYMENT_SUCCEEDED_RESOLVED_CASE',
-      });
-
-      return {
-        riskDetected: false,
-        caseCreated: false,
-        caseId: updatedCase.id,
-        case: updatedCase,
-        reason: 'Payment succeeded; active case resolved to RECOVERED',
-      };
-    }
-
-    return {
-      riskDetected: false,
-      caseCreated: false,
-      reason: 'Payment succeeded observed; no active case required resolution',
-    };
+    await this.auditRepo.record(event.merchantId, {
+      eventType: 'PAYMENT_SUCCEEDED_OBSERVED',
+      actorType: AuditActorType.SYSTEM,
+      inputSummaryJson: { paymentId: event.payment?.paymentId ?? null, amount: event.amount, currency: event.currency },
+      reasonCode: 'MONETARY_RECOVERY_DEFERRED_TO_OUTCOME_OBSERVER',
+    });
+    return { riskDetected: false, caseCreated: false, reason: 'Payment success persisted for suppression; OutcomeObserver owns monetary recovery' };
   }
 
-  /**
-   * 8. CHECKOUT_COMPLETED -> Resolve existing CHECKOUT_ABANDONMENT case or record observation
-   */
+  /** Checkout completion remains available for timer suppression; OutcomeObserver owns money recovery. */
   private async handleCheckoutCompleted(event: NormalizedMerchantEvent): Promise<DetectionResult> {
-    const merchantId = event.merchantId;
     const checkoutSessionId = event.checkout?.checkoutSessionId || event.externalEventId;
-
-    if (!checkoutSessionId) {
-      throw new MissingEventIdentityError('CHECKOUT_COMPLETED', 'checkoutSessionId');
-    }
-
-    const incidentKey = generateIncidentKey(merchantId, RiskType.CHECKOUT_ABANDONMENT, checkoutSessionId);
-    const matchedCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, incidentKey);
-
-    if (matchedCase && (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING)) {
-      let recoveredAmount: Money | undefined = undefined;
-      if (event.amount) {
-        const eventCurrency = (event.currency || '').toUpperCase();
-        if (eventCurrency !== matchedCase.currency.toUpperCase()) {
-          await this.auditRepo.record(merchantId, {
-            caseId: matchedCase.id,
-            eventType: 'CURRENCY_MISMATCH_REJECTED',
-            actorType: AuditActorType.SYSTEM,
-            inputSummaryJson: {
-              eventCurrency,
-              caseCurrency: matchedCase.currency,
-              amount: event.amount,
-            },
-            reasonCode: 'CHECKOUT_CURRENCY_MISMATCH',
-          });
-          return {
-            riskDetected: false,
-            caseCreated: false,
-            caseId: matchedCase.id,
-            case: matchedCase,
-            reason: `Currency mismatch: checkout completed currency "${eventCurrency}" does not match case currency "${matchedCase.currency}"; case remains open`,
-          };
-        }
-        recoveredAmount = Money.fromDecimalString(event.amount, eventCurrency);
-      }
-
-      const updatedCase = await this.caseRepo.compareAndSetStatus(
-        merchantId,
-        matchedCase.id,
-        matchedCase.status,
-        CaseStatus.RECOVERED,
-        {
-          recoveredAmount,
-          resolvedAt: event.occurredAt,
-        },
-      );
-
-      await this.auditRepo.record(merchantId, {
-        caseId: updatedCase.id,
-        eventType: 'CASE_RESOLVED_BY_CHECKOUT_COMPLETION',
-        actorType: AuditActorType.SYSTEM,
-        inputSummaryJson: { checkoutSessionId, amount: event.amount, currency: event.currency },
-        outputSummaryJson: { status: CaseStatus.RECOVERED, recoveredAmount: event.amount },
-        reasonCode: 'CHECKOUT_COMPLETED_RESOLVED_CASE',
-      });
-
-      return {
-        riskDetected: false,
-        caseCreated: false,
-        caseId: updatedCase.id,
-        case: updatedCase,
-        reason: 'Checkout completed; active abandonment case resolved to RECOVERED',
-      };
-    }
-
-    await this.auditRepo.record(merchantId, {
+    if (!checkoutSessionId) throw new MissingEventIdentityError('CHECKOUT_COMPLETED', 'checkoutSessionId');
+    await this.auditRepo.record(event.merchantId, {
       eventType: 'CHECKOUT_COMPLETED_OBSERVED',
       actorType: AuditActorType.SYSTEM,
       inputSummaryJson: { checkoutSessionId, occurredAt: event.occurredAt },
-      reasonCode: 'CHECKOUT_COMPLETED_RECORDED',
+      reasonCode: 'MONETARY_RECOVERY_DEFERRED_TO_OUTCOME_OBSERVER',
     });
-
-    return {
-      riskDetected: false,
-      caseCreated: false,
-      reason: 'Checkout completed observed',
-    };
+    return { riskDetected: false, caseCreated: false, reason: 'Checkout completion persisted for suppression; OutcomeObserver owns monetary recovery' };
   }
 
-  /**
-   * 9. INVOICE_PAID -> Resolve active case or record observation
-   */
+  /** Invoice payment remains available for overdue suppression; OutcomeObserver owns money recovery. */
   private async handleInvoicePaid(event: NormalizedMerchantEvent): Promise<DetectionResult> {
-    const merchantId = event.merchantId;
     const invoiceId = event.invoice?.invoiceId || event.externalEventId;
-
-    if (!invoiceId) {
-      throw new MissingEventIdentityError('INVOICE_PAID', 'invoiceId');
-    }
-
-    const invoiceIncidentKey = generateIncidentKey(merchantId, RiskType.OVERDUE_RECEIVABLE, invoiceId);
-    const matchedCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, invoiceIncidentKey);
-
-    if (matchedCase && (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING)) {
-      let recoveredAmount: Money | undefined = undefined;
-      if (event.amount) {
-        const eventCurrency = (event.currency || '').toUpperCase();
-        if (eventCurrency !== matchedCase.currency.toUpperCase()) {
-          await this.auditRepo.record(merchantId, {
-            caseId: matchedCase.id,
-            eventType: 'CURRENCY_MISMATCH_REJECTED',
-            actorType: AuditActorType.SYSTEM,
-            inputSummaryJson: {
-              eventCurrency,
-              caseCurrency: matchedCase.currency,
-              amount: event.amount,
-            },
-            reasonCode: 'INVOICE_CURRENCY_MISMATCH',
-          });
-          return {
-            riskDetected: false,
-            caseCreated: false,
-            caseId: matchedCase.id,
-            case: matchedCase,
-            reason: `Currency mismatch: invoice paid currency "${eventCurrency}" does not match case currency "${matchedCase.currency}"; case remains open`,
-          };
-        }
-        recoveredAmount = Money.fromDecimalString(event.amount, eventCurrency);
-      }
-
-      const updatedCase = await this.caseRepo.compareAndSetStatus(
-        merchantId,
-        matchedCase.id,
-        matchedCase.status,
-        CaseStatus.RECOVERED,
-        {
-          recoveredAmount,
-          resolvedAt: event.occurredAt,
-        },
-      );
-
-      await this.auditRepo.record(merchantId, {
-        caseId: updatedCase.id,
-        eventType: 'INVOICE_PAID_RESOLVED_CASE',
-        actorType: AuditActorType.SYSTEM,
-        inputSummaryJson: { invoiceId, amount: event.amount },
-        outputSummaryJson: { status: CaseStatus.RECOVERED, recoveredAmount: event.amount },
-        reasonCode: 'INVOICE_PAID_RESOLVED_CASE',
-      });
-
-      return {
-        riskDetected: false,
-        caseCreated: false,
-        caseId: updatedCase.id,
-        case: updatedCase,
-        reason: 'Invoice paid; active case resolved to RECOVERED',
-      };
-    }
-
-    return {
-      riskDetected: false,
-      caseCreated: false,
-      reason: 'Invoice paid observed; no active case required resolution',
-    };
+    if (!invoiceId) throw new MissingEventIdentityError('INVOICE_PAID', 'invoiceId');
+    await this.auditRepo.record(event.merchantId, {
+      eventType: 'INVOICE_PAID_OBSERVED',
+      actorType: AuditActorType.SYSTEM,
+      inputSummaryJson: { invoiceId, amount: event.amount, currency: event.currency },
+      reasonCode: 'MONETARY_RECOVERY_DEFERRED_TO_OUTCOME_OBSERVER',
+    });
+    return { riskDetected: false, caseCreated: false, reason: 'Invoice payment persisted for suppression; OutcomeObserver owns monetary recovery' };
   }
 }

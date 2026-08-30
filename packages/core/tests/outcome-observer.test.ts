@@ -253,6 +253,7 @@ describe('OutcomeObserver Unit Tests', () => {
       expect(result.caseResolved).toBe(true);
       expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.RECOVERED);
       expect(inMemoryOutcomes).toHaveLength(1);
+      expect(inMemoryOutcomes[0].actionId).toBe('act_link_001');
     });
 
     it('rejects forged payment-link correlation before any recovery credit', async () => {

@@ -131,7 +131,7 @@ export class RazorpayEventNormalizer {
       eventType = NormalizedEventType.PAYMENT_FAILED;
     } else if (eventName === 'payment.captured' || eventName === 'payment_link.paid') {
       eventType = NormalizedEventType.PAYMENT_SUCCEEDED;
-    } else if (eventName === 'subscription.charged' || eventName === 'subscription.activated') {
+    } else if (eventName === 'subscription.charged') {
       eventType = NormalizedEventType.PAYMENT_SUCCEEDED;
     } else if (eventName === 'subscription.pending' || eventName === 'subscription.halted') {
       eventType = NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED;

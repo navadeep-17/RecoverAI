@@ -65,6 +65,7 @@ export interface ListCasesFilter {
 export interface RevenueRadarMetrics {
   revenueAtRisk: string;
   verifiedRecovered: string;
+  agentAttributedRecovered: string;
   activeRecoveries: number;
   needsReview: number;
   riskTypeBreakdown: Record<string, { count: number; amountAtRisk: string }>;
@@ -218,6 +219,18 @@ export class CaseRepository {
     let verifiedRecovered = 0n;
     let activeRecoveries = 0;
     let needsReview = 0;
+    const attributedOutcomes = await prisma.recoveryOutcome.findMany({
+      where: {
+        actionId: { not: null },
+        amountRecovered: { not: null },
+        case: { merchantId },
+      },
+      select: { amountRecovered: true },
+    });
+    const agentAttributedRecovered = attributedOutcomes.reduce(
+      (sum, outcome) => sum + decimalToMinorUnits(outcome.amountRecovered),
+      0n,
+    );
     const riskTypeBreakdown: Record<string, { count: number; amountMinor: bigint }> = {};
     const statusBreakdown: Record<string, number> = {};
     for (const item of cases) {
@@ -236,6 +249,7 @@ export class CaseRepository {
     return {
       revenueAtRisk: minorUnitsToDecimal(revenueAtRisk),
       verifiedRecovered: minorUnitsToDecimal(verifiedRecovered),
+      agentAttributedRecovered: minorUnitsToDecimal(agentAttributedRecovered),
       activeRecoveries,
       needsReview,
       riskTypeBreakdown: Object.fromEntries(Object.entries(riskTypeBreakdown).map(([riskType, group]) => [riskType, { count: group.count, amountAtRisk: minorUnitsToDecimal(group.amountMinor) }])),

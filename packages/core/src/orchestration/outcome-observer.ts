@@ -196,7 +196,13 @@ export class OutcomeObserver {
 
     // 2. Handle Monetary Confirmation Events (PAYMENT_SUCCEEDED, CHECKOUT_COMPLETED, INVOICE_PAID)
     if (this.isMonetaryRecoveryEvent(event.eventType)) {
-      return this.handleMonetaryRecovery(merchantId, matchedCase, event, merchantEventId);
+      return this.handleMonetaryRecovery(
+        merchantId,
+        matchedCase,
+        event,
+        merchantEventId,
+        authoritativeActionCorrelation,
+      );
     }
 
     // 3. Handle PAYMENT_METHOD_UPDATED
@@ -1061,6 +1067,7 @@ export class OutcomeObserver {
     matchedCase: RevenueRiskCase,
     event: NormalizedMerchantEvent,
     merchantEventId?: string,
+    authoritativeActionCorrelation?: AuthoritativeActionCorrelation,
   ): Promise<ObservationResult> {
     const caseId = matchedCase.id;
 
@@ -1166,6 +1173,7 @@ export class OutcomeObserver {
     const rawId = (rawEvent.eventId || rawEvent.id) as string | undefined;
     const dedupeKey = `merchant-event:${merchantEventId || event.externalEventId || rawId}`;
     const outcomeResult = await this.outcomeRepo.recordOutcome(merchantId, caseId, {
+      actionId: authoritativeActionCorrelation?.actionId,
       merchantEventId,
       dedupeKey,
       outcomeType: event.eventType,
@@ -1173,6 +1181,13 @@ export class OutcomeObserver {
       detailsJson: {
         eventSource: event.source,
         externalEventId: event.externalEventId,
+        actionId: authoritativeActionCorrelation?.actionId ?? null,
+        attribution: authoritativeActionCorrelation
+          ? {
+              providerName: authoritativeActionCorrelation.providerName,
+              externalActionId: authoritativeActionCorrelation.externalActionId,
+            }
+          : null,
       },
       observedAt: event.occurredAt || this.now(),
     });
@@ -1225,6 +1240,7 @@ export class OutcomeObserver {
           outcomeId: outcomeResult.outcome.id,
           amount: event.amount,
           currency: eventCurrency,
+          actionId: authoritativeActionCorrelation?.actionId ?? null,
         },
         outputSummaryJson: {
           status: CaseStatus.RECOVERED,

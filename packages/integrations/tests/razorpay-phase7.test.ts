@@ -100,6 +100,25 @@ describe('Phase 7 Razorpay boundaries', () => {
     expect(() => RazorpayEventNormalizer.normalize(merchantId, raw)).toThrow(/Unsupported Razorpay event/);
   });
 
+  it('normalizes subscription.charged only with authoritative money evidence', () => {
+    const normalized = RazorpayEventNormalizer.normalize(merchantId, {
+      id: 'evt_sub_charge', event: 'subscription.charged', created_at: 1720000000,
+      payload: { payment: { entity: { id: 'pay_sub_charge', subscription_id: 'sub_1', amount: 1499900, currency: 'INR' } } },
+    } as any);
+    expect(normalized.eventType).toBe('PAYMENT_SUCCEEDED');
+    expect(normalized.amount).toBe('14999.00');
+    expect(normalized.currency).toBe('INR');
+    expect(() => RazorpayEventNormalizer.normalize(merchantId, {
+      id: 'evt_sub_missing_money', event: 'subscription.charged', payload: { subscription: { entity: { id: 'sub_1' } } },
+    } as any)).toThrow();
+  });
+
+  it('rejects subscription.activated as non-monetary lifecycle evidence', () => {
+    expect(() => RazorpayEventNormalizer.normalize(merchantId, {
+      id: 'evt_sub_activated', event: 'subscription.activated', payload: { subscription: { entity: { id: 'sub_1' } } },
+    } as any)).toThrow(/Unsupported Razorpay event/);
+  });
+
   it('uses the real payment-link adapter only through explicit Test Mode runtime configuration', () => {
     const configured = ProviderRegistry.forRuntime({ enabled: true, keyId: 'rzp_test_key', keySecret: 'secret' });
     const safeDefault = ProviderRegistry.forRuntime({ enabled: false });

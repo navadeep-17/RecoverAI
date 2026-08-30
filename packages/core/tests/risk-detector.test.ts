@@ -416,11 +416,13 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
     it('repeated evaluateCheckoutTimer execution does not duplicate case', async () => {
       const res1 = await riskDetector.evaluateCheckoutTimer(merchantId, 'sess_chk_dup', {
         amount: '2500.00',
+        currency: 'INR',
       });
       expect(res1.caseCreated).toBe(true);
 
       const res2 = await riskDetector.evaluateCheckoutTimer(merchantId, 'sess_chk_dup', {
         amount: '2500.00',
+        currency: 'INR',
       });
       expect(res2.caseCreated).toBe(false);
       expect(res2.deduplicated).toBe(true);
@@ -484,8 +486,8 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
     });
   });
 
-  describe('5. Success Events & Resolution', () => {
-    it('PAYMENT_SUCCEEDED resolves active OPEN case to RECOVERED', async () => {
+  describe('5. Success Events are Suppression Observations', () => {
+    it('PAYMENT_SUCCEEDED leaves active recovery to OutcomeObserver', async () => {
       // Create active case
       const createdCase = await mockCaseRepo.createCase(merchantId, {
         riskType: RiskType.PAYMENT_FAILURE,
@@ -510,17 +512,18 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
       };
 
       const result = await riskDetector.handleNormalizedEvent(event);
-      expect(result.case?.status).toBe(CaseStatus.RECOVERED);
+      expect(result.case).toBeUndefined();
+      expect(createdCase.status).toBe(CaseStatus.OPEN);
       expect(mockAuditRepo.record).toHaveBeenCalledWith(
         merchantId,
         expect.objectContaining({
-          eventType: 'CASE_RESOLVED_BY_PAYMENT',
-          reasonCode: 'PAYMENT_SUCCEEDED_RESOLVED_CASE',
+          eventType: 'PAYMENT_SUCCEEDED_OBSERVED',
+          reasonCode: 'MONETARY_RECOVERY_DEFERRED_TO_OUTCOME_OBSERVER',
         }),
       );
     });
 
-    it('CHECKOUT_COMPLETED resolves active CHECKOUT_ABANDONMENT case to RECOVERED', async () => {
+    it('CHECKOUT_COMPLETED leaves active recovery to OutcomeObserver', async () => {
       const checkoutSessionId = 'sess_rec_chk_01';
       const incidentKey = generateIncidentKey(merchantId, RiskType.CHECKOUT_ABANDONMENT, checkoutSessionId);
 
@@ -545,17 +548,18 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
       };
 
       const result = await riskDetector.handleNormalizedEvent(event);
-      expect(result.case?.status).toBe(CaseStatus.RECOVERED);
+      expect(result.case).toBeUndefined();
+      expect(createdCase.status).toBe(CaseStatus.OPEN);
       expect(mockAuditRepo.record).toHaveBeenCalledWith(
         merchantId,
         expect.objectContaining({
-          eventType: 'CASE_RESOLVED_BY_CHECKOUT_COMPLETION',
-          reasonCode: 'CHECKOUT_COMPLETED_RESOLVED_CASE',
+          eventType: 'CHECKOUT_COMPLETED_OBSERVED',
+          reasonCode: 'MONETARY_RECOVERY_DEFERRED_TO_OUTCOME_OBSERVER',
         }),
       );
     });
 
-    it('rejects case resolution and audits CURRENCY_MISMATCH_REJECTED when success event currency differs from case currency', async () => {
+    it('does not inspect or resolve a currency-mismatched success event', async () => {
       // Case is in INR
       const incidentKey = generateIncidentKey(merchantId, RiskType.PAYMENT_FAILURE, 'pay_curr_mismatch');
       const createdCase = await mockCaseRepo.createCase(merchantId, {
@@ -580,12 +584,13 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
       };
 
       const result = await riskDetector.handleNormalizedEvent(event);
-      expect(result.case?.status).toBe(CaseStatus.OPEN); // Case was NOT resolved
+      expect(result.case).toBeUndefined();
+      expect(createdCase.status).toBe(CaseStatus.OPEN);
       expect(mockAuditRepo.record).toHaveBeenCalledWith(
         merchantId,
         expect.objectContaining({
-          eventType: 'CURRENCY_MISMATCH_REJECTED',
-          reasonCode: 'PAYMENT_CURRENCY_MISMATCH',
+          eventType: 'PAYMENT_SUCCEEDED_OBSERVED',
+          reasonCode: 'MONETARY_RECOVERY_DEFERRED_TO_OUTCOME_OBSERVER',
         }),
       );
     });
@@ -727,6 +732,23 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
       expect(riskDetectedCalls.length).toBe(1);
       expect(duplicateCalls.length).toBe(1);
       expect(duplicateCalls[0][1].reasonCode).toBe('DUPLICATE_PAYMENT_FAILURE_INCIDENT');
+    });
+
+    it('suppresses all revenue-risk case creation when money is missing, malformed, zero, or currency is absent', async () => {
+      const payment = await riskDetector.handleNormalizedEvent({
+        merchantId, source: MerchantEventSource.RAZORPAY, eventType: NormalizedEventType.PAYMENT_FAILED,
+        occurredAt: new Date(), dedupeKey: 'missing-payment-money', payment: { paymentId: 'pay_missing_money' }, amount: null, currency: 'INR',
+      } as any);
+      const subscription = await riskDetector.handleNormalizedEvent({
+        merchantId, source: MerchantEventSource.RAZORPAY, eventType: NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED,
+        occurredAt: new Date(), dedupeKey: 'zero-sub-money', payment: { subscriptionId: 'sub_zero_money' }, amount: '0.00', currency: 'INR',
+      } as any);
+      const checkout = await riskDetector.evaluateCheckoutTimer(merchantId, 'checkout_bad_money', { amount: 'bad', currency: 'INR' });
+      const invoice = await riskDetector.evaluateInvoiceTimer(merchantId, 'invoice_missing_currency', { amount: '10.00' });
+      for (const result of [payment, subscription, checkout, invoice]) {
+        expect(result.caseCreated).toBe(false);
+        expect(result.suppressed).toBe(true);
+      }
     });
   });
 });
