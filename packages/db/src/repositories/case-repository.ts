@@ -62,6 +62,26 @@ export interface ListCasesFilter {
   offset?: number;
 }
 
+export interface RevenueRadarMetrics {
+  revenueAtRisk: string;
+  verifiedRecovered: string;
+  activeRecoveries: number;
+  needsReview: number;
+  riskTypeBreakdown: Record<string, { count: number; amountAtRisk: string }>;
+  statusBreakdown: Record<string, number>;
+}
+
+function decimalToMinorUnits(value: Prisma.Decimal | null): bigint {
+  if (!value) return 0n;
+  const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(value.toString());
+  if (!match) throw new InvalidMoneyError(`Stored money is not canonical: ${value.toString()}`);
+  return BigInt(match[1]) * 100n + BigInt((match[2] ?? '').padEnd(2, '0'));
+}
+
+function minorUnitsToDecimal(value: bigint): string {
+  return `${value / 100n}.${(value % 100n).toString().padStart(2, '0')}`;
+}
+
 export interface CaseTransitionOptions {
   recoveredAmount?: ExactMonetaryInput;
   resolvedAt?: Date;
@@ -169,7 +189,7 @@ export class CaseRepository {
     });
   }
 
-  async listCases(merchantId: string, filter: ListCasesFilter = {}): Promise<RevenueRiskCase[]> {
+  async listCases(merchantId: string, filter: ListCasesFilter = {}): Promise<CaseWithRelations[]> {
     const { status, riskType, limit = 50, offset = 0 } = filter;
     return prisma.revenueRiskCase.findMany({
       where: {
@@ -185,6 +205,42 @@ export class CaseRepository {
         actions: { take: 1, orderBy: { createdAt: 'desc' } },
       },
     });
+  }
+
+  /** Full tenant-scoped dashboard aggregate. Case pagination must never affect these totals. */
+  async getRevenueRadarMetrics(merchantId: string): Promise<RevenueRadarMetrics> {
+    const cases = await prisma.revenueRiskCase.findMany({
+      where: { merchantId },
+      select: { status: true, riskType: true, amountAtRisk: true, recoveredAmount: true },
+    });
+    const activeStatuses = new Set<CaseStatus>([CaseStatus.OPEN, CaseStatus.WAITING, CaseStatus.NEEDS_REVIEW]);
+    let revenueAtRisk = 0n;
+    let verifiedRecovered = 0n;
+    let activeRecoveries = 0;
+    let needsReview = 0;
+    const riskTypeBreakdown: Record<string, { count: number; amountMinor: bigint }> = {};
+    const statusBreakdown: Record<string, number> = {};
+    for (const item of cases) {
+      statusBreakdown[item.status] = (statusBreakdown[item.status] ?? 0) + 1;
+      verifiedRecovered += decimalToMinorUnits(item.recoveredAmount);
+      if (item.status === CaseStatus.NEEDS_REVIEW) needsReview += 1;
+      if (!activeStatuses.has(item.status)) continue;
+      activeRecoveries += 1;
+      const amount = decimalToMinorUnits(item.amountAtRisk);
+      revenueAtRisk += amount;
+      const group = riskTypeBreakdown[item.riskType] ?? { count: 0, amountMinor: 0n };
+      group.count += 1;
+      group.amountMinor += amount;
+      riskTypeBreakdown[item.riskType] = group;
+    }
+    return {
+      revenueAtRisk: minorUnitsToDecimal(revenueAtRisk),
+      verifiedRecovered: minorUnitsToDecimal(verifiedRecovered),
+      activeRecoveries,
+      needsReview,
+      riskTypeBreakdown: Object.fromEntries(Object.entries(riskTypeBreakdown).map(([riskType, group]) => [riskType, { count: group.count, amountAtRisk: minorUnitsToDecimal(group.amountMinor) }])),
+      statusBreakdown,
+    };
   }
 
   /**

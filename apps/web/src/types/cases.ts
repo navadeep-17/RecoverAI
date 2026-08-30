@@ -13,3 +13,4 @@ export interface RecoveryAction { id: string; actionType: string; status: string
 export interface RecoveryOutcome { id: string; outcomeType: string; amountRecovered?: string | null; observedAt: string; detailsJson?: Record<string, unknown> | null; }
 export interface AuditEvent { id: string; eventType: string; actorType: string; reasonCode?: string | null; createdAt: string; }
 export interface CaseDetailResponse { case: RecoveryCase; auditEvents: AuditEvent[]; }
+export interface RevenueRadarMetrics { revenueAtRisk: string; verifiedRecovered: string; activeRecoveries: number; needsReview: number; riskTypeBreakdown: Record<string, { count: number; amountAtRisk: string }>; statusBreakdown: Record<string, number>; }

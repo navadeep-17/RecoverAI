@@ -1,5 +1,5 @@
 import { getJson } from './client';
-import type { CaseDetailResponse, CaseStatus, RecoveryCase, RiskType } from '../types/cases';
+import type { CaseDetailResponse, CaseStatus, RecoveryCase, RevenueRadarMetrics, RiskType } from '../types/cases';
 
 export function listCases(filters: { status?: CaseStatus; riskType?: RiskType } = {}) {
   const params = new URLSearchParams();
@@ -9,3 +9,4 @@ export function listCases(filters: { status?: CaseStatus; riskType?: RiskType } 
   return getJson<{ cases: RecoveryCase[] }>(`/cases${query ? `?${query}` : ''}`);
 }
 export function getCase(caseId: string) { return getJson<CaseDetailResponse>(`/cases/${encodeURIComponent(caseId)}`); }
+export function getRevenueRadarMetrics() { return getJson<RevenueRadarMetrics>('/cases/metrics'); }

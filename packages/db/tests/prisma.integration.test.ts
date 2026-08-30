@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { prisma, checkDatabaseConnection } from '../src/client.js';
 import { buildServer } from '../../../apps/api/src/server.js';
+import { CaseRepository } from '../src/repositories/case-repository.js';
+import { CaseStatus, RiskType } from '@prisma/client';
 
 describe('PostgreSQL + Prisma Real Integration Smoke Test', () => {
   let dbAvailable = false;
@@ -82,5 +84,13 @@ describe('PostgreSQL + Prisma Real Integration Smoke Test', () => {
     const body = JSON.parse(res.payload);
     expect(body.ready).toBe(true);
     expect(body.database).toBe(true);
+  });
+
+  it('aggregates more than one list page of tenant-scoped radar metrics exactly', async () => {
+    if (!dbAvailable) { expect(true).toBe(true); return; }
+    await prisma.revenueRiskCase.deleteMany({ where: { merchantId: testMerchantId } });
+    await prisma.revenueRiskCase.createMany({ data: Array.from({ length: 51 }, (_, index) => ({ merchantId: testMerchantId, riskType: RiskType.PAYMENT_FAILURE, amountAtRisk: '0.10', currency: 'INR', status: index === 50 ? CaseStatus.NEEDS_REVIEW : CaseStatus.OPEN, contextJson: {}, incidentKey: `metrics-${index}`, recoveredAmount: index === 0 ? '0.10' : null })) });
+    const metrics = await new CaseRepository().getRevenueRadarMetrics(testMerchantId);
+    expect(metrics).toMatchObject({ revenueAtRisk: '5.10', verifiedRecovered: '0.10', activeRecoveries: 51, needsReview: 1, riskTypeBreakdown: { PAYMENT_FAILURE: { count: 51, amountAtRisk: '5.10' } }, statusBreakdown: { OPEN: 50, NEEDS_REVIEW: 1 } });
   });
 });
