@@ -21,8 +21,12 @@ export class ProviderRegistry extends BaseProviderRegistry {
   /** Explicit runtime composition; the no-argument registry remains simulated. */
   static forRuntime(config: RazorpayTestModeRuntimeConfig): ProviderRegistry {
     if (config.enabled) {
+      // Base ProviderRegistry chooses the first supporting provider. Keep Razorpay
+      // first so payment links use Test Mode, while retaining simulation for all
+      // other supported recovery actions.
       return new ProviderRegistry([
         new RazorpayPaymentLinkProvider({ keyId: config.keyId, keySecret: config.keySecret, fetchImpl: config.fetchImpl }),
+        new SimulatedRecoveryProvider(),
       ]);
     }
     return new ProviderRegistry();

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { RecoveryWorkerService } from '../src/worker.js';
 import PgBoss from 'pg-boss';
 
@@ -26,6 +26,23 @@ describe('RecoveryWorkerService Unit Tests', () => {
 
     await worker.stop();
     expect(worker.getStatus().isRunning).toBe(false);
+  });
+
+  it('cleans up a real worker lifecycle when subscriber registration fails after pg-boss starts', async () => {
+    const mockBoss = {
+      start: vi.fn(async () => mockBoss as unknown as PgBoss),
+      stop: vi.fn(async () => {}),
+      on: vi.fn(() => mockBoss),
+      work: vi.fn(async () => { throw new Error('subscriber registration failed'); }),
+      send: vi.fn(async () => 'mock_send_id'),
+    } as unknown as PgBoss;
+    const worker = new RecoveryWorkerService({ bossInstance: mockBoss });
+
+    await expect(worker.start()).rejects.toThrow('subscriber registration failed');
+    expect((mockBoss.stop as any)).toHaveBeenCalledTimes(1);
+    expect(worker.getStatus().isRunning).toBe(false);
+    await worker.stop();
+    expect((mockBoss.stop as any)).toHaveBeenCalledTimes(1);
   });
 
   it('PgBossJobScheduler transitions ScheduledJob to SCHEDULED with pgBossJobId on successful dispatch', async () => {

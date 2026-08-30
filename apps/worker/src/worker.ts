@@ -36,7 +36,11 @@ export interface RecoveryWorkerConfig {
 export class RecoveryWorkerService {
   private boss: PgBoss | null = null;
   private logger = createLogger();
+  /** Resource acquisition is distinct from fully registered subscribers. */
+  private bossStarted = false;
+  private workerReady = false;
   private isRunning = false;
+  private stopPromise: Promise<void> | null = null;
   private scheduler: PgBossJobScheduler | null = null;
   private riskDetector: RiskDetector | null = null;
   private outcomeObserver: OutcomeObserver | null = null;
@@ -71,7 +75,7 @@ export class RecoveryWorkerService {
       });
 
       await this.boss.start();
-      this.isRunning = true;
+      this.bossStarted = true;
 
       // Initialize repositories & services
       const caseRepo = this.config?.caseRepo || new CaseRepository();
@@ -114,10 +118,18 @@ export class RecoveryWorkerService {
       // Register pg-boss job subscribers
       await this.registerJobHandlers(scheduledJobRepo);
 
+      this.workerReady = true;
+      this.isRunning = true;
       this.logger.info({ msg: 'Recovery worker service started and subscribers registered successfully' });
     } catch (err) {
       this.logger.error({ err, msg: 'Failed to start recovery worker service' });
+      this.workerReady = false;
       this.isRunning = false;
+      try {
+        await this.stop();
+      } catch (cleanupError) {
+        this.logger.error({ cleanupError, msg: 'Failed to clean up partially started recovery worker' });
+      }
       throw err;
     }
   }
@@ -302,10 +314,19 @@ export class RecoveryWorkerService {
   }
 
   async stop(): Promise<void> {
-    if (this.boss && this.isRunning) {
+    if (this.stopPromise) return this.stopPromise;
+    if (!this.boss || !this.bossStarted) return;
+    this.stopPromise = (async () => {
       this.logger.info({ msg: 'Stopping recovery worker service...' });
-      await this.boss.stop({ graceful: true, timeout: 5000 });
+      await this.boss!.stop({ graceful: true, timeout: 5000 });
+      this.bossStarted = false;
+      this.workerReady = false;
       this.isRunning = false;
+    })();
+    try {
+      await this.stopPromise;
+    } finally {
+      this.stopPromise = null;
     }
   }
 

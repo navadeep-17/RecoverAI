@@ -124,5 +124,7 @@ describe('Phase 7 Razorpay boundaries', () => {
     const safeDefault = ProviderRegistry.forRuntime({ enabled: false });
     expect(configured.getProviderForAction(RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK)?.providerName).toBe('RAZORPAY_TEST_MODE_PAYMENT_LINKS');
     expect(safeDefault.getProviderForAction(RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK)?.isSimulated).toBe(true);
+    expect(configured.getProviderForAction(RecoveryActionType.SEND_RECEIVABLE_REMINDER)?.providerName).toBe('SIMULATED_RECOVERY_PROVIDER');
+    expect(configured.getProviderForAction(RecoveryActionType.STOP_RECOVERY)).toBeNull();
   });
 });
