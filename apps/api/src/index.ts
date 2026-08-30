@@ -1,13 +1,14 @@
 import { buildServer } from './server.js';
 import { loadEnv, createLogger } from '@recoverai/shared';
-import { AuditRepository, EventRepository } from '@recoverai/db';
+import { AuditRepository, EventRepository, ScheduledJobRepository } from '@recoverai/db';
 import { RazorpayWebhookService } from '@recoverai/integrations';
 import { PgBossRazorpayWebhookQueue } from './razorpay-webhook-queue.js';
-import { composeApiReviewService } from './runtime.js';
+import { composeApiMerchantEventServices, composeApiReviewService } from './runtime.js';
 
 const env = loadEnv();
 const logger = createLogger({ level: env.LOG_LEVEL });
 const webhookQueue = new PgBossRazorpayWebhookQueue(env.DATABASE_URL, env.PG_BOSS_SCHEMA);
+const merchantEventServices = composeApiMerchantEventServices(webhookQueue.createScheduler(new ScheduledJobRepository()));
 const server = buildServer({
   reviewService: composeApiReviewService(env),
   razorpayWebhookService: new RazorpayWebhookService({
@@ -17,6 +18,8 @@ const server = buildServer({
     auditRepo: new AuditRepository(),
     queue: webhookQueue,
   }),
+  merchantEventIngestionService: merchantEventServices.ingestionService,
+  merchantEventOutcomeObserver: merchantEventServices.outcomeObserver,
 });
 
 async function start() {

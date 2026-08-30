@@ -6,4 +6,5 @@ export * from './providers/provider-contracts.js';
 export * from './providers/simulated-provider.js';
 export * from './providers/razorpay-payment-link-provider.js';
 export * from './providers/provider-registry.js';
+export * from './providers/gemini-llm-provider.js';
 export * from './razorpay-webhook-service.js';

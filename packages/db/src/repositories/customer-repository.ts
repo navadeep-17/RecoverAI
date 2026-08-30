@@ -2,6 +2,23 @@ import { Customer } from '@prisma/client';
 import { prisma } from '../client.js';
 
 export class CustomerRepository {
+  /** Applies explicitly supplied merchant-owned facts; missing consent never changes consent. */
+  async upsertAuthoritativeCustomerFacts(
+    merchantId: string,
+    data: { externalCustomerId: string; email?: string; phone?: string; name?: string; contactConsent?: boolean | null },
+  ): Promise<Customer> {
+    return prisma.customer.upsert({
+      where: { merchantId_externalCustomerId: { merchantId, externalCustomerId: data.externalCustomerId } },
+      create: { merchantId, externalCustomerId: data.externalCustomerId, email: data.email, phone: data.phone, name: data.name, contactConsent: data.contactConsent ?? null },
+      update: {
+        ...(data.email !== undefined ? { email: data.email } : {}),
+        ...(data.phone !== undefined ? { phone: data.phone } : {}),
+        ...(data.name !== undefined ? { name: data.name } : {}),
+        ...(data.contactConsent !== undefined ? { contactConsent: data.contactConsent } : {}),
+      },
+    });
+  }
+
   async getOrCreateCustomer(
     merchantId: string,
     data: {

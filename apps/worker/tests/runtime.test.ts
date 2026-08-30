@@ -43,8 +43,9 @@ describe('worker executable runtime bootstrap', () => {
     expect(app.closeDatabase as any).toHaveBeenCalledTimes(1);
   });
 
-  it('rejects unsupported and fake-production LLM configuration', () => {
+  it('composes Gemini in production and rejects unsupported and fake-production LLM configuration', () => {
     expect(() => composeWorkerRuntime({ NODE_ENV: 'production', AI_PROVIDER: 'mock' } as any)).toThrow(/development\/test-only/);
-    expect(() => composeWorkerRuntime({ NODE_ENV: 'development', AI_PROVIDER: 'gemini' } as any)).toThrow(/no supported runtime adapter/);
+    expect(() => composeWorkerRuntime({ NODE_ENV: 'development', AI_PROVIDER: 'openai' } as any)).toThrow(/unsupported/);
+    expect(() => composeWorkerRuntime({ NODE_ENV: 'production', AI_PROVIDER: 'gemini', GEMINI_API_KEY: 'test-key', GEMINI_MODEL: 'gemini-test', DATABASE_URL: 'postgresql://x', PG_BOSS_SCHEMA: 'pgboss', LOG_LEVEL: 'error' } as any)).not.toThrow();
   });
 });

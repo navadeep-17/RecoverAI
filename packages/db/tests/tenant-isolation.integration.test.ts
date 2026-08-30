@@ -541,26 +541,20 @@ describe('Tenant Isolation & Persistence Invariant Integration Tests', () => {
       expect(eventB.event.merchantId).toBe(merchantBId);
 
       // Duplicate lookup for Merchant A returns Merchant A event
-      const dupA = await eventRepo.recordMerchantEvent(merchantAId, {
+      await expect(eventRepo.recordMerchantEvent(merchantAId, {
         source: EventSource.RAZORPAY,
         type: 'PAYMENT_FAILED',
         dedupeKey: sharedDedupeKey,
         payloadJson: { merchant: 'alpha_dup' },
-      });
-      expect(dupA.created).toBe(false);
-      expect(dupA.event.id).toBe(eventA.event.id);
-      expect(dupA.event.merchantId).toBe(merchantAId);
+      })).rejects.toThrow(/already accepted with different facts/);
 
       // Duplicate lookup for Merchant B returns Merchant B event
-      const dupB = await eventRepo.recordMerchantEvent(merchantBId, {
+      await expect(eventRepo.recordMerchantEvent(merchantBId, {
         source: EventSource.RAZORPAY,
         type: 'PAYMENT_FAILED',
         dedupeKey: sharedDedupeKey,
         payloadJson: { merchant: 'beta_dup' },
-      });
-      expect(dupB.created).toBe(false);
-      expect(dupB.event.id).toBe(eventB.event.id);
-      expect(dupB.event.merchantId).toBe(merchantBId);
+      })).rejects.toThrow(/already accepted with different facts/);
     });
   });
 

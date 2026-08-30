@@ -5,11 +5,12 @@ import { generateCorrelationId, createLogger, loadEnv } from '@recoverai/shared'
 import { checkDatabaseConnection, AuditRepository, CaseRepository, EventRepository } from '@recoverai/db';
 import { RazorpayWebhookService } from '@recoverai/integrations';
 
-import { HumanReviewService } from '@recoverai/core';
+import { EventIngestionService, HumanReviewService, OutcomeObserver } from '@recoverai/core';
 import { reviewRoutes } from './routes/review-routes.js';
 import { authenticatePrincipalHook } from './auth/principal.js';
 import { razorpayWebhookRoutes } from './routes/razorpay-webhook-routes.js';
 import { caseRoutes } from './routes/case-routes.js';
+import { merchantEventRoutes } from './routes/merchant-event-routes.js';
 
 export interface BuildServerOptions {
   checkDbConnection?: () => Promise<boolean>;
@@ -17,6 +18,8 @@ export interface BuildServerOptions {
   razorpayWebhookService?: RazorpayWebhookService;
   caseRepo?: CaseRepository;
   auditRepo?: AuditRepository;
+  merchantEventIngestionService?: EventIngestionService;
+  merchantEventOutcomeObserver?: OutcomeObserver;
 }
 
 export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
@@ -110,6 +113,10 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     caseRepo: options.caseRepo || new CaseRepository(),
     auditRepo: options.auditRepo || new AuditRepository(),
   });
+
+  if (options.merchantEventIngestionService) {
+    app.register(merchantEventRoutes, { prefix: '/merchant-events', ingestionService: options.merchantEventIngestionService, outcomeObserver: options.merchantEventOutcomeObserver });
+  }
 
   app.register(razorpayWebhookRoutes, {
     prefix: '/webhooks',

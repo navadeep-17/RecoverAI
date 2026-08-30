@@ -26,7 +26,7 @@ import {
   RecoveryOrchestrator,
   RiskDetector,
 } from '@recoverai/core';
-import { ProviderRegistry } from '@recoverai/integrations';
+import { GeminiLLMProvider, ProviderRegistry } from '@recoverai/integrations';
 import { PolicyEngine } from '@recoverai/policy';
 import { createLogger, EnvConfig, loadEnv } from '@recoverai/shared';
 import { PgBossJobScheduler } from './scheduler.js';
@@ -46,13 +46,16 @@ export interface WorkerBootstrapOptions {
 /** Builds the production dependency graph; no provider/network work occurs here. */
 export function composeWorkerRuntime(env: EnvConfig = loadEnv()): WorkerRuntime {
   const logger = createLogger({ level: env.LOG_LEVEL, isProduction: env.NODE_ENV === 'production' });
-  if (env.AI_PROVIDER !== 'mock') {
-    throw new Error(`AI_PROVIDER=${env.AI_PROVIDER} is configured, but no supported runtime adapter is available`);
-  }
-  if (env.NODE_ENV === 'production') {
+  if (env.AI_PROVIDER === 'mock' && env.NODE_ENV === 'production') {
     throw new Error('AI_PROVIDER=mock is development/test-only; production worker refuses fake AI');
   }
-  logger.warn({ msg: 'Starting worker with explicit development/test MockLLMProvider; autonomous output is not production AI-backed' });
+  if (env.AI_PROVIDER === 'openai' || env.AI_PROVIDER === 'anthropic') {
+    throw new Error(`AI_PROVIDER=${env.AI_PROVIDER} is unsupported at runtime`);
+  }
+  const llmProvider = env.AI_PROVIDER === 'gemini'
+    ? new GeminiLLMProvider({ apiKey: env.GEMINI_API_KEY!, model: env.GEMINI_MODEL })
+    : new MockLLMProvider();
+  if (env.AI_PROVIDER === 'mock') logger.warn({ msg: 'Starting worker with explicit development/test MockLLMProvider; autonomous output is not production AI-backed' });
 
   const caseRepo = new CaseRepository();
   const actionRepo = new ActionRepository();
@@ -88,7 +91,7 @@ export function composeWorkerRuntime(env: EnvConfig = loadEnv()): WorkerRuntime 
   const orchestrator = new RecoveryOrchestrator({
     caseRepo, actionRepo, customerRepo, merchantRepo, policyConfigRepo, commitmentRepo,
     auditRepo, humanReviewRepo, reviewGateRequester: reviewService,
-    recoveryAgent: new RecoveryAgent(new MockLLMProvider()), policyEngine: executionPolicy, actionExecutor,
+    recoveryAgent: new RecoveryAgent(llmProvider), policyEngine: executionPolicy, actionExecutor,
     triggerRepo: new TriggerRepository(), jobScheduler: scheduler,
   });
   const observer = new OutcomeObserver({
@@ -100,7 +103,7 @@ export function composeWorkerRuntime(env: EnvConfig = loadEnv()): WorkerRuntime 
     connectionString: env.DATABASE_URL, schema: env.PG_BOSS_SCHEMA, bossInstance: boss,
     caseRepo, customerRepo, policyConfigRepo, auditRepo, eventRepo, scheduledJobRepo,
     reviewGateRequester: reviewService, scheduler, riskDetector: detector,
-    eventIngestionService: new EventIngestionService(eventRepo, auditRepo, detector),
+    eventIngestionService: new EventIngestionService(eventRepo, auditRepo, detector, customerRepo),
     outcomeObserver: observer,
   });
   return { worker, closeDatabase: () => prisma.$disconnect() };

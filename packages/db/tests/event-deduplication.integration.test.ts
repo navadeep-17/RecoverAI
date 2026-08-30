@@ -56,7 +56,7 @@ describe('MerchantEvent Tenant-Scoped Deduplication & Idempotent Ingestion', () 
         eventRepo,
       );
 
-      ingestionService = new EventIngestionService(eventRepo, auditRepo, riskDetector);
+      ingestionService = new EventIngestionService(eventRepo, auditRepo, riskDetector, customerRepo);
 
       // Create test merchants
       const mchA = await merchantRepo.createMerchant({
@@ -189,5 +189,16 @@ describe('MerchantEvent Tenant-Scoped Deduplication & Idempotent Ingestion', () 
     expect(res2.deduplicated).toBe(true);
     expect(res2.detectionResult.caseCreated).toBe(false);
     expect(res2.event.id).toBe(res1.event.id);
+  });
+
+  it('persists explicit merchant consent while leaving missing consent unknown', async () => {
+    if (!dbAvailable) return;
+    const customerId = `consent-${Date.now()}`;
+    const common = { merchantId: merchantAId, source: MerchantEventSource.MERCHANT, occurredAt: new Date(), amount: '8499.00', currency: 'INR', checkout: { checkoutSessionId: `checkout-${customerId}` } };
+    await ingestionService.ingestEvent({ ...common, externalEventId: `evt-consent-${customerId}`, dedupeKey: `dedupe-consent-${customerId}`, eventType: NormalizedEventType.CHECKOUT_STARTED, customer: { externalCustomerId: customerId, contactConsent: true } });
+    expect((await customerRepo.getOrCreateCustomer(merchantAId, { externalCustomerId: customerId })).contactConsent).toBe(true);
+    const unknownId = `${customerId}-unknown`;
+    await ingestionService.ingestEvent({ ...common, externalEventId: `evt-unknown-${customerId}`, dedupeKey: `dedupe-unknown-${customerId}`, checkout: { checkoutSessionId: `checkout-${unknownId}` }, eventType: NormalizedEventType.CHECKOUT_STARTED, customer: { externalCustomerId: unknownId } });
+    expect((await customerRepo.getOrCreateCustomer(merchantAId, { externalCustomerId: unknownId })).contactConsent).toBeNull();
   });
 });

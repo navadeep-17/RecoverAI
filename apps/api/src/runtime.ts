@@ -1,8 +1,9 @@
 import {
   ActionRepository, AuditRepository, CaseRepository, CommitmentRepository, CustomerRepository,
-  HumanReviewRepository, MerchantRepository, OutcomeRepository, PolicyConfigRepository,
+  EventRepository, HumanReviewRepository, MerchantRepository, OutcomeRepository, PolicyConfigRepository, ScheduledJobRepository,
 } from '@recoverai/db';
-import { ActionExecutor, DurableReviewGateService, HumanReviewService, IPolicyEngine } from '@recoverai/core';
+import { ActionExecutor, DurableReviewGateService, EventIngestionService, HumanReviewService, IPolicyEngine, OutcomeObserver, RiskDetector } from '@recoverai/core';
+import { IJobScheduler } from '@recoverai/core';
 import { ProviderRegistry } from '@recoverai/integrations';
 import { PolicyEngine } from '@recoverai/policy';
 import { EnvConfig, loadEnv } from '@recoverai/shared';
@@ -36,4 +37,23 @@ export function composeApiReviewService(env: EnvConfig = loadEnv()): HumanReview
   });
   executor.setReviewGateRequester(reviewService);
   return reviewService;
+}
+
+export function composeApiMerchantEventServices(jobScheduler: IJobScheduler): { ingestionService: EventIngestionService; outcomeObserver: OutcomeObserver } {
+  const caseRepo = new CaseRepository();
+  const actionRepo = new ActionRepository();
+  const customerRepo = new CustomerRepository();
+  const policyConfigRepo = new PolicyConfigRepository();
+  const auditRepo = new AuditRepository();
+  const eventRepo = new EventRepository();
+  const outcomeRepo = new OutcomeRepository();
+  const commitmentRepo = new CommitmentRepository();
+  const scheduledJobRepo = new ScheduledJobRepository();
+  const humanReviewRepo = new HumanReviewRepository();
+  const reviewGate = new DurableReviewGateService(humanReviewRepo, caseRepo, auditRepo);
+  const detector = new RiskDetector(caseRepo, customerRepo, policyConfigRepo, auditRepo, eventRepo, jobScheduler);
+  return {
+    ingestionService: new EventIngestionService(eventRepo, auditRepo, detector, customerRepo),
+    outcomeObserver: new OutcomeObserver({ caseRepo, actionRepo, outcomeRepo, customerRepo, commitmentRepo, eventRepo, auditRepo, scheduledJobRepo, jobScheduler, reviewGateRequester: reviewGate }),
+  };
 }

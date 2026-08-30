@@ -6,6 +6,7 @@ import {
 import {
   EventRepository,
   AuditRepository,
+  CustomerRepository,
   MerchantEvent,
 } from '@recoverai/db';
 import { RiskDetector, DetectionResult } from '../detection/risk-detector.js';
@@ -27,12 +28,14 @@ export class EventIngestionService {
     private eventRepo: EventRepository,
     private auditRepo: AuditRepository,
     private riskDetector: RiskDetector,
+    private customerRepo?: CustomerRepository,
   ) {}
 
   async ingestEvent(eventInput: NormalizedMerchantEvent, options: EventIngestionOptions = {}): Promise<IngestionResult> {
     // 1. Strict Schema & Domain Validation
     const validatedEvent = NormalizedMerchantEventSchema.parse(eventInput);
     const merchantId = validatedEvent.merchantId;
+    const canonicalPayload = JSON.parse(JSON.stringify(validatedEvent)) as Record<string, unknown>;
 
     // 2. Persist with tenant-scoped idempotency
     const { created, event } = await this.eventRepo.recordMerchantEvent(merchantId, {
@@ -41,7 +44,7 @@ export class EventIngestionService {
       type: validatedEvent.eventType,
       occurredAt: validatedEvent.occurredAt,
       dedupeKey: validatedEvent.dedupeKey,
-      payloadJson: validatedEvent as unknown as Record<string, unknown>,
+      payloadJson: canonicalPayload,
     });
 
     // 3. If duplicate event for this merchant, skip risk detection
@@ -67,6 +70,18 @@ export class EventIngestionService {
           reason: 'Duplicate merchant event received; detection skipped',
         },
       };
+    }
+
+    // Consent is authoritative only when the merchant explicitly supplies it.
+    // No absent value is inferred or promoted to true.
+    if (this.customerRepo && validatedEvent.customer?.externalCustomerId) {
+      await this.customerRepo.upsertAuthoritativeCustomerFacts(merchantId, {
+        externalCustomerId: validatedEvent.customer.externalCustomerId,
+        email: validatedEvent.customer.email || undefined,
+        phone: validatedEvent.customer.phone || undefined,
+        name: validatedEvent.customer.name || undefined,
+        ...(validatedEvent.customer.contactConsent !== undefined ? { contactConsent: validatedEvent.customer.contactConsent } : {}),
+      });
     }
 
     // 4. Record successful ingestion audit

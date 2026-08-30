@@ -99,7 +99,7 @@ export class RecoveryWorkerService {
         eventRepo,
         this.scheduler,
       );
-      this.eventIngestionService = this.config?.eventIngestionService || new EventIngestionService(eventRepo, auditRepo, this.riskDetector);
+      this.eventIngestionService = this.config?.eventIngestionService || new EventIngestionService(eventRepo, auditRepo, this.riskDetector, customerRepo);
       if (!this.outcomeObserver) {
         this.outcomeObserver = new OutcomeObserver({
           caseRepo,

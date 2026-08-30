@@ -1,5 +1,10 @@
 import { Prisma, MerchantEvent, WebhookEvent, EventSource } from '@prisma/client';
 import { prisma } from '../client.js';
+import { jsonStructurallyEqual } from '@recoverai/shared';
+
+export class MerchantEventIdentityConflictError extends Error {
+  constructor() { super('Merchant event identity was already accepted with different facts'); this.name = 'MerchantEventIdentityConflictError'; }
+}
 
 export class EventRepository {
   async recordMerchantEvent(
@@ -42,6 +47,7 @@ export class EventRepository {
             },
           },
         });
+        if (!jsonStructurallyEqual(existing.payloadJson, data.payloadJson)) throw new MerchantEventIdentityConflictError();
         return { created: false, event: existing };
       }
       throw err;
