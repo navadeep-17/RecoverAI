@@ -28,7 +28,7 @@ export class GeminiLLMProvider implements LLMProvider {
   private readonly timeoutMs: number;
 
   constructor(private readonly options: GeminiLLMProviderOptions) {
-    this.model = options.model || 'gemini-2.0-flash';
+    this.model = options.model || 'gemini-3.6-flash';
     this.fetchImpl = options.fetchImpl || fetch;
     this.timeoutMs = options.timeoutMs ?? 10_000;
   }
@@ -40,10 +40,10 @@ export class GeminiLLMProvider implements LLMProvider {
       let response: Response;
       try {
         response = await this.fetchImpl(
-          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:generateContent?key=${encodeURIComponent(this.options.apiKey)}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:generateContent`,
           {
             method: 'POST', signal: controller.signal,
-            headers: { 'content-type': 'application/json' },
+            headers: { 'content-type': 'application/json', 'x-goog-api-key': this.options.apiKey },
             body: JSON.stringify({
               contents: [{ role: 'user', parts: [{ text: `${request.systemPrompt}\n\n${request.userPrompt}` }] }],
               generationConfig: { temperature: request.temperature ?? 0, responseMimeType: 'application/json' },

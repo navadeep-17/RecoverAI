@@ -28,13 +28,33 @@ describe('merchant event ingress route', () => {
     expect(ingest.mock.calls[0][0].customer.contactConsent).toBeUndefined();
   });
 
-  it('does not call the observer for duplicates and delegates monetary success only to OutcomeObserver', async () => {
+  it('re-observes an exact duplicate monetary success so a failed first observation can recover', async () => {
     const ingest = vi.fn(async () => ({ created: false, deduplicated: true, event: { id: 'event-1', receivedAt: new Date() } }));
-    const observer = { observeMerchantEvent: vi.fn() };
+    const observer = { observeMerchantEvent: vi.fn(async () => ({ observed: true, deduplicated: true })) };
     const app = buildServer({ checkDbConnection: async () => true, merchantEventIngestionService: { ingestEvent: ingest } as any, merchantEventOutcomeObserver: observer as any }); apps.push(app);
     const duplicate = await app.inject({ method: 'POST', url: '/merchant-events', headers: headers(), payload: { ...valid, eventType: 'CHECKOUT_COMPLETED' } });
     expect(duplicate.json().deduplicated).toBe(true);
-    expect(observer.observeMerchantEvent).not.toHaveBeenCalled();
+    expect(observer.observeMerchantEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns 5xx after a transient observer failure and retries the exact duplicate observation', async () => {
+    const ingest = vi.fn()
+      .mockResolvedValueOnce({ created: true, deduplicated: false, event: { id: 'event-1', receivedAt: new Date() } })
+      .mockResolvedValueOnce({ created: false, deduplicated: true, event: { id: 'event-1', receivedAt: new Date() } });
+    const observer = { observeMerchantEvent: vi.fn().mockRejectedValueOnce(new Error('transient observer failure')).mockResolvedValueOnce({ observed: true, deduplicated: false }) };
+    const app = buildServer({ checkDbConnection: async () => true, merchantEventIngestionService: { ingestEvent: ingest } as any, merchantEventOutcomeObserver: observer as any }); apps.push(app);
+    const payload = { ...valid, eventType: 'CHECKOUT_COMPLETED' };
+    expect((await app.inject({ method: 'POST', url: '/merchant-events', headers: headers(), payload })).statusCode).toBe(500);
+    expect((await app.inject({ method: 'POST', url: '/merchant-events', headers: headers(), payload })).statusCode).toBe(202);
+    expect(observer.observeMerchantEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it('requires payment.paymentId for first-party PAYMENT_SUCCEEDED', async () => {
+    const { app } = appWith();
+    expect((await app.inject({ method: 'POST', url: '/merchant-events', headers: headers(), payload: { ...valid, eventType: 'PAYMENT_SUCCEEDED' } })).statusCode).toBe(400);
+    const observer = { observeMerchantEvent: vi.fn(async () => ({ observed: false })) };
+    const accepted = buildServer({ checkDbConnection: async () => true, merchantEventIngestionService: { ingestEvent: vi.fn(async () => ({ created: true, deduplicated: false, event: { id: 'payment-success', receivedAt: new Date() } })) } as any, merchantEventOutcomeObserver: observer as any }); apps.push(accepted);
+    expect((await accepted.inject({ method: 'POST', url: '/merchant-events', headers: headers(), payload: { ...valid, eventType: 'PAYMENT_SUCCEEDED', payment: { paymentId: 'pay-1' } } })).statusCode).toBe(202);
   });
 
   it('hands a newly persisted monetary success to OutcomeObserver, never directly to a case writer', async () => {

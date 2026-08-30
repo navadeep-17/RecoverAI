@@ -42,6 +42,7 @@ const merchantEventSchema = z.object({
   if ((body.eventType === NormalizedEventType.CHECKOUT_STARTED || body.eventType === NormalizedEventType.CHECKOUT_COMPLETED) && !body.checkout) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'checkout is required for checkout events' });
   if ((body.eventType === NormalizedEventType.INVOICE_CREATED || body.eventType === NormalizedEventType.INVOICE_PAID) && !body.invoice) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'invoice is required for invoice events' });
   if (body.eventType === NormalizedEventType.PAYMENT_FAILED && !body.payment?.paymentId) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'payment.paymentId is required for payment failures' });
+  if (body.eventType === NormalizedEventType.PAYMENT_SUCCEEDED && !body.payment?.paymentId) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'payment.paymentId is required for payment successes' });
   if (body.eventType === NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED && !body.payment?.subscriptionId) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'payment.subscriptionId is required for subscription failures' });
   if (body.customer?.contactConsent !== undefined && !body.customer.externalCustomerId) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Consent requires externalCustomerId' });
 });
@@ -62,14 +63,19 @@ export const merchantEventRoutes: FastifyPluginAsync<MerchantEventRoutesOptions>
       });
       const isMonetarySuccess = event.eventType === NormalizedEventType.PAYMENT_SUCCEEDED || event.eventType === NormalizedEventType.CHECKOUT_COMPLETED || event.eventType === NormalizedEventType.INVOICE_PAID;
       const ingested = await options.ingestionService.ingestEvent(event, { skipRiskDetection: isMonetarySuccess });
-      if (isMonetarySuccess && ingested.created && options.outcomeObserver) await options.outcomeObserver.observeMerchantEvent(event, ingested.event.id);
+      if (isMonetarySuccess) {
+        if (!options.outcomeObserver) throw new Error('Authoritative monetary observer is unavailable');
+        // Re-observe exact duplicates: persistence is deduplicated, while OutcomeObserver
+        // owns idempotent recovery and repairs a prior post-persistence failure.
+        await options.outcomeObserver.observeMerchantEvent(event, ingested.event.id);
+      }
       return reply.status(202).send({ eventId: ingested.event.id, deduplicated: ingested.deduplicated, eventType: event.eventType, acceptedAt: ingested.event.receivedAt });
     } catch (error) {
       if (error instanceof z.ZodError) return reply.status(400).send({ error: 'Validation failed', details: error.errors });
       const message = error instanceof Error ? error.message : 'Merchant event ingestion failed';
       if (message.startsWith('UNAUTHORIZED')) return reply.status(401).send({ error: message });
       if (message === 'Merchant event identity was already accepted with different facts') return reply.status(409).send({ error: message });
-      return reply.status(400).send({ error: message });
+      return reply.status(500).send({ error: 'Merchant event processing failed' });
     }
   });
 };

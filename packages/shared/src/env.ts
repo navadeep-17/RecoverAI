@@ -12,7 +12,7 @@ export const EnvSchema = z.object({
   SESSION_SECRET: z.string().min(16).default('development_secret_must_be_overridden_in_prod'),
   AI_PROVIDER: z.enum(['mock', 'gemini', 'anthropic', 'openai']).default('mock'),
   GEMINI_API_KEY: z.string().min(1).optional(),
-  GEMINI_MODEL: z.string().min(1).default('gemini-2.0-flash'),
+  GEMINI_MODEL: z.string().min(1).default('gemini-3.6-flash'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   // Test-mode only. These remain optional so ordinary CI never needs private credentials.
   RAZORPAY_KEY_ID: z.string().min(1).optional(),
