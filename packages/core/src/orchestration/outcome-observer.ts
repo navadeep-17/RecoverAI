@@ -1168,11 +1168,13 @@ export class OutcomeObserver {
       };
     }
 
-    // 4. Database-backed observation dedupe before applying recovery credit
+    // 4. Atomically select the single monetary recovery winner. This commits the
+    // winning outcome, recovery amount, and RECOVERED state together; a losing
+    // event does not persist an independently credit-bearing outcome.
     const rawEvent = event as Record<string, unknown>;
     const rawId = (rawEvent.eventId || rawEvent.id) as string | undefined;
     const dedupeKey = `merchant-event:${merchantEventId || event.externalEventId || rawId}`;
-    const outcomeResult = await this.outcomeRepo.recordOutcome(merchantId, caseId, {
+    const recoveryClaim = await this.outcomeRepo.claimMonetaryRecovery(merchantId, caseId, {
       actionId: authoritativeActionCorrelation?.actionId,
       merchantEventId,
       dedupeKey,
@@ -1192,63 +1194,49 @@ export class OutcomeObserver {
       observedAt: event.occurredAt || this.now(),
     });
 
-    if (!outcomeResult.created) {
-      // Duplicate event delivery: return deduplicated without double crediting or auditing
+    if (!recoveryClaim.wonRecovery) {
       return {
         observed: true,
-        deduplicated: true,
-        outcome: outcomeResult.outcome,
+        deduplicated: recoveryClaim.deduplicated,
+        outcome: recoveryClaim.outcome ?? undefined,
         caseId,
-        caseStatus: matchedCase.status,
-        reason: 'Duplicate monetary event; outcome already recorded',
+        caseStatus: recoveryClaim.caseStatus,
+        caseResolved: recoveryClaim.caseStatus === CaseStatus.RECOVERED,
+        reason: recoveryClaim.deduplicated
+          ? 'Duplicate monetary event; recovery winner already recorded'
+          : 'Monetary recovery was not credited because this case already has a recovery winner',
       };
     }
 
-    // 5. Winner transitions case to RECOVERED via CAS
-    if (
-      matchedCase.status === CaseStatus.OPEN ||
-      matchedCase.status === CaseStatus.WAITING ||
-      matchedCase.status === CaseStatus.NEEDS_REVIEW
-    ) {
-      await this.safeCompareAndSetStatus(
-        merchantId,
-        caseId,
-        matchedCase.status,
-        CaseStatus.RECOVERED,
-        {
-          recoveredAmount: recoveredMoney,
-          resolvedAt: event.occurredAt || this.now(),
-        },
-      );
-      await this.reconcileTerminalReviewGates(merchantId, caseId, CaseStatus.RECOVERED);
+    // 5. Only the transaction winner performs terminal side effects.
+    await this.reconcileTerminalReviewGates(merchantId, caseId, CaseStatus.RECOVERED);
 
-      // Audit with source-specific truthful event name
-      let auditEventType = 'CASE_RECOVERED';
-      if (event.eventType === NormalizedEventType.PAYMENT_SUCCEEDED) {
-        auditEventType = 'CASE_RECOVERED_BY_PAYMENT';
-      } else if (event.eventType === NormalizedEventType.CHECKOUT_COMPLETED) {
-        auditEventType = 'CASE_RECOVERED_BY_CHECKOUT';
-      } else if (event.eventType === NormalizedEventType.INVOICE_PAID) {
-        auditEventType = 'CASE_RECOVERED_BY_INVOICE';
-      }
-
-      await this.auditRepo.record(merchantId, {
-        caseId,
-        eventType: auditEventType,
-        actorType: AuditActorType.SYSTEM,
-        inputSummaryJson: {
-          outcomeId: outcomeResult.outcome.id,
-          amount: event.amount,
-          currency: eventCurrency,
-          actionId: authoritativeActionCorrelation?.actionId ?? null,
-        },
-        outputSummaryJson: {
-          status: CaseStatus.RECOVERED,
-          recoveredAmount: event.amount,
-        },
-        reasonCode: 'AUTHORITATIVE_MONEY_RECOVERED',
-      });
+    // Audit with source-specific truthful event name
+    let auditEventType = 'CASE_RECOVERED';
+    if (event.eventType === NormalizedEventType.PAYMENT_SUCCEEDED) {
+      auditEventType = 'CASE_RECOVERED_BY_PAYMENT';
+    } else if (event.eventType === NormalizedEventType.CHECKOUT_COMPLETED) {
+      auditEventType = 'CASE_RECOVERED_BY_CHECKOUT';
+    } else if (event.eventType === NormalizedEventType.INVOICE_PAID) {
+      auditEventType = 'CASE_RECOVERED_BY_INVOICE';
     }
+
+    await this.auditRepo.record(merchantId, {
+      caseId,
+      eventType: auditEventType,
+      actorType: AuditActorType.SYSTEM,
+      inputSummaryJson: {
+        outcomeId: recoveryClaim.outcome!.id,
+        amount: event.amount,
+        currency: eventCurrency,
+        actionId: authoritativeActionCorrelation?.actionId ?? null,
+      },
+      outputSummaryJson: {
+        status: CaseStatus.RECOVERED,
+        recoveredAmount: event.amount,
+      },
+      reasonCode: 'AUTHORITATIVE_MONEY_RECOVERED',
+    });
 
     // 6. Fulfill any pending commitments for this case
     const activeCommitments = await this.commitmentRepo.getActiveCommitmentsForCase(merchantId, caseId);
@@ -1260,7 +1248,7 @@ export class OutcomeObserver {
 
     return {
       observed: true,
-      outcome: outcomeResult.outcome,
+      outcome: recoveryClaim.outcome!,
       caseId,
       caseResolved: true,
       caseStatus: CaseStatus.RECOVERED,

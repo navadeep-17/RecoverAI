@@ -187,6 +187,7 @@ model RevenueRiskCase {
   nextEvaluationAt   DateTime?
   recoveredAmount    Decimal?              @db.Decimal(12, 2)
   resolvedAt         DateTime?
+  recoveryOutcomeId  String?               @unique
   createdAt          DateTime              @default(now())
   updatedAt          DateTime              @updatedAt
 
@@ -195,6 +196,7 @@ model RevenueRiskCase {
   planVersions       RecoveryPlanVersion[]
   actions            RecoveryAction[]
   outcomes           RecoveryOutcome[]
+  recoveryOutcome    RecoveryOutcome?      @relation("WinningRecoveryOutcome", fields: [recoveryOutcomeId], references: [id], onDelete: SetNull)
   reviews            HumanReview[]
   commitments        RecoveryCommitment[]
   scheduledJobs      ScheduledJob[]
@@ -271,6 +273,7 @@ model RecoveryOutcome {
   case            RevenueRiskCase   @relation(fields: [caseId], references: [id], onDelete: Cascade)
   action          RecoveryAction?   @relation(fields: [actionId], references: [id], onDelete: SetNull)
   merchantEvent   MerchantEvent?    @relation(fields: [merchantEventId], references: [id], onDelete: SetNull)
+  winningForCase  RevenueRiskCase?  @relation("WinningRecoveryOutcome")
 
   @@unique([caseId, dedupeKey])
   @@index([caseId])

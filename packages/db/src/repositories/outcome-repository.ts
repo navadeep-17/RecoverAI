@@ -1,4 +1,4 @@
-import { Prisma, RecoveryOutcome } from '@prisma/client';
+import { CaseStatus, Prisma, RecoveryOutcome } from '@prisma/client';
 import { prisma } from '../client.js';
 import { Money, CurrencyMismatchError } from '@recoverai/shared';
 import { ExactMonetaryInput, toPrismaDecimal } from './case-repository.js';
@@ -18,7 +18,94 @@ export interface RecordOutcomeResult {
   created: boolean;
 }
 
+export interface MonetaryRecoveryClaimResult {
+  wonRecovery: boolean;
+  deduplicated: boolean;
+  outcome: RecoveryOutcome | null;
+  caseStatus: CaseStatus;
+}
+
 export class OutcomeRepository {
+  /**
+   * Atomically binds the only credit-bearing monetary outcome to a case.
+   * A losing concurrent candidate is rolled back with its transaction, so it
+   * cannot later be mistaken for attributed recovered revenue.
+   */
+  async claimMonetaryRecovery(
+    merchantId: string,
+    caseId: string,
+    params: RecordOutcomeParams,
+  ): Promise<MonetaryRecoveryClaimResult> {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const parentCase = await tx.revenueRiskCase.findFirstOrThrow({
+          where: { id: caseId, merchantId },
+          select: { currency: true, status: true, recoveryOutcomeId: true },
+        });
+        if (parentCase.recoveryOutcomeId || parentCase.status === CaseStatus.RECOVERED) {
+          const winner = parentCase.recoveryOutcomeId
+            ? await tx.recoveryOutcome.findUnique({ where: { id: parentCase.recoveryOutcomeId } })
+            : null;
+          return { wonRecovery: false, deduplicated: !!winner && winner.dedupeKey === params.dedupeKey, outcome: winner, caseStatus: parentCase.status };
+        }
+        if (params.amountRecovered instanceof Money && params.amountRecovered.currency !== parentCase.currency) {
+          throw new CurrencyMismatchError(
+            `RecoveryOutcome amountRecovered currency "${params.amountRecovered.currency}" does not match case currency "${parentCase.currency}"`,
+          );
+        }
+        if (params.actionId) {
+          await tx.recoveryAction.findFirstOrThrow({ where: { id: params.actionId, caseId } });
+        }
+        if (params.merchantEventId) {
+          await tx.merchantEvent.findFirstOrThrow({ where: { id: params.merchantEventId, merchantId } });
+        }
+
+        const candidate = await tx.recoveryOutcome.create({
+          data: {
+            caseId,
+            actionId: params.actionId,
+            merchantEventId: params.merchantEventId,
+            dedupeKey: params.dedupeKey,
+            outcomeType: params.outcomeType,
+            amountRecovered: params.amountRecovered !== undefined ? toPrismaDecimal(params.amountRecovered) : null,
+            detailsJson: params.detailsJson as Prisma.InputJsonValue,
+            observedAt: params.observedAt || new Date(),
+          },
+        });
+        const claimed = await tx.revenueRiskCase.updateMany({
+          where: {
+            id: caseId,
+            merchantId,
+            recoveryOutcomeId: null,
+            status: { in: [CaseStatus.OPEN, CaseStatus.WAITING, CaseStatus.NEEDS_REVIEW] },
+          },
+          data: {
+            status: CaseStatus.RECOVERED,
+            recoveredAmount: params.amountRecovered !== undefined ? toPrismaDecimal(params.amountRecovered) : undefined,
+            resolvedAt: params.observedAt || new Date(),
+            recoveryOutcomeId: candidate.id,
+          },
+        });
+        if (claimed.count !== 1) {
+          throw new Error('RECOVERY_CREDIT_CLAIM_LOST');
+        }
+        return { wonRecovery: true, deduplicated: false, outcome: candidate, caseStatus: CaseStatus.RECOVERED };
+      });
+    } catch (error) {
+      const existing = await prisma.revenueRiskCase.findFirstOrThrow({
+        where: { id: caseId, merchantId },
+        select: { status: true, recoveryOutcomeId: true },
+      });
+      if (existing.recoveryOutcomeId || existing.status === CaseStatus.RECOVERED) {
+        const winner = existing.recoveryOutcomeId
+          ? await prisma.recoveryOutcome.findUnique({ where: { id: existing.recoveryOutcomeId } })
+          : null;
+        return { wonRecovery: false, deduplicated: !!winner && winner.dedupeKey === params.dedupeKey, outcome: winner, caseStatus: existing.status };
+      }
+      throw error;
+    }
+  }
+
   /**
    * Records an authoritative RecoveryOutcome under a tenant-scoped case with atomic create-or-get semantics.
    *

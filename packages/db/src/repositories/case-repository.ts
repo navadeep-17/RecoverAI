@@ -212,30 +212,37 @@ export class CaseRepository {
   async getRevenueRadarMetrics(merchantId: string): Promise<RevenueRadarMetrics> {
     const cases = await prisma.revenueRiskCase.findMany({
       where: { merchantId },
-      select: { status: true, riskType: true, amountAtRisk: true, recoveredAmount: true },
+      select: {
+        status: true,
+        riskType: true,
+        amountAtRisk: true,
+        recoveredAmount: true,
+        recoveryOutcomeId: true,
+        recoveryOutcome: { select: { actionId: true, amountRecovered: true } },
+      },
     });
     const activeStatuses = new Set<CaseStatus>([CaseStatus.OPEN, CaseStatus.WAITING, CaseStatus.NEEDS_REVIEW]);
     let revenueAtRisk = 0n;
     let verifiedRecovered = 0n;
     let activeRecoveries = 0;
     let needsReview = 0;
-    const attributedOutcomes = await prisma.recoveryOutcome.findMany({
-      where: {
-        actionId: { not: null },
-        amountRecovered: { not: null },
-        case: { merchantId },
-      },
-      select: { amountRecovered: true },
-    });
-    const agentAttributedRecovered = attributedOutcomes.reduce(
-      (sum, outcome) => sum + decimalToMinorUnits(outcome.amountRecovered),
-      0n,
-    );
+    let agentAttributedRecovered = 0n;
     const riskTypeBreakdown: Record<string, { count: number; amountMinor: bigint }> = {};
     const statusBreakdown: Record<string, number> = {};
     for (const item of cases) {
       statusBreakdown[item.status] = (statusBreakdown[item.status] ?? 0) + 1;
-      verifiedRecovered += decimalToMinorUnits(item.recoveredAmount);
+      if (item.status === CaseStatus.RECOVERED) {
+        if (!item.recoveryOutcomeId || !item.recoveryOutcome?.amountRecovered) {
+          throw new InvalidMoneyError(`Recovered case is missing its authoritative recovery outcome: ${merchantId}`);
+        }
+        const recoveredAmount = decimalToMinorUnits(item.recoveredAmount);
+        const winningOutcomeAmount = decimalToMinorUnits(item.recoveryOutcome.amountRecovered);
+        if (recoveredAmount !== winningOutcomeAmount) {
+          throw new InvalidMoneyError('Recovered case amount does not match its authoritative recovery outcome');
+        }
+        verifiedRecovered += recoveredAmount;
+        if (item.recoveryOutcome.actionId) agentAttributedRecovered += recoveredAmount;
+      }
       if (item.status === CaseStatus.NEEDS_REVIEW) needsReview += 1;
       if (!activeStatuses.has(item.status)) continue;
       activeRecoveries += 1;

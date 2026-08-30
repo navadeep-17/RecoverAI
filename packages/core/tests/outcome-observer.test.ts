@@ -87,6 +87,34 @@ describe('OutcomeObserver Unit Tests', () => {
     };
 
     mockOutcomeRepo = {
+      claimMonetaryRecovery: vi.fn(async (_mId: string, cId: string, params: any) => {
+        const currentCase = inMemoryCases.get(cId);
+        if (currentCase?.recoveryOutcomeId || currentCase?.status === CaseStatus.RECOVERED) {
+          const winner = inMemoryOutcomes.find((outcome) => outcome.id === currentCase.recoveryOutcomeId) || null;
+          return {
+            wonRecovery: false,
+            deduplicated: winner?.dedupeKey === params.dedupeKey,
+            outcome: winner,
+            caseStatus: currentCase.status,
+          };
+        }
+        const outcome = {
+          id: `out_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          caseId: cId,
+          merchantEventId: params.merchantEventId || null,
+          dedupeKey: params.dedupeKey || null,
+          actionId: params.actionId || null,
+          outcomeType: params.outcomeType,
+          amountRecovered: params.amountRecovered || null,
+          detailsJson: params.detailsJson || null,
+          observedAt: params.observedAt || new Date(),
+        };
+        inMemoryOutcomes.push(outcome);
+        currentCase.status = CaseStatus.RECOVERED;
+        currentCase.recoveredAmount = params.amountRecovered;
+        currentCase.recoveryOutcomeId = outcome.id;
+        return { wonRecovery: true, deduplicated: false, outcome, caseStatus: CaseStatus.RECOVERED };
+      }),
       recordOutcome: vi.fn(async (_mId: string, cId: string, params: any) => {
         if (params.dedupeKey) {
           const existing = inMemoryOutcomes.find((o) => o.dedupeKey === params.dedupeKey);
