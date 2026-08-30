@@ -341,6 +341,32 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(v2Result.review.planVersionId).toBe(planVersion2.id);
   });
 
+  it('Scenario A3: concurrent close and a new review request never leave a pending review case OPEN', async () => {
+    if (!dbAvailable) return;
+
+    const { testCase, planVersion } = await createTestCase(merchantAId);
+    const first = await reviewService.requestReview(merchantAId, testCase.id, {
+      planVersionId: planVersion.id,
+      reasonForReview: 'First review to close',
+    });
+
+    const [, second] = await Promise.all([
+      reviewService.closeReview(merchantAId, first.review!.id, userReviewerAId, {
+        reason: 'Close concurrently',
+        stopCase: false,
+      }),
+      reviewService.requestReview(merchantAId, testCase.id, {
+        reviewKey: `concurrent:${planVersion.id}`,
+        planVersionId: planVersion.id,
+        reasonForReview: 'New active review gate',
+      }),
+    ]);
+
+    expect(second.review?.status).toBe(ReviewStatus.PENDING);
+    const finalCase = await caseRepo.getCaseById(merchantAId, testCase.id);
+    expect(finalCase?.status).toBe(CaseStatus.NEEDS_REVIEW);
+  });
+
   // B. Approval Happy Path & Double Revalidation
   it('Scenario B: Reviewer approves pending review -> fresh policy ALLOW -> ActionExecutor executes -> review APPROVED -> provider called once', async () => {
     if (!dbAvailable) return;

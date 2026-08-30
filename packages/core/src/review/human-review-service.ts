@@ -138,12 +138,34 @@ export class HumanReviewService {
       return false;
     }
 
-    await this.caseRepo.compareAndSetStatus(
-      merchantId,
-      caseId,
-      CaseStatus.NEEDS_REVIEW,
-      CaseStatus.OPEN,
-    );
+    try {
+      await this.caseRepo.compareAndSetStatus(
+        merchantId,
+        caseId,
+        CaseStatus.NEEDS_REVIEW,
+        CaseStatus.OPEN,
+      );
+    } catch {
+      return false;
+    }
+
+    // A request can create a new pending review after the initial gate check
+    // but before this CAS. Re-check after reopening so that the closer cannot
+    // leave a case OPEN while a durable review gate exists.
+    if (await this.hasActiveHumanReviewGate(merchantId, caseId)) {
+      try {
+        await this.caseRepo.compareAndSetStatus(
+          merchantId,
+          caseId,
+          CaseStatus.OPEN,
+          CaseStatus.NEEDS_REVIEW,
+        );
+      } catch {
+        // A concurrent transition won; its resulting state is authoritative.
+      }
+      return false;
+    }
+
     return true;
   }
 
@@ -250,9 +272,25 @@ export class HumanReviewService {
     });
 
     const effectiveReview = createResult.review;
-    const reviewAlreadyPending = effectiveReview.status === ReviewStatus.PENDING;
 
-    if (createResult.created || reviewAlreadyPending) {
+    // The review row is the durable authority. A closer may have just
+    // reopened the case after our initial status check; repair that race only
+    // after the review exists, and never revive a terminal case.
+    const currentCase = await this.caseRepo.getCaseById(merchantId, caseId);
+    if (currentCase && (currentCase.status === CaseStatus.OPEN || currentCase.status === CaseStatus.WAITING)) {
+      try {
+        await this.caseRepo.compareAndSetStatus(
+          merchantId,
+          caseId,
+          currentCase.status,
+          CaseStatus.NEEDS_REVIEW,
+        );
+      } catch {
+        // A concurrent transition won; never overwrite its authoritative state.
+      }
+    }
+
+    if (createResult.created) {
       await this.auditRepo.record(merchantId, {
         caseId,
         eventType: 'REVIEW_REQUESTED',
@@ -268,7 +306,7 @@ export class HumanReviewService {
     }
 
     return {
-      created: createResult.created || reviewAlreadyPending,
+      created: createResult.created,
       review: effectiveReview,
       caseStatus: CaseStatus.NEEDS_REVIEW,
     };

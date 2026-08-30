@@ -375,7 +375,7 @@ describe('HumanReviewService Unit Tests', () => {
     });
 
     expect(first.created).toBe(true);
-    expect(second.created).toBe(true);
+    expect(second.created).toBe(false);
     expect(second.caseStatus).toBe(CaseStatus.NEEDS_REVIEW);
   });
 
@@ -409,7 +409,7 @@ describe('HumanReviewService Unit Tests', () => {
     expect(mockActionRepo.createAction).not.toHaveBeenCalled();
   });
 
-  it('fails closed at execution time when a human-approved action is stale because case moved out of NEEDS_REVIEW', async () => {
+  it('does not re-fail a successful human-approved action when its case later leaves NEEDS_REVIEW', async () => {
     const { review } = await mockReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId,
@@ -427,15 +427,58 @@ describe('HumanReviewService Unit Tests', () => {
     const execution = await actionExecutor.executeAction(merchantId, action!.id);
 
     expect(execution.executed).toBe(false);
-    expect(execution.success).toBe(false);
-    expect(execution.action?.status).toBe(ActionExecutionStatus.FAILED);
-    expect(mockAuditRepo.record).toHaveBeenCalledWith(
-      merchantId,
-      expect.objectContaining({
-        eventType: 'ACTION_FAILED',
-        reasonCode: 'REVIEW_EXECUTION_BLOCKED_CASE_NOT_NEEDS_REVIEW',
-      }),
-    );
+    expect(execution.alreadyClaimed).toBe(true);
+    expect(execution.action?.status).toBe(ActionExecutionStatus.SUCCESS);
+  });
+
+  it('preserves an already-successful human-approved action when the case later leaves NEEDS_REVIEW', async () => {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Needs check',
+    });
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+    const approval = await reviewService.approveReview(merchantId, review.id, reviewerId);
+    expect(approval.executionResult?.success).toBe(true);
+
+    const action = approval.action!;
+    inMemoryCases.get(caseId).status = CaseStatus.OPEN;
+    const failureAuditsBefore = inMemoryAudits.filter((audit) => audit.eventType === 'ACTION_FAILED').length;
+
+    const repeat = await actionExecutor.executeAction(merchantId, action.id);
+
+    expect(repeat.executed).toBe(false);
+    expect(repeat.alreadyClaimed).toBe(true);
+    expect(inMemoryActions.get(action.id).status).toBe(ActionExecutionStatus.SUCCESS);
+    expect(inMemoryAudits.filter((audit) => audit.eventType === 'ACTION_FAILED')).toHaveLength(failureAuditsBefore);
+  });
+
+  it('claims a pending human-approved action before failing stale case authority without dispatch', async () => {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Needs check',
+    });
+    inMemoryReviews.get(review.id).status = ReviewStatus.APPROVED;
+    const action = await mockActionRepo.createAction(merchantId, caseId, {
+      planVersionId,
+      actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+      actionParams: { channel: 'EMAIL', discountOffered: 0 },
+      idempotencyKey: 'stale-human-approved-action',
+      policyDecision: PolicyDecision.ALLOW,
+      policyRationale: 'approved',
+      status: ActionExecutionStatus.PENDING,
+      executionMetadata: { executionSource: 'HUMAN_REVIEW_APPROVAL', reviewId: review.id },
+    });
+    inMemoryCases.get(caseId).status = CaseStatus.OPEN;
+    const dispatchedBefore = simulatedProvider.dispatchedCalls.length;
+
+    const result = await actionExecutor.executeAction(merchantId, action.id);
+
+    expect(result.executed).toBe(false);
+    expect(result.success).toBe(false);
+    expect(inMemoryActions.get(action.id).status).toBe(ActionExecutionStatus.FAILED);
+    expect(simulatedProvider.dispatchedCalls).toHaveLength(dispatchedBefore);
   });
 
   it('keeps the case in NEEDS_REVIEW when a second review is still pending after rejectReview', async () => {
@@ -857,20 +900,38 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
 
   let inMemoryCases: Map<string, any>;
   let inMemoryReviews: Map<string, any>;
+  let inMemoryActions: Map<string, any>;
 
   beforeEach(() => {
     inMemoryCases = new Map();
     inMemoryReviews = new Map();
+    inMemoryActions = new Map();
 
     const baseCase = {
       id: caseId,
       merchantId,
+      customerId: 'cust_phase6_01',
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: { toString: () => '100.00' },
+      currency: 'INR',
       status: CaseStatus.NEEDS_REVIEW,
+      openedAt: new Date('2026-08-28T00:00:00.000Z'),
+      contextJson: { verifiedPaymentFailureCode: 'BAD_REQUEST_ERROR' },
+      customer: {
+        id: 'cust_phase6_01',
+        contactConsent: true,
+        optedOut: false,
+        lastContactedAt: null,
+      },
       planVersions: [{
         id: planVersionId,
+        caseId,
         version: 1,
+        diagnosisCode: 'CARD_DECLINED',
+        diagnosisSummary: 'Payment recovery review',
         proposedActionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
         proposedActionParams: { amount: '100.00' },
+        confidence: 0.9,
       }],
       actions: [],
       outcomes: [],
@@ -915,7 +976,8 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
       }),
       getReviewById: vi.fn(async (m: string, id: string) => {
         const r = inMemoryReviews.get(id);
-        return r && r.merchantId === m ? { ...r } : null;
+        const planVersion = inMemoryCases.get(r?.caseId)?.planVersions?.find((plan: any) => plan.id === r.planVersionId);
+        return r && r.merchantId === m ? { ...r, planVersion } : null;
       }),
       findPendingReviewForCase: vi.fn(async (m: string, cId: string) => {
         return [...inMemoryReviews.values()].find(
@@ -935,21 +997,48 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
     };
 
     mockActionRepo = {
-      createAction: vi.fn(async () => ({ id: 'action_1', status: ActionExecutionStatus.PENDING })),
-      getActionById: vi.fn(async (m: string, id: string) => ({
-        id,
-        caseId,
-        status: ActionExecutionStatus.PENDING,
-        executionMetadata: { executionSource: 'HUMAN_REVIEW_APPROVAL' },
-      })),
-      claimActionForExecution: vi.fn(async (m: string, id: string) => ({
-        claimed: true,
-        action: { id, status: ActionExecutionStatus.EXECUTING },
-      })),
-      transitionActionStatus: vi.fn(async (m: string, id: string, expected: any, next: any) => ({
-        transitioned: true,
-        action: { id, status: next },
-      })),
+      createAction: vi.fn(async (_m: string, cId: string, params: any) => {
+        const action = {
+          id: `action_${inMemoryActions.size + 1}`,
+          caseId: cId,
+          planVersionId: params.planVersionId ?? null,
+          actionType: params.actionType,
+          actionParams: params.actionParams,
+          idempotencyKey: params.idempotencyKey,
+          policyDecision: params.policyDecision,
+          status: params.status ?? ActionExecutionStatus.PENDING,
+          executionMetadata: params.executionMetadata ?? null,
+          createdAt: new Date(),
+        };
+        inMemoryActions.set(action.id, action);
+        return action;
+      }),
+      getActionById: vi.fn(async (_m: string, id: string) => inMemoryActions.get(id) ?? null),
+      findActionByIdempotencyKey: vi.fn(async () => null),
+      bindApprovedReview: vi.fn(async (_m: string, id: string, reviewId: string) => {
+        const action = inMemoryActions.get(id);
+        if (!action || action.status !== ActionExecutionStatus.PENDING) return null;
+        action.executionMetadata = { executionSource: 'HUMAN_REVIEW_APPROVAL', reviewId };
+        return action;
+      }),
+      claimActionForExecution: vi.fn(async (_m: string, id: string) => {
+        const action = inMemoryActions.get(id);
+        if (!action || action.status !== ActionExecutionStatus.PENDING) return { claimed: false, action: action ?? null };
+        action.status = ActionExecutionStatus.EXECUTING;
+        return { claimed: true, action };
+      }),
+      transitionActionStatus: vi.fn(async (_m: string, id: string, expected: any, next: any, extras?: any) => {
+        const action = inMemoryActions.get(id);
+        if (!action || action.status !== expected) return { transitioned: false, action: action ?? null };
+        action.status = next;
+        if (extras?.errorMessage) action.errorMessage = extras.errorMessage;
+        return { transitioned: true, action };
+      }),
+      updateActionStatus: vi.fn(async (_m: string, id: string, data: any) => {
+        const action = inMemoryActions.get(id);
+        Object.assign(action, data);
+        return action;
+      }),
     };
 
     policyEngine = new PolicyEngine();
@@ -965,10 +1054,16 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
           maxRetriesPerCase: 5,
           maxContactsPerCase: 5,
           maxActionsPerCase: 10,
+          cooldownHoursBetweenActions: 24,
+          highValueThreshold: { toString: () => '50000.00' },
           minConfidenceThreshold: 0.5,
-          quietHoursStart: 22,
-          quietHoursEnd: 8,
+          reviewFirstMode: false,
+          checkoutAbandonmentThresholdMinutes: 30,
+          quietHoursStart: 0,
+          quietHoursEnd: 0,
           quietHoursTimezone: 'UTC',
+          maxRecoveryWindowDays: 14,
+          overdueGracePeriodDays: 3,
         })),
       } as any,
       commitmentRepo: { getActiveCommitmentsForCase: vi.fn(async () => []) } as any,
@@ -987,6 +1082,23 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
       auditRepo: mockAuditRepo as any,
       policyEngine,
       providerRegistry: new ProviderRegistry([new SimulatedRecoveryProvider()]),
+    });
+
+    // This suite exercises the real approval -> executor composition. The
+    // earlier service supplies the shared complete policy fixture; rebuild it
+    // with the executor now that runtime composition is available.
+    reviewService = new HumanReviewService({
+      humanReviewRepo: mockReviewRepo,
+      caseRepo: mockCaseRepo,
+      actionRepo: mockActionRepo,
+      customerRepo: { updateLastContactedAt: vi.fn() } as any,
+      merchantRepo: { getMerchantById: vi.fn(async () => ({ killSwitchActive: false })) } as any,
+      policyConfigRepo: reviewService['policyConfigRepo'] as any,
+      commitmentRepo: { getActiveCommitmentsForCase: vi.fn(async () => []) } as any,
+      outcomeRepo: {} as any,
+      auditRepo: mockAuditRepo,
+      policyEngine,
+      actionExecutor,
     });
   });
 
@@ -1119,12 +1231,7 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
     // Now try to execute - should fail closed
     const executionResult = await actionExecutor.executeAction(merchantId, 'action_e');
     expect(executionResult.executed).toBe(false);
-    expect(mockAuditRepo.record).toHaveBeenCalledWith(
-      merchantId,
-      expect.objectContaining({
-        reasonCode: 'REVIEW_EXECUTION_BLOCKED_CASE_NOT_NEEDS_REVIEW',
-      })
-    );
+    expect(executionResult.alreadyClaimed).toBe(true);
   });
 
   // F. Legitimate approval while NEEDS_REVIEW dispatches exactly once
@@ -1137,11 +1244,6 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
 
     inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
     
-    mockActionRepo.createAction = vi.fn(async () => ({
-      id: 'action_f',
-      status: ActionExecutionStatus.PENDING,
-    }));
-
     const approvalResult = await reviewService.approveReview(
       merchantId,
       review.review.id,
@@ -1166,9 +1268,9 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
       reasonForReview: 'Second concurrent request (should find same review)',
     });
 
-    // Both should succeed and reference the same review
+    // Only the durable insert owner reports creation; both converge on it.
     expect(firstRequest.created).toBe(true);
-    expect(secondRequest.created).toBe(true);
+    expect(secondRequest.created).toBe(false);
     expect(firstRequest.review?.id).toBe(secondRequest.review?.id);
   });
 
@@ -1311,12 +1413,9 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
     expect(approvalResult.approved).toBe(true);
 
     // Second attempt should fail because review is no longer PENDING
-    const retryApproval = await reviewService.approveReview(
-      merchantId,
-      review.review.id,
-      'other_reviewer'
-    );
-    expect(retryApproval.approved).toBe(false);
+    await expect(
+      reviewService.approveReview(merchantId, review.review.id, 'other_reviewer'),
+    ).rejects.toBeInstanceOf(ReviewStateConflictError);
   });
 
   // O. Existing exact reviewed action type/params binding tests remain green
@@ -1328,14 +1427,6 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
     });
 
     inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
-
-    mockActionRepo.createAction = vi.fn(async (m, cId, params) => ({
-      id: 'action_o',
-      caseId: cId,
-      actionType: params.actionType,
-      actionParams: params.actionParams,
-      status: ActionExecutionStatus.PENDING,
-    }));
 
     const approvalResult = await reviewService.approveReview(
       merchantId,

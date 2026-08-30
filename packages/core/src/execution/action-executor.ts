@@ -332,27 +332,6 @@ export class ActionExecutor {
       );
     }
 
-    const metadataIsHumanReviewApproval =
-      action.executionMetadata &&
-      typeof action.executionMetadata === 'object' &&
-      !Array.isArray(action.executionMetadata) &&
-      (action.executionMetadata as Record<string, unknown>).executionSource === 'HUMAN_REVIEW_APPROVAL';
-
-    if (metadataIsHumanReviewApproval) {
-      const authoritativeCase = await this.caseRepo.getCaseById(merchantId, action.caseId);
-      if (!authoritativeCase || authoritativeCase.status !== CaseStatus.NEEDS_REVIEW) {
-        return await this.failActionSafely(
-          merchantId,
-          actionId,
-          action.caseId,
-          action.actionType,
-          action.idempotencyKey,
-          'Human-review execution authority is stale: authoritative case is no longer NEEDS_REVIEW; failing closed.',
-          'REVIEW_EXECUTION_BLOCKED_CASE_NOT_NEEDS_REVIEW',
-        );
-      }
-    }
-
     // ── Step 2: PENDING eligibility check ────────────────────────────────────
     if (action.status !== ActionExecutionStatus.PENDING) {
       return {
@@ -989,6 +968,7 @@ export class ActionExecutor {
     reasonCode: string,
   ): Promise<ActionExecutionResult> {
     let failedAction: RecoveryAction | null = null;
+    let transitionedToFailed = false;
     try {
       const current = await this.actionRepo.getActionById(merchantId, actionId);
       if (current?.status === ActionExecutionStatus.EXECUTING) {
@@ -1000,17 +980,7 @@ export class ActionExecutor {
           { errorMessage },
         );
         failedAction = transition.action;
-      } else if (
-        current &&
-        current.status !== ActionExecutionStatus.FAILED &&
-        current.status !== ActionExecutionStatus.CANCELLED &&
-        current.status !== ActionExecutionStatus.SUCCESS
-      ) {
-        const updated = await this.actionRepo.updateActionStatus(merchantId, actionId, {
-          status: ActionExecutionStatus.FAILED,
-          errorMessage,
-        });
-        failedAction = updated;
+        transitionedToFailed = transition.transitioned;
       } else {
         failedAction = current ?? null;
       }
@@ -1018,14 +988,16 @@ export class ActionExecutor {
       // Best-effort; proceed to audit regardless
     }
 
-    await this.auditRepo.record(merchantId, {
-      caseId,
-      eventType: 'ACTION_FAILED',
-      actorType: AuditActorType.SYSTEM,
-      inputSummaryJson: { actionId, actionType, idempotencyKey },
-      outputSummaryJson: { errorMessage },
-      reasonCode,
-    });
+    if (transitionedToFailed) {
+      await this.auditRepo.record(merchantId, {
+        caseId,
+        eventType: 'ACTION_FAILED',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { actionId, actionType, idempotencyKey },
+        outputSummaryJson: { errorMessage },
+        reasonCode,
+      });
+    }
 
     return {
       executed: false,
