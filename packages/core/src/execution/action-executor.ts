@@ -1,38 +1,38 @@
 import {
-  ActionExecutionStatus,
-  AuditActorType,
-  CaseStatus,
-  PolicyDecision,
-  RecoveryAction,
-  RecoveryActionType,
-  ReviewStatus,
+    ActionExecutionStatus,
+    AuditActorType,
+    CaseStatus,
+    PolicyDecision,
+    RecoveryAction,
+    RecoveryActionType,
+    ReviewStatus,
 } from '@prisma/client';
 import {
-  ActionRepository,
-  AuditRepository,
-  CaseRepository,
-  CommitmentRepository,
-  CustomerRepository,
-  MerchantRepository,
-  PolicyConfigRepository,
-  CaseWithRelations,
-  HumanReviewRepository,
+    ActionRepository,
+    AuditRepository,
+    CaseRepository,
+    CaseWithRelations,
+    CommitmentRepository,
+    CustomerRepository,
+    HumanReviewRepository,
+    MerchantRepository,
+    PolicyConfigRepository,
 } from '@recoverai/db';
-import {
-  IPolicyEngine,
-  PolicyEvaluationResult,
-  PolicyExecutionContext,
-  PolicyExecutionSource,
-} from './policy-interface.js';
-import {
-  ProviderActionInput,
-  ProviderActionResult,
-  ProviderExecutionOutcome,
-  ProviderRegistry,
-} from './provider-interface.js';
 import { ActionExecutionError, jsonStructurallyEqual } from '@recoverai/shared';
 import { IJobScheduler } from '../detection/job-scheduler-interface.js';
 import { generateActionIdempotencyKey } from './idempotency-generator.js';
+import {
+    IPolicyEngine,
+    PolicyEvaluationResult,
+    PolicyExecutionContext,
+    PolicyExecutionSource,
+} from './policy-interface.js';
+import {
+    ProviderActionInput,
+    ProviderActionResult,
+    ProviderExecutionOutcome,
+    ProviderRegistry,
+} from './provider-interface.js';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Options
@@ -99,6 +99,10 @@ export interface ActionExecutionResult {
   action?: RecoveryAction | null;
   result?: ProviderActionResult;
   error?: string;
+}
+
+function executionSourceIsHumanReviewApproval(source: PolicyExecutionSource): boolean {
+  return source === 'HUMAN_REVIEW_APPROVAL';
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -328,6 +332,27 @@ export class ActionExecutor {
       );
     }
 
+    const metadataIsHumanReviewApproval =
+      action.executionMetadata &&
+      typeof action.executionMetadata === 'object' &&
+      !Array.isArray(action.executionMetadata) &&
+      (action.executionMetadata as Record<string, unknown>).executionSource === 'HUMAN_REVIEW_APPROVAL';
+
+    if (metadataIsHumanReviewApproval) {
+      const authoritativeCase = await this.caseRepo.getCaseById(merchantId, action.caseId);
+      if (!authoritativeCase || authoritativeCase.status !== CaseStatus.NEEDS_REVIEW) {
+        return await this.failActionSafely(
+          merchantId,
+          actionId,
+          action.caseId,
+          action.actionType,
+          action.idempotencyKey,
+          'Human-review execution authority is stale: authoritative case is no longer NEEDS_REVIEW; failing closed.',
+          'REVIEW_EXECUTION_BLOCKED_CASE_NOT_NEEDS_REVIEW',
+        );
+      }
+    }
+
     // ── Step 2: PENDING eligibility check ────────────────────────────────────
     if (action.status !== ActionExecutionStatus.PENDING) {
       return {
@@ -464,7 +489,22 @@ export class ActionExecutor {
         'INVALID_HUMAN_REVIEW_AUTHORITY',
       );
     }
+
     const executionSource: PolicyExecutionSource = authority.executionSource;
+    if (executionSourceIsHumanReviewApproval(executionSource)) {
+      const authoritativeCase = await this.caseRepo.getCaseById(merchantId, caseRecord.id);
+      if (!authoritativeCase || authoritativeCase.status !== CaseStatus.NEEDS_REVIEW) {
+        return await this.failActionSafely(
+          merchantId,
+          actionId,
+          freshAction.caseId,
+          freshAction.actionType,
+          freshAction.idempotencyKey,
+          'Human-review execution authority is stale: authoritative case is no longer NEEDS_REVIEW; failing closed.',
+          'REVIEW_EXECUTION_BLOCKED_CASE_NOT_NEEDS_REVIEW',
+        );
+      }
+    }
 
     // ── Step 5: Fresh Policy Revalidation — only the claim owner revalidates ──
     const freshContext: PolicyExecutionContext = {
@@ -950,15 +990,30 @@ export class ActionExecutor {
   ): Promise<ActionExecutionResult> {
     let failedAction: RecoveryAction | null = null;
     try {
-      // Use CAS: EXECUTING → FAILED to protect against stale overwrite
-      const transition = await this.actionRepo.transitionActionStatus(
-        merchantId,
-        actionId,
-        ActionExecutionStatus.EXECUTING,
-        ActionExecutionStatus.FAILED,
-        { errorMessage },
-      );
-      failedAction = transition.action;
+      const current = await this.actionRepo.getActionById(merchantId, actionId);
+      if (current?.status === ActionExecutionStatus.EXECUTING) {
+        const transition = await this.actionRepo.transitionActionStatus(
+          merchantId,
+          actionId,
+          ActionExecutionStatus.EXECUTING,
+          ActionExecutionStatus.FAILED,
+          { errorMessage },
+        );
+        failedAction = transition.action;
+      } else if (
+        current &&
+        current.status !== ActionExecutionStatus.FAILED &&
+        current.status !== ActionExecutionStatus.CANCELLED &&
+        current.status !== ActionExecutionStatus.SUCCESS
+      ) {
+        const updated = await this.actionRepo.updateActionStatus(merchantId, actionId, {
+          status: ActionExecutionStatus.FAILED,
+          errorMessage,
+        });
+        failedAction = updated;
+      } else {
+        failedAction = current ?? null;
+      }
     } catch {
       // Best-effort; proceed to audit regardless
     }

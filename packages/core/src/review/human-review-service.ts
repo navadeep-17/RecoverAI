@@ -1,22 +1,22 @@
 import {
-  AuditActorType,
-  CaseStatus,
-  HumanReview,
-  PolicyDecision,
-  RecoveryAction,
-  ReviewStatus,
+    AuditActorType,
+    CaseStatus,
+    HumanReview,
+    PolicyDecision,
+    RecoveryAction,
+    ReviewStatus,
 } from '@prisma/client';
 import {
-  ActionRepository,
-  AuditRepository,
-  CaseRepository,
-  CommitmentRepository,
-  CustomerRepository,
-  HumanReviewRepository,
-  HumanReviewWithRelations,
-  MerchantRepository,
-  OutcomeRepository,
-  PolicyConfigRepository,
+    ActionRepository,
+    AuditRepository,
+    CaseRepository,
+    CommitmentRepository,
+    CustomerRepository,
+    HumanReviewRepository,
+    HumanReviewWithRelations,
+    MerchantRepository,
+    OutcomeRepository,
+    PolicyConfigRepository,
 } from '@recoverai/db';
 import { ReviewStateConflictError } from '@recoverai/shared';
 import { ActionExecutionResult, ActionExecutor } from '../execution/action-executor.js';
@@ -106,6 +106,47 @@ export class HumanReviewService {
     return this.clock ? this.clock() : new Date();
   }
 
+  private async hasActiveHumanReviewGate(
+    merchantId: string,
+    caseId: string,
+    excludedReviewId?: string,
+  ): Promise<boolean> {
+    if (!this.humanReviewRepo) {
+      return false;
+    }
+
+    const pending = await this.humanReviewRepo.findPendingReviewForCase(merchantId, caseId);
+    if (pending && (!excludedReviewId || pending.id !== excludedReviewId)) {
+      return true;
+    }
+
+    const takeover = await this.humanReviewRepo.findActiveTakeoverForCase(merchantId, caseId);
+    return !!takeover && (!excludedReviewId || takeover.id !== excludedReviewId);
+  }
+
+  private async reopenCaseIfReviewGateCleared(
+    merchantId: string,
+    caseId: string,
+    excludedReviewId?: string,
+  ): Promise<boolean> {
+    const caseRecord = await this.caseRepo.getCaseById(merchantId, caseId);
+    if (!caseRecord || caseRecord.status !== CaseStatus.NEEDS_REVIEW) {
+      return false;
+    }
+
+    if (await this.hasActiveHumanReviewGate(merchantId, caseId, excludedReviewId)) {
+      return false;
+    }
+
+    await this.caseRepo.compareAndSetStatus(
+      merchantId,
+      caseId,
+      CaseStatus.NEEDS_REVIEW,
+      CaseStatus.OPEN,
+    );
+    return true;
+  }
+
   /**
    * Retrieves a review by ID scoped to merchant.
    */
@@ -147,7 +188,7 @@ export class HumanReviewService {
       throw new Error(`Case "${caseId}" not found for merchant "${merchantId}"`);
     }
 
-    // Terminal cases cannot have new human reviews created
+    // Terminal cases cannot have new human reviews created.
     if (
       caseRecord.status === CaseStatus.RECOVERED ||
       caseRecord.status === CaseStatus.STOPPED ||
@@ -161,16 +202,45 @@ export class HumanReviewService {
       };
     }
 
-    // Transition case to NEEDS_REVIEW via CAS if not already there
+    let authoritativeCaseStatus = caseRecord.status;
     if (caseRecord.status === CaseStatus.OPEN || caseRecord.status === CaseStatus.WAITING) {
       try {
-        await this.caseRepo.compareAndSetStatus(merchantId, caseId, caseRecord.status, CaseStatus.NEEDS_REVIEW);
+        await this.caseRepo.compareAndSetStatus(
+          merchantId,
+          caseId,
+          caseRecord.status,
+          CaseStatus.NEEDS_REVIEW,
+        );
+        authoritativeCaseStatus = CaseStatus.NEEDS_REVIEW;
       } catch {
-        // Concurrency CAS loss is safe if another concurrent request already transitioned it
+        const reloadedCase = await this.caseRepo.getCaseById(merchantId, caseId);
+        if (!reloadedCase) {
+          throw new Error(`Case "${caseId}" not found for merchant "${merchantId}"`);
+        }
+
+        if (reloadedCase.status === CaseStatus.NEEDS_REVIEW) {
+          authoritativeCaseStatus = CaseStatus.NEEDS_REVIEW;
+        } else {
+          return {
+            created: false,
+            review: null,
+            caseStatus: reloadedCase.status,
+            reason: `Case is no longer eligible for review; authoritative status is "${reloadedCase.status}"`,
+          };
+        }
       }
     }
 
-    // Create durable review idempotently bound to proposal/version
+    if (authoritativeCaseStatus !== CaseStatus.NEEDS_REVIEW) {
+      return {
+        created: false,
+        review: null,
+        caseStatus: authoritativeCaseStatus,
+        reason: `Case is not eligible for human review; authoritative status is "${authoritativeCaseStatus}"`,
+      };
+    }
+
+    // Create durable review idempotently bound to proposal/version.
     const createResult = await this.humanReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId: data.planVersionId,
@@ -179,13 +249,16 @@ export class HumanReviewService {
       reasonForReview: data.reasonForReview,
     });
 
-    if (createResult.created) {
+    const effectiveReview = createResult.review;
+    const reviewAlreadyPending = effectiveReview.status === ReviewStatus.PENDING;
+
+    if (createResult.created || reviewAlreadyPending) {
       await this.auditRepo.record(merchantId, {
         caseId,
         eventType: 'REVIEW_REQUESTED',
         actorType: data.actorType || AuditActorType.POLICY,
         inputSummaryJson: {
-          reviewId: createResult.review.id,
+          reviewId: effectiveReview.id,
           planVersionId: data.planVersionId,
           actionId: data.actionId,
           reasonForReview: data.reasonForReview,
@@ -195,8 +268,8 @@ export class HumanReviewService {
     }
 
     return {
-      created: createResult.created,
-      review: createResult.review,
+      created: createResult.created || reviewAlreadyPending,
+      review: effectiveReview,
       caseStatus: CaseStatus.NEEDS_REVIEW,
     };
   }
@@ -237,7 +310,6 @@ export class HumanReviewService {
       throw new Error(`Case "${review.caseId}" not found for merchant "${merchantId}"`);
     }
 
-    // Check if case is terminal or not in NEEDS_REVIEW
     if (
       caseRecord.status === CaseStatus.RECOVERED ||
       caseRecord.status === CaseStatus.STOPPED ||
@@ -251,14 +323,34 @@ export class HumanReviewService {
           reviewId,
           reviewerId,
           caseStatus: caseRecord.status,
-          reason: 'Case is already in terminal state',
+          reason: `Case status is ${caseRecord.status}; approval requires NEEDS_REVIEW`,
         },
         reasonCode: 'REVIEW_APPROVAL_REJECTED_TERMINAL',
       });
       return {
         approved: false,
         stale: true,
-        reason: `Case is already in terminal state "${caseRecord.status}"; approval rejected`,
+        reason: `Case is in terminal state "${caseRecord.status}"; approval is no longer valid`,
+      };
+    }
+
+    if (caseRecord.status !== CaseStatus.NEEDS_REVIEW) {
+      await this.auditRepo.record(merchantId, {
+        caseId: caseRecord.id,
+        eventType: 'REVIEW_STALE',
+        actorType: AuditActorType.HUMAN,
+        inputSummaryJson: {
+          reviewId,
+          reviewerId,
+          caseStatus: caseRecord.status,
+          reason: `Case status is ${caseRecord.status}; approval requires NEEDS_REVIEW`,
+        },
+        reasonCode: 'REVIEW_APPROVAL_REJECTED_NOT_NEEDS_REVIEW',
+      });
+      return {
+        approved: false,
+        stale: true,
+        reason: `Case must still be in NEEDS_REVIEW for this approval; authoritative status is "${caseRecord.status}"`,
       };
     }
 
@@ -582,10 +674,13 @@ export class HumanReviewService {
       reasonCode: 'HUMAN_REVIEW_REJECTED',
     });
 
-    // Reopen case to allow autonomous replanning if it was in NEEDS_REVIEW
+    // Reopen only when there is no remaining active review gate for the case.
     const caseRecord = await this.caseRepo.getCaseById(merchantId, review.caseId);
     if (caseRecord && caseRecord.status === CaseStatus.NEEDS_REVIEW) {
-      await this.caseRepo.compareAndSetStatus(merchantId, caseRecord.id, CaseStatus.NEEDS_REVIEW, CaseStatus.OPEN);
+      const activeGateRemains = await this.hasActiveHumanReviewGate(merchantId, caseRecord.id, updatedReview.id);
+      if (!activeGateRemains) {
+        await this.caseRepo.compareAndSetStatus(merchantId, caseRecord.id, CaseStatus.NEEDS_REVIEW, CaseStatus.OPEN);
+      }
     }
 
     return {
@@ -702,6 +797,8 @@ export class HumanReviewService {
           reasonCode: 'ADMINISTRATIVE_STOP',
         });
       }
+    } else {
+      await this.reopenCaseIfReviewGateCleared(merchantId, review.caseId, updatedReview.id);
     }
 
     return {

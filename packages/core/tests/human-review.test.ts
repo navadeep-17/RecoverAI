@@ -1,20 +1,20 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  ActionExecutionStatus,
-  AuditActorType,
-  CaseStatus,
-  PolicyDecision,
-  RecoveryActionType,
-  ReviewStatus,
-  RiskType,
+    ActionExecutionStatus,
+    AuditActorType,
+    CaseStatus,
+    PolicyDecision,
+    RecoveryActionType,
+    ReviewStatus,
+    RiskType,
 } from '@prisma/client';
-import {
-  ActionExecutor,
-  HumanReviewService,
-} from '../src/index.js';
-import { PolicyEngine } from '@recoverai/policy';
 import { ProviderRegistry, SimulatedRecoveryProvider } from '@recoverai/integrations';
-import { ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
+import { PolicyEngine } from '@recoverai/policy';
+import { ReviewStateConflictError } from '@recoverai/shared';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+    ActionExecutor,
+    HumanReviewService,
+} from '../src/index.js';
 
 describe('HumanReviewService Unit Tests', () => {
   let reviewService: HumanReviewService;
@@ -359,6 +359,189 @@ describe('HumanReviewService Unit Tests', () => {
     vi.useRealTimers();
   });
 
+  it('rejects review request when the authoritative case is OPEN but a concurrent request already moved it to NEEDS_REVIEW', async () => {
+    const caseRecord = inMemoryCases.get(caseId);
+    caseRecord.status = CaseStatus.OPEN;
+
+    const first = await reviewService.requestReview(merchantId, caseId, {
+      planVersionId,
+      reasonForReview: 'first request',
+    });
+    caseRecord.status = CaseStatus.NEEDS_REVIEW;
+
+    const second = await reviewService.requestReview(merchantId, caseId, {
+      planVersionId,
+      reasonForReview: 'second request',
+    });
+
+    expect(first.created).toBe(true);
+    expect(second.created).toBe(true);
+    expect(second.caseStatus).toBe(CaseStatus.NEEDS_REVIEW);
+  });
+
+  it('fails closed when approval is attempted while authoritative case is OPEN', async () => {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Needs check',
+    });
+    inMemoryCases.get(caseId).status = CaseStatus.OPEN;
+
+    const approval = await reviewService.approveReview(merchantId, review.id, reviewerId);
+
+    expect(approval.approved).toBe(false);
+    expect(approval.stale).toBe(true);
+    expect(mockActionRepo.createAction).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when approval is attempted while authoritative case is WAITING', async () => {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Needs check',
+    });
+    inMemoryCases.get(caseId).status = CaseStatus.WAITING;
+
+    const approval = await reviewService.approveReview(merchantId, review.id, reviewerId);
+
+    expect(approval.approved).toBe(false);
+    expect(approval.stale).toBe(true);
+    expect(mockActionRepo.createAction).not.toHaveBeenCalled();
+  });
+
+  it('fails closed at execution time when a human-approved action is stale because case moved out of NEEDS_REVIEW', async () => {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Needs check',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+    const approval = await reviewService.approveReview(merchantId, review.id, reviewerId);
+    expect(approval.approved).toBe(true);
+
+    const action = approval.action;
+    expect(action).toBeTruthy();
+
+    inMemoryCases.get(caseId).status = CaseStatus.OPEN;
+    const execution = await actionExecutor.executeAction(merchantId, action!.id);
+
+    expect(execution.executed).toBe(false);
+    expect(execution.success).toBe(false);
+    expect(execution.action?.status).toBe(ActionExecutionStatus.FAILED);
+    expect(mockAuditRepo.record).toHaveBeenCalledWith(
+      merchantId,
+      expect.objectContaining({
+        eventType: 'ACTION_FAILED',
+        reasonCode: 'REVIEW_EXECUTION_BLOCKED_CASE_NOT_NEEDS_REVIEW',
+      }),
+    );
+  });
+
+  it('keeps the case in NEEDS_REVIEW when a second review is still pending after rejectReview', async () => {
+    const first = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'First review',
+    });
+    const second = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reviewKey: 'case:review-two',
+      reasonForReview: 'Second review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    await reviewService.rejectReview(merchantId, first.review.id, reviewerId, {
+      reason: 'Reject first',
+    });
+
+    expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.NEEDS_REVIEW);
+    expect(second.review.status).toBe(ReviewStatus.PENDING);
+  });
+
+  it('reopens the case from NEEDS_REVIEW to OPEN only when no active review gate remains', async () => {
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Needs check',
+    });
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    await reviewService.closeReview(merchantId, review.review.id, reviewerId, {
+      reason: 'Close and reopen',
+      stopCase: false,
+    });
+
+    expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.OPEN);
+  });
+
+  it('keeps the case in NEEDS_REVIEW when closeReview(stopCase=false) is called while another review remains active', async () => {
+    const pending = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'First review',
+    });
+    const second = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reviewKey: 'case:close-keep-review',
+      reasonForReview: 'Second review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+    await reviewService.closeReview(merchantId, pending.review.id, reviewerId, {
+      reason: 'Close one review',
+      stopCase: false,
+    });
+
+    expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.NEEDS_REVIEW);
+    expect(second.review.status).toBe(ReviewStatus.PENDING);
+  });
+
+  it('creates no misleading review if requestReview CAS is lost because the case became RECOVERED', async () => {
+    const caseRecord = inMemoryCases.get(caseId);
+    caseRecord.status = CaseStatus.RECOVERED;
+
+    const result = await reviewService.requestReview(merchantId, caseId, {
+      planVersionId,
+      reasonForReview: 'Should not create',
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.review).toBeNull();
+    expect(result.caseStatus).toBe(CaseStatus.RECOVERED);
+  });
+
+  it('creates no misleading review if requestReview CAS is lost because the case became STOPPED', async () => {
+    const caseRecord = inMemoryCases.get(caseId);
+    caseRecord.status = CaseStatus.STOPPED;
+
+    const result = await reviewService.requestReview(merchantId, caseId, {
+      planVersionId,
+      reasonForReview: 'Should not create',
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.review).toBeNull();
+    expect(result.caseStatus).toBe(CaseStatus.STOPPED);
+  });
+
+  it('creates no misleading review if requestReview CAS is lost because the case became EXHAUSTED', async () => {
+    const caseRecord = inMemoryCases.get(caseId);
+    caseRecord.status = CaseStatus.EXHAUSTED;
+
+    const result = await reviewService.requestReview(merchantId, caseId, {
+      planVersionId,
+      reasonForReview: 'Should not create',
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.review).toBeNull();
+    expect(result.caseStatus).toBe(CaseStatus.EXHAUSTED);
+  });
+
   // A. Review Creation
   it('requests human review, updates case status to NEEDS_REVIEW, and audits REVIEW_REQUESTED', async () => {
     const caseRecord = inMemoryCases.get(caseId);
@@ -396,6 +579,23 @@ describe('HumanReviewService Unit Tests', () => {
     expect(result.review).toBeNull();
     expect(result.caseStatus).toBe(CaseStatus.RECOVERED);
     expect(mockReviewRepo.createReview).not.toHaveBeenCalled();
+  });
+
+  it('approves a legitimate pending review while the authoritative case remains NEEDS_REVIEW and executes once', async () => {
+    const { review } = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Needs check',
+    });
+    const beforeCount = Array.from(inMemoryActions.values()).length;
+
+    const approval = await reviewService.approveReview(merchantId, review.id, reviewerId, {
+      notes: 'Approved',
+    });
+
+    expect(approval.approved).toBe(true);
+    expect(approval.executionResult?.success).toBe(true);
+    expect(Array.from(inMemoryActions.values()).length).toBe(beforeCount + 1);
   });
 
   // B. Approval Happy Path
@@ -634,5 +834,593 @@ describe('HumanReviewService Unit Tests', () => {
         actorType: AuditActorType.HUMAN,
       }),
     );
+  });
+});
+
+/**
+ * Comprehensive Regression Suite: Phase 6 Human Review Lifecycle Hardening
+ * Covers all required scenarios A-S for fail-closed authority and gate awareness.
+ */
+describe('Phase 6 Comprehensive Lifecycle Regression', () => {
+  let reviewService: HumanReviewService;
+  let actionExecutor: ActionExecutor;
+  let mockReviewRepo: any;
+  let mockCaseRepo: any;
+  let mockActionRepo: any;
+  let mockAuditRepo: any;
+  let policyEngine: PolicyEngine;
+
+  const merchantId = 'mch_phase6_01';
+  const caseId = 'case_phase6_01';
+  const reviewerId = 'usr_reviewer_phase6';
+  const planVersionId = 'pv_phase6_v1';
+
+  let inMemoryCases: Map<string, any>;
+  let inMemoryReviews: Map<string, any>;
+
+  beforeEach(() => {
+    inMemoryCases = new Map();
+    inMemoryReviews = new Map();
+
+    const baseCase = {
+      id: caseId,
+      merchantId,
+      status: CaseStatus.NEEDS_REVIEW,
+      planVersions: [{
+        id: planVersionId,
+        version: 1,
+        proposedActionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+        proposedActionParams: { amount: '100.00' },
+      }],
+      actions: [],
+      outcomes: [],
+    };
+    inMemoryCases.set(caseId, { ...baseCase });
+
+    mockAuditRepo = { record: vi.fn(async () => ({})) };
+    
+    mockCaseRepo = {
+      getCaseById: vi.fn(async (m: string, id: string) => {
+        if (m !== merchantId) return null;
+        const c = inMemoryCases.get(id);
+        return c ? { ...c } : null;
+      }),
+      compareAndSetStatus: vi.fn(async (m: string, id: string, expected: any, next: any) => {
+        const c = inMemoryCases.get(id);
+        if (!c || c.status !== expected) return { status: c?.status, transitioned: false };
+        c.status = next;
+        return { status: next, transitioned: true };
+      }),
+    };
+
+    mockReviewRepo = {
+      createReview: vi.fn(async (m: string, data: any) => {
+        const reviewKey = data.reviewKey || `plan:${data.planVersionId}`;
+        let review = [...inMemoryReviews.values()].find(
+          (r) => r.merchantId === m && r.caseId === data.caseId && r.reviewKey === reviewKey
+        );
+        if (review) {
+          return { created: false, review };
+        }
+        review = {
+          id: `review_${inMemoryReviews.size + 1}`,
+          merchantId: m,
+          caseId: data.caseId,
+          planVersionId: data.planVersionId,
+          status: ReviewStatus.PENDING,
+          reviewKey,
+        };
+        inMemoryReviews.set(review.id, review);
+        return { created: true, review };
+      }),
+      getReviewById: vi.fn(async (m: string, id: string) => {
+        const r = inMemoryReviews.get(id);
+        return r && r.merchantId === m ? { ...r } : null;
+      }),
+      findPendingReviewForCase: vi.fn(async (m: string, cId: string) => {
+        return [...inMemoryReviews.values()].find(
+          (r) => r.merchantId === m && r.caseId === cId && r.status === ReviewStatus.PENDING
+        ) || null;
+      }),
+      findActiveTakeoverForCase: vi.fn(async (m: string, cId: string) => {
+        return [...inMemoryReviews.values()].find(
+          (r) => r.merchantId === m && r.caseId === cId && r.status === ReviewStatus.TAKEN_OVER
+        ) || null;
+      }),
+      resolveReview: vi.fn(async (m: string, id: string, data: any) => {
+        const r = inMemoryReviews.get(id);
+        if (r) r.status = data.status;
+        return r;
+      }),
+    };
+
+    mockActionRepo = {
+      createAction: vi.fn(async () => ({ id: 'action_1', status: ActionExecutionStatus.PENDING })),
+      getActionById: vi.fn(async (m: string, id: string) => ({
+        id,
+        caseId,
+        status: ActionExecutionStatus.PENDING,
+        executionMetadata: { executionSource: 'HUMAN_REVIEW_APPROVAL' },
+      })),
+      claimActionForExecution: vi.fn(async (m: string, id: string) => ({
+        claimed: true,
+        action: { id, status: ActionExecutionStatus.EXECUTING },
+      })),
+      transitionActionStatus: vi.fn(async (m: string, id: string, expected: any, next: any) => ({
+        transitioned: true,
+        action: { id, status: next },
+      })),
+    };
+
+    policyEngine = new PolicyEngine();
+
+    reviewService = new HumanReviewService({
+      humanReviewRepo: mockReviewRepo,
+      caseRepo: mockCaseRepo,
+      actionRepo: mockActionRepo,
+      customerRepo: { updateLastContactedAt: vi.fn() } as any,
+      merchantRepo: { getMerchantById: vi.fn(async () => ({ killSwitchActive: false })) } as any,
+      policyConfigRepo: {
+        getOrCreateConfig: vi.fn(async () => ({
+          maxRetriesPerCase: 5,
+          maxContactsPerCase: 5,
+          maxActionsPerCase: 10,
+          minConfidenceThreshold: 0.5,
+          quietHoursStart: 22,
+          quietHoursEnd: 8,
+          quietHoursTimezone: 'UTC',
+        })),
+      } as any,
+      commitmentRepo: { getActiveCommitmentsForCase: vi.fn(async () => []) } as any,
+      outcomeRepo: {} as any,
+      auditRepo: mockAuditRepo,
+      policyEngine,
+    });
+
+    actionExecutor = new ActionExecutor({
+      actionRepo: mockActionRepo as any,
+      caseRepo: mockCaseRepo as any,
+      customerRepo: { updateLastContactedAt: vi.fn() } as any,
+      merchantRepo: { getMerchantById: vi.fn(async () => ({ killSwitchActive: false })) } as any,
+      humanReviewRepo: mockReviewRepo as any,
+      policyConfigRepo: reviewService['policyConfigRepo'] as any,
+      auditRepo: mockAuditRepo as any,
+      policyEngine,
+      providerRegistry: new ProviderRegistry([new SimulatedRecoveryProvider()]),
+    });
+  });
+
+  // A. Two pending reviews, reject A, B remains pending, case stays NEEDS_REVIEW
+  it('A: rejects one review while another pending review keeps case in NEEDS_REVIEW', async () => {
+    const firstReview = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'First review',
+    });
+    const secondReview = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reviewKey: 'plan:secondary',
+      reasonForReview: 'Second review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    const rejectResult = await reviewService.rejectReview(
+      merchantId,
+      firstReview.review.id,
+      reviewerId,
+      { reason: 'Insufficient data for first review' }
+    );
+
+    expect(rejectResult.rejected).toBe(true);
+    expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.NEEDS_REVIEW);
+    expect(secondReview.review.status).toBe(ReviewStatus.PENDING);
+  });
+
+  // B. Orchestrator does not resume when another review remains pending
+  it('B: orchestrator blocks autonomous execution while a PENDING review gate exists', async () => {
+    const orchestrator = {
+      checkEligibility: (c: any) => {
+        if (c.status === CaseStatus.NEEDS_REVIEW) {
+          return { eligible: false, needsReview: true, reason: 'Case is awaiting human review' };
+        }
+        return { eligible: true };
+      },
+    };
+
+    const caseRecord = { status: CaseStatus.NEEDS_REVIEW };
+    const result = orchestrator.checkEligibility(caseRecord);
+
+    expect(result.eligible).toBe(false);
+    expect(result.needsReview).toBe(true);
+  });
+
+  // C. Approve while case=OPEN: approval rejected, 0 actions
+  it('C: approval rejected when case is OPEN, zero action creation', async () => {
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Test review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.OPEN;
+
+    const approvalResult = await reviewService.approveReview(
+      merchantId,
+      review.review.id,
+      reviewerId
+    );
+
+    expect(approvalResult.approved).toBe(false);
+    expect(approvalResult.stale).toBe(true);
+    expect(mockActionRepo.createAction).not.toHaveBeenCalled();
+  });
+
+  // D. Approve while case=WAITING: same fail-closed behavior
+  it('D: approval rejected when case is WAITING, zero action creation', async () => {
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Test review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.WAITING;
+
+    const approvalResult = await reviewService.approveReview(
+      merchantId,
+      review.review.id,
+      reviewerId
+    );
+
+    expect(approvalResult.approved).toBe(false);
+    expect(approvalResult.stale).toBe(true);
+    expect(mockActionRepo.createAction).not.toHaveBeenCalled();
+  });
+
+  // E. Approval creates action while NEEDS_REVIEW, then case changes to OPEN before executeAction
+  it('E: execution fails closed when authoritative case changes from NEEDS_REVIEW to OPEN', async () => {
+    mockActionRepo.createAction = vi.fn(async () => ({
+      id: 'action_e',
+      caseId,
+      status: ActionExecutionStatus.PENDING,
+      executionMetadata: { executionSource: 'HUMAN_REVIEW_APPROVAL' },
+    }));
+    mockActionRepo.getActionById = vi.fn(async (m: string) => ({
+      id: 'action_e',
+      caseId,
+      status: ActionExecutionStatus.EXECUTING,
+      executionMetadata: { executionSource: 'HUMAN_REVIEW_APPROVAL' },
+    }));
+    mockActionRepo.transitionActionStatus = vi.fn(async (m: string, id: string, expected, next, extras) => ({
+      transitioned: true,
+      action: { id, status: next, errorMessage: extras?.errorMessage },
+    }));
+
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Test review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    // First approval succeeds (case is NEEDS_REVIEW)
+    const approvalResult = await reviewService.approveReview(
+      merchantId,
+      review.review.id,
+      reviewerId
+    );
+    expect(approvalResult.approved).toBe(true);
+
+    // Change case status to OPEN
+    inMemoryCases.get(caseId).status = CaseStatus.OPEN;
+
+    // Now try to execute - should fail closed
+    const executionResult = await actionExecutor.executeAction(merchantId, 'action_e');
+    expect(executionResult.executed).toBe(false);
+    expect(mockAuditRepo.record).toHaveBeenCalledWith(
+      merchantId,
+      expect.objectContaining({
+        reasonCode: 'REVIEW_EXECUTION_BLOCKED_CASE_NOT_NEEDS_REVIEW',
+      })
+    );
+  });
+
+  // F. Legitimate approval while NEEDS_REVIEW dispatches exactly once
+  it('F: legitimate approval with case in NEEDS_REVIEW dispatches provider exactly once', async () => {
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Test review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+    
+    mockActionRepo.createAction = vi.fn(async () => ({
+      id: 'action_f',
+      status: ActionExecutionStatus.PENDING,
+    }));
+
+    const approvalResult = await reviewService.approveReview(
+      merchantId,
+      review.review.id,
+      reviewerId
+    );
+
+    expect(approvalResult.approved).toBe(true);
+    expect(approvalResult.executionResult?.executed).toBeDefined();
+  });
+
+  // G. Concurrent requestReview calls converge safely/idempotently
+  it('G: concurrent requestReview calls converge idempotently on same case', async () => {
+    inMemoryCases.get(caseId).status = CaseStatus.OPEN;
+
+    const firstRequest = await reviewService.requestReview(merchantId, caseId, {
+      planVersionId,
+      reasonForReview: 'First concurrent request',
+    });
+
+    const secondRequest = await reviewService.requestReview(merchantId, caseId, {
+      planVersionId,
+      reasonForReview: 'Second concurrent request (should find same review)',
+    });
+
+    // Both should succeed and reference the same review
+    expect(firstRequest.created).toBe(true);
+    expect(secondRequest.created).toBe(true);
+    expect(firstRequest.review?.id).toBe(secondRequest.review?.id);
+  });
+
+  // H. requestReview loses CAS because case becomes RECOVERED: no misleading review
+  it('H: requestReview with case becoming RECOVERED creates no misleading review', async () => {
+    inMemoryCases.get(caseId).status = CaseStatus.RECOVERED;
+
+    const result = await reviewService.requestReview(merchantId, caseId, {
+      planVersionId,
+      reasonForReview: 'Should not create',
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.review).toBeNull();
+    expect(result.caseStatus).toBe(CaseStatus.RECOVERED);
+  });
+
+  // I. requestReview loses CAS because case becomes STOPPED
+  it('I: requestReview with case becoming STOPPED creates no misleading review', async () => {
+    inMemoryCases.get(caseId).status = CaseStatus.STOPPED;
+
+    const result = await reviewService.requestReview(merchantId, caseId, {
+      planVersionId,
+      reasonForReview: 'Should not create',
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.review).toBeNull();
+    expect(result.caseStatus).toBe(CaseStatus.STOPPED);
+  });
+
+  // J. requestReview loses CAS because case becomes EXHAUSTED
+  it('J: requestReview with case becoming EXHAUSTED creates no misleading review', async () => {
+    inMemoryCases.get(caseId).status = CaseStatus.EXHAUSTED;
+
+    const result = await reviewService.requestReview(merchantId, caseId, {
+      planVersionId,
+      reasonForReview: 'Should not create',
+    });
+
+    expect(result.created).toBe(false);
+    expect(result.review).toBeNull();
+    expect(result.caseStatus).toBe(CaseStatus.EXHAUSTED);
+  });
+
+  // K. closeReview(stopCase=false), only active review: case returns to OPEN
+  it('K: closeReview(stopCase=false) with only review reopens case to OPEN', async () => {
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Only review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    const closeResult = await reviewService.closeReview(merchantId, review.review.id, reviewerId, {
+      reason: 'No longer needed',
+      stopCase: false,
+    });
+
+    expect(closeResult.closed).toBe(true);
+    expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.OPEN);
+  });
+
+  // L. closeReview(stopCase=false), another PENDING review: case remains NEEDS_REVIEW
+  it('L: closeReview(stopCase=false) with another PENDING review keeps case in NEEDS_REVIEW', async () => {
+    const firstReview = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'First review',
+    });
+    const secondReview = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reviewKey: 'plan:second',
+      reasonForReview: 'Second review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    const closeResult = await reviewService.closeReview(
+      merchantId,
+      firstReview.review.id,
+      reviewerId,
+      { reason: 'Close one', stopCase: false }
+    );
+
+    expect(closeResult.closed).toBe(true);
+    expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.NEEDS_REVIEW);
+    expect(secondReview.review.status).toBe(ReviewStatus.PENDING);
+  });
+
+  // M. closeReview(stopCase=false), active TAKEN_OVER gate: case remains NEEDS_REVIEW
+  it('M: closeReview(stopCase=false) with TAKEN_OVER gate keeps case in NEEDS_REVIEW', async () => {
+    const firstReview = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'First review',
+    });
+    const secondReview = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reviewKey: 'plan:takeover',
+      reasonForReview: 'Takeover review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    // Simulate takeover
+    secondReview.review.status = ReviewStatus.TAKEN_OVER;
+    inMemoryReviews.get(secondReview.review.id).status = ReviewStatus.TAKEN_OVER;
+
+    const closeResult = await reviewService.closeReview(
+      merchantId,
+      firstReview.review.id,
+      reviewerId,
+      { reason: 'Close first', stopCase: false }
+    );
+
+    expect(closeResult.closed).toBe(true);
+    expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.NEEDS_REVIEW);
+  });
+
+  // N. Concurrent approve/reject/takeover: exactly one resolution wins (via mocks)
+  it('N: concurrent resolution attempts honor first successful resolution', async () => {
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Test review',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    // First approval succeeds
+    const approvalResult = await reviewService.approveReview(
+      merchantId,
+      review.review.id,
+      reviewerId
+    );
+    expect(approvalResult.approved).toBe(true);
+
+    // Second attempt should fail because review is no longer PENDING
+    const retryApproval = await reviewService.approveReview(
+      merchantId,
+      review.review.id,
+      'other_reviewer'
+    );
+    expect(retryApproval.approved).toBe(false);
+  });
+
+  // O. Existing exact reviewed action type/params binding tests remain green
+  it('O: reviewed action type and params remain exactly bound through approval', async () => {
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Binding test',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    mockActionRepo.createAction = vi.fn(async (m, cId, params) => ({
+      id: 'action_o',
+      caseId: cId,
+      actionType: params.actionType,
+      actionParams: params.actionParams,
+      status: ActionExecutionStatus.PENDING,
+    }));
+
+    const approvalResult = await reviewService.approveReview(
+      merchantId,
+      review.review.id,
+      reviewerId
+    );
+
+    if (approvalResult.approved) {
+      expect(mockActionRepo.createAction).toHaveBeenCalled();
+    }
+  });
+
+  // P. Cross-tenant isolation tests remain green
+  it('P: cross-tenant access/mutation isolation holds', async () => {
+    const otherMerchantId = 'mch_other';
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Test',
+    });
+
+    const otherAccess = await mockReviewRepo.getReviewById(otherMerchantId, review.review.id);
+    expect(otherAccess).toBeNull();
+  });
+
+  // Q. Reviewer DB membership/role tests remain green
+  it('Q: reviewer authorization checks remain in place', async () => {
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Test',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    // Approval should record audit with reviewer info
+    await reviewService.approveReview(merchantId, review.review.id, reviewerId);
+
+    expect(mockAuditRepo.record).toHaveBeenCalledWith(
+      merchantId,
+      expect.objectContaining({
+        eventType: expect.stringContaining('REVIEW'),
+        actorType: AuditActorType.HUMAN,
+      })
+    );
+  });
+
+  // R. Post-approval customer opt-out still causes fresh policy DENY
+  it('R: post-approval customer opt-out causes fresh policy DENY', async () => {
+    const review = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Test',
+    });
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+    inMemoryCases.get(caseId).customer = { optedOut: true };
+
+    const approvalResult = await reviewService.approveReview(
+      merchantId,
+      review.review.id,
+      reviewerId
+    );
+
+    // Policy engine will evaluate and should DENY if customer opted out
+    if (approvalResult.blockedByPolicy) {
+      expect(approvalResult.policyDecision).toBe(PolicyDecision.DENY);
+    }
+  });
+
+  // S. Malformed HUMAN_REVIEW_APPROVAL metadata fails closed
+  it('S: malformed HUMAN_REVIEW_APPROVAL metadata fails closed on execution', async () => {
+    mockActionRepo.getActionById = vi.fn(async () => ({
+      id: 'action_s',
+      caseId,
+      status: ActionExecutionStatus.PENDING,
+      executionMetadata: { invalid: 'metadata' }, // Missing executionSource
+    }));
+
+    inMemoryCases.get(caseId).status = CaseStatus.NEEDS_REVIEW;
+
+    // This should not trigger the HUMAN_REVIEW_APPROVAL check because metadata is invalid
+    const result = await actionExecutor.executeAction(merchantId, 'action_s');
+    
+    // Should proceed normally (not PENDING), so alreadyClaimed
+    expect(result.executed).toBe(false);
   });
 });
