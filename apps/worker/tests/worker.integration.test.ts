@@ -60,41 +60,24 @@ describe('pg-boss Real Integration Smoke Test', () => {
       CommitmentRepository,
       OutcomeRepository,
       ScheduledJobRepository,
-      TriggerRepository,
       AuditRepository,
       EventRepository,
       CustomerRepository,
       PolicyConfigRepository,
-      ActionRepository,
+      HumanReviewRepository,
       RiskType,
     } = await import('@recoverai/db');
-    const {
-      OutcomeObserver,
-      RecoveryOrchestrator,
-      ActionExecutor,
-      RecoveryAgent,
-      MockLLMProvider,
-    } = await import('@recoverai/core');
-    const { PolicyEngine } = await import('@recoverai/policy');
-    const { ProviderRegistry, SimulatedRecoveryProvider } = await import('@recoverai/integrations');
 
     const merchantRepo = new MerchantRepository();
     const caseRepo = new CaseRepository();
     const commitmentRepo = new CommitmentRepository();
     const outcomeRepo = new OutcomeRepository();
     const scheduledJobRepo = new ScheduledJobRepository();
-    const triggerRepo = new TriggerRepository();
     const auditRepo = new AuditRepository();
     const eventRepo = new EventRepository();
     const customerRepo = new CustomerRepository();
     const policyConfigRepo = new PolicyConfigRepository();
-    const actionRepo = new ActionRepository();
-
-    const policyEngine = new PolicyEngine();
-    const mockLLM = new MockLLMProvider();
-    const recoveryAgent = new RecoveryAgent(mockLLM);
-    const simulatedProvider = new SimulatedRecoveryProvider();
-    const providerRegistry = new ProviderRegistry([simulatedProvider]);
+    const reviewRepo = new HumanReviewRepository();
 
     const mch = await merchantRepo.createMerchant({
       name: 'pg-boss E2E Worker Merchant',
@@ -119,45 +102,8 @@ describe('pg-boss Real Integration Smoke Test', () => {
       extractedFromText: 'I will pay on time',
     });
 
-    const actionExecutor = new ActionExecutor({
-      actionRepo,
-      caseRepo,
-      merchantRepo,
-      customerRepo,
-      auditRepo,
-      policyConfigRepo,
-      commitmentRepo,
-      policyEngine,
-      providerRegistry,
-    });
-
-    const orchestrator = new RecoveryOrchestrator({
-      caseRepo,
-      actionRepo,
-      customerRepo,
-      merchantRepo,
-      policyConfigRepo,
-      commitmentRepo,
-      auditRepo,
-      recoveryAgent,
-      policyEngine,
-      actionExecutor,
-      triggerRepo,
-    });
-
-    const observer = new OutcomeObserver({
-      caseRepo,
-      actionRepo,
-      outcomeRepo,
-      customerRepo,
-      commitmentRepo,
-      eventRepo,
-      auditRepo,
-      scheduledJobRepo,
-      orchestrator,
-    });
-
-    // Start real worker service wired with real OutcomeObserver
+    // Exercise the worker's default composition: its OutcomeObserver must use
+    // the canonical durable review gate rather than an injected test double.
     const e2eWorker = new RecoveryWorkerService({
       caseRepo,
       customerRepo,
@@ -165,7 +111,6 @@ describe('pg-boss Real Integration Smoke Test', () => {
       auditRepo,
       eventRepo,
       scheduledJobRepo,
-      outcomeObserver: observer,
     });
 
     await e2eWorker.start();
@@ -206,6 +151,13 @@ describe('pg-boss Real Integration Smoke Test', () => {
       const updatedCommitment = await commitmentRepo.getCommitmentById(merchantId, testCase.id, commitment.id);
       expect(updatedCommitment?.status).toBe('BROKEN');
 
+      const updatedCase = await caseRepo.getCaseById(merchantId, testCase.id);
+      const activeReview = await reviewRepo.findPendingReviewForCase(merchantId, testCase.id);
+      expect(updatedCase?.status).toBe('NEEDS_REVIEW');
+      expect(activeReview).toMatchObject({ merchantId, caseId: testCase.id, status: 'PENDING' });
+      expect(activeReview?.actionId).toBeNull();
+      expect(activeReview?.reasonForReview).toContain('Promise-to-pay expired unpaid');
+
       const outcomes = await outcomeRepo.listOutcomesByCase(merchantId, testCase.id);
       expect(outcomes.some((o) => o.outcomeType === 'PROMISE_TO_PAY_BROKEN')).toBe(true);
 
@@ -213,6 +165,7 @@ describe('pg-boss Real Integration Smoke Test', () => {
         where: { caseId: testCase.id, eventType: 'PROMISE_TO_PAY_BROKEN' },
       });
       expect(audits.length).toBeGreaterThanOrEqual(1);
+      expect((await prisma.auditEvent.findMany({ where: { caseId: testCase.id, eventType: 'REVIEW_REQUESTED' } })).length).toBe(1);
     } finally {
       await e2eWorker.stop();
     }

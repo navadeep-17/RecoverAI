@@ -10,8 +10,9 @@ import {
   ActionRepository,
   OutcomeRepository,
   CommitmentRepository,
+  HumanReviewRepository,
 } from '@recoverai/db';
-import { RiskDetector, OutcomeObserver, EventIngestionService } from '@recoverai/core';
+import { DurableReviewGateService, ReviewGateRequester, RiskDetector, OutcomeObserver, EventIngestionService } from '@recoverai/core';
 import { RazorpayEventNormalizer, RazorpayPaymentLinkProvider } from '@recoverai/integrations';
 import { PgBossJobScheduler } from './scheduler.js';
 
@@ -26,6 +27,7 @@ export interface RecoveryWorkerConfig {
   eventRepo?: EventRepository;
   scheduledJobRepo?: ScheduledJobRepository;
   outcomeObserver?: OutcomeObserver;
+  reviewGateRequester?: ReviewGateRequester;
 }
 
 export class RecoveryWorkerService {
@@ -75,6 +77,11 @@ export class RecoveryWorkerService {
       const auditRepo = this.config?.auditRepo || new AuditRepository();
       const eventRepo = this.config?.eventRepo || new EventRepository();
       const scheduledJobRepo = this.config?.scheduledJobRepo || new ScheduledJobRepository();
+      const reviewGateRequester = this.config?.reviewGateRequester || new DurableReviewGateService(
+        new HumanReviewRepository(),
+        caseRepo,
+        auditRepo,
+      );
 
       this.scheduler = new PgBossJobScheduler(this.boss, scheduledJobRepo);
       this.riskDetector = new RiskDetector(
@@ -97,6 +104,7 @@ export class RecoveryWorkerService {
           auditRepo,
           scheduledJobRepo,
           jobScheduler: this.scheduler,
+          reviewGateRequester,
         });
       }
 
