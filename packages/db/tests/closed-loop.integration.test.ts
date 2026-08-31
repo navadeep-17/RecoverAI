@@ -26,6 +26,8 @@ import {
   RecoveryAgent,
   HumanReviewService,
   MockLLMProvider,
+  EventIngestionService,
+  RiskDetector,
 } from '@recoverai/core';
 import { PolicyEngine } from '@recoverai/policy';
 import {
@@ -43,8 +45,12 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   let auditRepo: AuditRepository;
   let policyConfigRepo: PolicyConfigRepository;
   let commitmentRepo: CommitmentRepository;
+  let humanReviewRepo: HumanReviewRepository;
   let outcomeRepo: OutcomeRepository;
   let eventRepo: EventRepository;
+  let scheduledJobRepo: ScheduledJobRepository;
+  let riskDetector: RiskDetector;
+  let ingestionService: EventIngestionService;
   let policyEngine: PolicyEngine;
   let mockLLM: MockLLMProvider;
   let recoveryAgent: RecoveryAgent;
@@ -69,7 +75,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       auditRepo = new AuditRepository();
       policyConfigRepo = new PolicyConfigRepository();
       commitmentRepo = new CommitmentRepository();
-      const reviewRepo = new HumanReviewRepository();
+      humanReviewRepo = new HumanReviewRepository();
       outcomeRepo = new OutcomeRepository();
       eventRepo = new EventRepository();
 
@@ -79,7 +85,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       simulatedProvider = new SimulatedRecoveryProvider();
       providerRegistry = new ProviderRegistry([simulatedProvider]);
 
-      const scheduledJobRepo = new ScheduledJobRepository();
+      scheduledJobRepo = new ScheduledJobRepository();
       const triggerRepo = new TriggerRepository();
       const jobScheduler = {
         schedule: async (params: any) => {
@@ -99,6 +105,16 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
         },
       };
 
+      riskDetector = new RiskDetector(
+        caseRepo,
+        customerRepo,
+        policyConfigRepo,
+        auditRepo,
+        eventRepo,
+        jobScheduler,
+      );
+      ingestionService = new EventIngestionService(eventRepo, auditRepo, riskDetector, customerRepo);
+
       actionExecutor = new ActionExecutor({
         actionRepo,
         caseRepo,
@@ -113,7 +129,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
         clock: () => new Date('2026-08-28T14:00:00+05:30'),
       });
       reviewService = new HumanReviewService({
-        humanReviewRepo: reviewRepo,
+        humanReviewRepo,
         caseRepo,
         actionRepo,
         customerRepo,
@@ -180,22 +196,35 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
   it('FLOW A: ₹14,999 Subscription CARD_EXPIRED -> REQUEST_UPDATE -> METHOD_UPDATED -> RETRY -> RECOVERED', async () => {
     if (!dbAvailable) return;
 
-    // 1. Setup Customer & Subscription Failure Case
-    const customer = await customerRepo.getOrCreateCustomer(merchantId, {
-      name: 'Flow A Customer',
-      email: `flow_a_${Date.now()}@example.com`,
-      contactConsent: true,
-    });
-
+    // 1. Canonical subscription failure ingestion creates the case through RiskDetector.
     const paymentId = `pay_sub_${Date.now()}`;
-    const testCase = await caseRepo.createCase(merchantId, {
-      customerId: customer.id,
-      riskType: RiskType.SUBSCRIPTION_FAILURE,
-      amountAtRisk: '14999.00',
+    const subscriptionId = `sub_${Date.now()}`;
+    const failureIngestion = await ingestionService.ingestEvent({
+      merchantId,
+      source: MerchantEventSource.MERCHANT,
+      externalEventId: `evt_subscription_failure_${paymentId}`,
+      eventType: NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED,
+      occurredAt: new Date(),
+      dedupeKey: `subscription_failure:${merchantId}:${subscriptionId}`,
+      amount: '14999.00',
       currency: 'INR',
-      incidentKey: `${merchantId}:SUBSCRIPTION_FAILURE:${paymentId}`,
-      contextJson: { paymentId, verifiedPaymentFailureCode: 'CARD_EXPIRED' },
+      customer: {
+        externalCustomerId: `flow-a-${Date.now()}`,
+        name: 'Flow A Customer',
+        email: `flow_a_${Date.now()}@example.com`,
+        contactConsent: true,
+      },
+      payment: { paymentId, subscriptionId, verifiedFailureCode: 'CARD_EXPIRED' },
     });
+    expect(failureIngestion.created).toBe(true);
+    expect(failureIngestion.event.type).toBe(NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED);
+    expect(failureIngestion.detectionResult.riskDetected).toBe(true);
+    expect(failureIngestion.detectionResult.caseCreated).toBe(true);
+    expect(failureIngestion.detectionResult.riskType).toBe(RiskType.SUBSCRIPTION_FAILURE);
+    const testCase = await caseRepo.getCaseById(merchantId, failureIngestion.detectionResult.caseId!);
+    expect(testCase?.status).toBe(CaseStatus.OPEN);
+    expect(testCase).not.toBeNull();
+    if (!testCase) throw new Error('Subscription failure detection did not persist a case');
 
     // 2. Iteration 1: Agent diagnoses expired card -> proposes REQUEST_PAYMENT_UPDATE
     mockLLM.setMockResponse({
@@ -210,14 +239,16 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       shouldEscalate: false,
     });
 
-    const iter1 = await orchestrator.runIteration(merchantId, testCase.id, 'CASE_OPENED');
+    const iter1 = await orchestrator.runIteration(merchantId, testCase!.id, 'CASE_OPENED');
 
     expect(iter1.iterationCompleted).toBe(true);
     expect(iter1.status).toBe(CaseStatus.WAITING);
+    expect(iter1.policyDecision).toBe(PolicyDecision.ALLOW);
+    expect(iter1.action?.providerName).toBe('SIMULATED_RECOVERY_PROVIDER');
     expect(iter1.planVersion?.version).toBe(1);
 
     // Verify case in database is now WAITING
-    const dbCaseWaiting = await caseRepo.getCaseById(merchantId, testCase.id);
+    const dbCaseWaiting = await caseRepo.getCaseById(merchantId, testCase!.id);
     expect(dbCaseWaiting?.status).toBe(CaseStatus.WAITING);
 
     // 3. Customer updates payment method -> Event PAYMENT_METHOD_UPDATED arrives
@@ -225,21 +256,17 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       eventId: `evt_method_${Date.now()}`,
       merchantId,
       source: MerchantEventSource.MERCHANT,
+      externalEventId: `ext_method_${paymentId}`,
       eventType: NormalizedEventType.PAYMENT_METHOD_UPDATED,
       occurredAt: new Date(),
+      dedupeKey: `method_updated:${merchantId}:${paymentId}`,
       payment: {
         paymentId,
       },
     };
 
-    const methodResult = await eventRepo.recordMerchantEvent(merchantId, {
-      source: MerchantEventSource.MERCHANT,
-      type: NormalizedEventType.PAYMENT_METHOD_UPDATED,
-      externalEventId: `ext_method_${paymentId}`,
-      dedupeKey: `method_updated:${merchantId}:${paymentId}`,
-      payloadJson: methodUpdatedEvent,
-      occurredAt: new Date(),
-    });
+    const methodResult = await ingestionService.ingestEvent(methodUpdatedEvent, { skipRiskDetection: true });
+    expect(methodResult.created).toBe(true);
 
     // When observer wakes orchestrator, configure LLM to propose RETRY_PAYMENT for iteration 2
     mockLLM.setMockResponse({
@@ -270,8 +297,10 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       eventId: `evt_success_${Date.now()}`,
       merchantId,
       source: MerchantEventSource.RAZORPAY,
+      externalEventId: `ext_succ_${paymentId}`,
       eventType: NormalizedEventType.PAYMENT_SUCCEEDED,
       occurredAt: new Date(),
+      dedupeKey: `pay_succ:${merchantId}:${paymentId}`,
       amount: '14999.00',
       currency: 'INR',
       payment: {
@@ -279,14 +308,8 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       },
     };
 
-    const succResult = await eventRepo.recordMerchantEvent(merchantId, {
-      source: MerchantEventSource.RAZORPAY,
-      type: NormalizedEventType.PAYMENT_SUCCEEDED,
-      externalEventId: `ext_succ_${paymentId}`,
-      dedupeKey: `pay_succ:${merchantId}:${paymentId}`,
-      payloadJson: successEvent,
-      occurredAt: new Date(),
-    });
+    const succResult = await ingestionService.ingestEvent(successEvent, { skipRiskDetection: true });
+    expect(succResult.created).toBe(true);
 
     // Verify before success observation that the case remains active and correctly correlated
     const beforeSuccess = await caseRepo.getCaseById(merchantId, testCase.id);
@@ -309,30 +332,55 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
 
     // Verify authoritative RecoveryOutcome was recorded
     const outcomes = await outcomeRepo.listOutcomesByCase(merchantId, testCase.id);
-    expect(outcomes.some((o) => o.outcomeType === NormalizedEventType.PAYMENT_SUCCEEDED)).toBe(true);
-    console.log('DEMO A | EVENT subscription failure -> AGENT REQUEST_PAYMENT_UPDATE -> POLICY ALLOW -> EXECUTE SIMULATED_RECOVERY_PROVIDER -> WAITING -> PAYMENT_METHOD_UPDATED -> REPLAN RETRY_PAYMENT -> OBSERVE PAYMENT_SUCCEEDED -> RECOVERED | Verified recovered: ₹14,999 | Agent-attributed: ₹0');
+    const winningOutcome = outcomes.find((o) => o.outcomeType === NormalizedEventType.PAYMENT_SUCCEEDED);
+    expect(winningOutcome).toBeDefined();
+    expect(winningOutcome?.actionId).toBeNull();
+    const verifiedRecovered = new Prisma.Decimal(finalDbCase!.recoveredAmount!).toFixed(2);
+    const agentAttributed = winningOutcome?.actionId ? verifiedRecovered : '0.00';
+    console.log(`DEMO A | EVENT ${failureIngestion.event.type} -> DETECT ${failureIngestion.detectionResult.riskType} -> AGENT ${iter1.planVersion?.proposedActionType} -> POLICY ${iter1.policyDecision} -> EXECUTE ${iter1.action?.providerName} -> WAITING -> PAYMENT_METHOD_UPDATED -> REPLAN RETRY_PAYMENT -> OBSERVE PAYMENT_SUCCEEDED -> RECOVERED | Verified recovered: ₹${verifiedRecovered} | Agent-attributed: ₹${agentAttributed}`);
   });
 
   // ──────────────────────────────────────────────────────────────────────────
   it('FLOW B: ₹8,499 Checkout Abandonment -> SEND_CHECKOUT_RECOVERY -> CHECKOUT_COMPLETED -> RECOVERED', async () => {
     if (!dbAvailable) return;
 
-    const customer = await customerRepo.getOrCreateCustomer(merchantId, {
-      name: 'Flow B Customer',
-      email: `flow_b_${Date.now()}@example.com`,
-      phone: '+919876543210',
-      contactConsent: true,
-    });
-
     const checkoutSessionId = `cs_${Date.now()}`;
-    const testCase = await caseRepo.createCase(merchantId, {
-      customerId: customer.id,
-      riskType: RiskType.CHECKOUT_ABANDONMENT,
-      amountAtRisk: '8499.00',
+    const checkoutIngestion = await ingestionService.ingestEvent({
+      merchantId,
+      source: MerchantEventSource.MERCHANT,
+      externalEventId: `evt_checkout_started_${checkoutSessionId}`,
+      eventType: NormalizedEventType.CHECKOUT_STARTED,
+      occurredAt: new Date(),
+      dedupeKey: `checkout_started:${merchantId}:${checkoutSessionId}`,
+      amount: '8499.00',
       currency: 'INR',
-      incidentKey: `${merchantId}:CHECKOUT_ABANDONMENT:${checkoutSessionId}`,
-      contextJson: { checkoutSessionId },
+      customer: {
+        externalCustomerId: `flow-b-${Date.now()}`,
+        name: 'Flow B Customer',
+        email: `flow_b_${Date.now()}@example.com`,
+        phone: '+919876543210',
+        contactConsent: true,
+      },
+      checkout: { checkoutSessionId },
     });
+    expect(checkoutIngestion.created).toBe(true);
+    expect(checkoutIngestion.event.type).toBe(NormalizedEventType.CHECKOUT_STARTED);
+    expect(checkoutIngestion.detectionResult.riskDetected).toBe(false);
+    expect(checkoutIngestion.detectionResult.scheduledJobId).toBeDefined();
+    const abandonmentJob = await scheduledJobRepo.getJobById(merchantId, checkoutIngestion.detectionResult.scheduledJobId!);
+    expect(abandonmentJob?.jobType).toBe('CHECKOUT_ABANDONMENT_CHECK');
+    expect(abandonmentJob?.status).toBe('SCHEDULED');
+    const abandonmentDetection = await riskDetector.evaluateCheckoutTimer(
+      merchantId,
+      checkoutSessionId,
+      abandonmentJob!.payloadJson as unknown as Record<string, unknown>,
+    );
+    expect(abandonmentDetection.riskDetected).toBe(true);
+    expect(abandonmentDetection.caseCreated).toBe(true);
+    expect(abandonmentDetection.riskType).toBe(RiskType.CHECKOUT_ABANDONMENT);
+    const testCase = await caseRepo.getCaseById(merchantId, abandonmentDetection.caseId!);
+    expect(testCase?.status).toBe(CaseStatus.OPEN);
+    if (!testCase) throw new Error('Checkout abandonment detection did not persist a case');
 
     // 1. Iteration 1: Agent proposes SEND_CHECKOUT_RECOVERY
     mockLLM.setMockResponse({
@@ -351,14 +399,18 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
 
     expect(iter1.iterationCompleted).toBe(true);
     expect(iter1.status).toBe(CaseStatus.WAITING);
+    expect(iter1.policyDecision).toBe(PolicyDecision.ALLOW);
+    expect(iter1.action?.providerName).toBe('SIMULATED_RECOVERY_PROVIDER');
 
     // 2. Authoritative CHECKOUT_COMPLETED event arrives for ₹8,499 INR
     const checkoutCompletedEvent: any = {
       eventId: `evt_chk_${Date.now()}`,
       merchantId,
       source: MerchantEventSource.MERCHANT,
+      externalEventId: `ext_chk_${checkoutSessionId}`,
       eventType: NormalizedEventType.CHECKOUT_COMPLETED,
       occurredAt: new Date(),
+      dedupeKey: `checkout_completed:${merchantId}:${checkoutSessionId}`,
       amount: '8499.00',
       currency: 'INR',
       checkout: {
@@ -366,14 +418,8 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       },
     };
 
-    const chkResult = await eventRepo.recordMerchantEvent(merchantId, {
-      source: MerchantEventSource.MERCHANT,
-      type: NormalizedEventType.CHECKOUT_COMPLETED,
-      externalEventId: `ext_chk_${checkoutSessionId}`,
-      dedupeKey: `checkout_completed:${merchantId}:${checkoutSessionId}`,
-      payloadJson: checkoutCompletedEvent,
-      occurredAt: new Date(),
-    });
+    const chkResult = await ingestionService.ingestEvent(checkoutCompletedEvent, { skipRiskDetection: true });
+    expect(chkResult.created).toBe(true);
 
     const obsResult = await observer.observeMerchantEvent(checkoutCompletedEvent, chkResult.event.id);
 
@@ -386,18 +432,18 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     expect(finalDbCase?.status).toBe(CaseStatus.RECOVERED);
     expect(finalDbCase?.recoveredAmount).toBeDefined();
     expect(new Prisma.Decimal(finalDbCase!.recoveredAmount!).equals(new Prisma.Decimal('8499.00'))).toBe(true);
-    console.log('DEMO B | EVENT CHECKOUT_STARTED -> DETECT CHECKOUT_ABANDONMENT -> AGENT SEND_CHECKOUT_RECOVERY -> POLICY ALLOW -> EXECUTE SIMULATED_RECOVERY_PROVIDER -> WAITING -> OBSERVE CHECKOUT_COMPLETED -> RECOVERED | Verified recovered: ₹8,499 | Agent-attributed: ₹0');
+    const outcomes = await outcomeRepo.listOutcomesByCase(merchantId, testCase.id);
+    const winningOutcome = outcomes.find((o) => o.outcomeType === NormalizedEventType.CHECKOUT_COMPLETED);
+    expect(winningOutcome).toBeDefined();
+    expect(winningOutcome?.actionId).toBeNull();
+    const verifiedRecovered = new Prisma.Decimal(finalDbCase!.recoveredAmount!).toFixed(2);
+    const agentAttributed = winningOutcome?.actionId ? verifiedRecovered : '0.00';
+    console.log(`DEMO B | EVENT ${checkoutIngestion.event.type} -> DETECT ${abandonmentDetection.riskType} -> AGENT ${iter1.planVersion?.proposedActionType} -> POLICY ${iter1.policyDecision} -> EXECUTE ${iter1.action?.providerName} -> WAITING -> OBSERVE CHECKOUT_COMPLETED -> RECOVERED | Verified recovered: ₹${verifiedRecovered} | Agent-attributed: ₹${agentAttributed}`);
   });
 
   // ──────────────────────────────────────────────────────────────────────────
   it('FLOW C: ₹85,000 Overdue Receivable -> REMINDER -> PROMISE_TO_PAY -> BROKEN -> NEEDS_REVIEW', async () => {
     if (!dbAvailable) return;
-
-    const customer = await customerRepo.getOrCreateCustomer(merchantId, {
-      name: 'Flow C Customer',
-      email: `flow_c_${Date.now()}@example.com`,
-      contactConsent: true,
-    });
 
     // Configure policyConfig with highValueThreshold = 100,000 so the initial reminder is authorized
     await prisma.policyConfig.upsert({
@@ -412,14 +458,42 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     });
 
     const invoiceId = `inv_${Date.now()}`;
-    const testCase = await caseRepo.createCase(merchantId, {
-      customerId: customer.id,
-      riskType: RiskType.OVERDUE_RECEIVABLE,
-      amountAtRisk: '85000.00',
+    const dueDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const invoiceIngestion = await ingestionService.ingestEvent({
+      merchantId,
+      source: MerchantEventSource.MERCHANT,
+      externalEventId: `evt_invoice_created_${invoiceId}`,
+      eventType: NormalizedEventType.INVOICE_CREATED,
+      occurredAt: new Date(),
+      dedupeKey: `invoice_created:${merchantId}:${invoiceId}`,
+      amount: '85000.00',
       currency: 'INR',
-      incidentKey: `${merchantId}:OVERDUE_RECEIVABLE:${invoiceId}`,
-      contextJson: { invoiceId },
+      customer: {
+        externalCustomerId: `flow-c-${Date.now()}`,
+        name: 'Flow C Customer',
+        email: `flow_c_${Date.now()}@example.com`,
+        contactConsent: true,
+      },
+      invoice: { invoiceId, dueDate, paid: false },
     });
+    expect(invoiceIngestion.created).toBe(true);
+    expect(invoiceIngestion.event.type).toBe(NormalizedEventType.INVOICE_CREATED);
+    expect(invoiceIngestion.detectionResult.riskDetected).toBe(false);
+    expect(invoiceIngestion.detectionResult.scheduledJobId).toBeDefined();
+    const overdueJob = await scheduledJobRepo.getJobById(merchantId, invoiceIngestion.detectionResult.scheduledJobId!);
+    expect(overdueJob?.jobType).toBe('INVOICE_OVERDUE_CHECK');
+    expect(overdueJob?.status).toBe('SCHEDULED');
+    const overdueDetection = await riskDetector.evaluateInvoiceTimer(
+      merchantId,
+      invoiceId,
+      overdueJob!.payloadJson as unknown as Record<string, unknown>,
+    );
+    expect(overdueDetection.riskDetected).toBe(true);
+    expect(overdueDetection.caseCreated).toBe(true);
+    expect(overdueDetection.riskType).toBe(RiskType.OVERDUE_RECEIVABLE);
+    const testCase = await caseRepo.getCaseById(merchantId, overdueDetection.caseId!);
+    expect(testCase?.status).toBe(CaseStatus.OPEN);
+    if (!testCase) throw new Error('Invoice overdue detection did not persist a case');
 
     // 1. Iteration 1: Agent proposes SEND_RECEIVABLE_REMINDER
     mockLLM.setMockResponse({
@@ -438,6 +512,8 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
 
     expect(iter1.iterationCompleted).toBe(true);
     expect(iter1.status).toBe(CaseStatus.WAITING);
+    expect(iter1.policyDecision).toBe(PolicyDecision.ALLOW);
+    expect(iter1.action?.providerName).toBe('SIMULATED_RECOVERY_PROVIDER');
 
     // 2. Customer replies: "Will pay ₹85,000 this Friday"
     const replyResult = await observer.observeCustomerReply({
@@ -456,8 +532,8 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     expect(commitments[0].promisedAmount.equals(new Prisma.Decimal('85000.00'))).toBe(true);
 
     // 3. Retrieve authoritative ScheduledJob created by observeCustomerReply
-    const scheduledJobRepo = new ScheduledJobRepository();
-    const caseJobs = await scheduledJobRepo.listJobsByCase(merchantId, testCase.id);
+    const promiseJobRepo = new ScheduledJobRepository();
+    const caseJobs = await promiseJobRepo.listJobsByCase(merchantId, testCase.id);
     expect(caseJobs.length).toBeGreaterThan(0);
     const promiseCheckJob = caseJobs.find((j) => j.jobType === 'PROMISE_TO_PAY_CHECK') || caseJobs[0];
 
@@ -491,10 +567,8 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     // 4. PolicyEngine evaluated BrokenPromiseToPayRule -> Decision REVIEW -> Case transitioned to NEEDS_REVIEW!
     const finalDbCase = await caseRepo.getCaseById(merchantId, testCase.id);
     expect(finalDbCase?.status).toBe(CaseStatus.NEEDS_REVIEW);
-    const activeReviewCount = await prisma.humanReview.count({
-      where: { merchantId, caseId: testCase.id, status: 'PENDING' },
-    });
-    expect(activeReviewCount).toBe(1);
+    const activeReview = await humanReviewRepo.findPendingReviewForCase(merchantId, testCase.id);
+    expect(activeReview).not.toBeNull();
 
     // Verify CASE_ESCALATED audit exists
     const escalationAudits = await prisma.auditEvent.findMany({
@@ -502,7 +576,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     });
     expect(escalationAudits.length).toBeGreaterThan(0);
     expect(escalationAudits[0].reasonCode).toBe('BROKEN_PROMISE_TO_PAY');
-    console.log('DEMO C | EVENT INVOICE_CREATED -> DETECT OVERDUE_RECEIVABLE -> AGENT SEND_RECEIVABLE_REMINDER -> POLICY ALLOW -> EXECUTE SIMULATED_RECOVERY_PROVIDER -> PROMISE_TO_PAY -> PTP_BROKEN -> HUMAN_REVIEW PENDING -> STOP awaiting human takeover');
+    console.log(`DEMO C | EVENT ${invoiceIngestion.event.type} -> DETECT ${overdueDetection.riskType} -> AGENT ${iter1.planVersion?.proposedActionType} -> POLICY ${iter1.policyDecision} -> EXECUTE ${iter1.action?.providerName} -> PROMISE_TO_PAY -> PTP_BROKEN -> HUMAN_REVIEW ${activeReview?.status} -> STOP awaiting human takeover`);
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -581,8 +655,9 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     mockLLM.setMockResponse({ diagnosisCode: 'CONTACT_REQUIRED', diagnosisSummary: 'Would contact customer', confidence: 0.9, proposedActionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE, proposedActionParams: { channel: 'EMAIL' }, reasoningSummary: 'Contact', shouldStop: false, shouldEscalate: false });
     const result = await orchestrator.runIteration(merchantId, testCase.id, 'SAFETY_OPT_OUT');
     expect(result.iterationCompleted).toBe(true);
+    expect(result.status).toBe(CaseStatus.STOPPED);
     expect(simulatedProvider.dispatchedCalls).toHaveLength(0);
-    console.log('SAFETY | customer optedOut=true -> POLICY DENY / STOPPED -> provider calls=0');
+    console.log(`SAFETY | customer optedOut=true -> deterministic pre-execution ${result.status} -> provider calls=${simulatedProvider.dispatchedCalls.length}`);
   });
 
   // ──────────────────────────────────────────────────────────────────────────
