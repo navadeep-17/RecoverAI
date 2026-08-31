@@ -22,7 +22,9 @@ export default defineConfig({
       command: 'npm run --workspace=@recoverai/api start',
       url: 'http://127.0.0.1:3000/ready',
       reuseExistingServer: !process.env.CI,
-      env: { ...commonEnv, PORT: '3000', HOST: '127.0.0.1', CORS_ORIGIN: 'http://127.0.0.1:5173', AI_PROVIDER: 'mock', LOG_LEVEL: 'error', SESSION_SECRET: 'phase_9c_playwright_session_secret' },
+      // CI runs the Playwright parent in test mode; the executable intentionally
+      // does not start in that mode, so isolate this child as a development service.
+      env: { ...commonEnv, NODE_ENV: 'development', PORT: '3000', HOST: '127.0.0.1', CORS_ORIGIN: 'http://127.0.0.1:5173', AI_PROVIDER: 'mock', LOG_LEVEL: 'error', SESSION_SECRET: 'phase_9c_playwright_session_secret' },
     },
     {
       command: 'npm run --workspace=@recoverai/web dev -- --host 127.0.0.1 --port 5173',
