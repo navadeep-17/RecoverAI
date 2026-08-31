@@ -7,6 +7,24 @@ const merchantB = 'merchant-b';
 const headers = (merchantId = merchantA) => ({ 'x-merchant-id': merchantId, 'x-user-id': 'user-a', 'x-user-role': Role.MERCHANT_ADMIN });
 
 describe('case read routes', () => {
+  it('returns 401 rather than a server error when case routes have no principal', async () => {
+    const getRevenueRadarMetrics = vi.fn();
+    const listCases = vi.fn();
+    const app = buildServer({ checkDbConnection: async () => true, caseRepo: { getRevenueRadarMetrics, listCases } as any, auditRepo: {} as any });
+
+    const [metrics, cases] = await Promise.all([
+      app.inject({ method: 'GET', url: '/cases/metrics' }),
+      app.inject({ method: 'GET', url: '/cases' }),
+    ]);
+
+    expect(metrics.statusCode).toBe(401);
+    expect(cases.statusCode).toBe(401);
+    expect(metrics.json()).toEqual({ error: 'UNAUTHORIZED: No authenticated principal present' });
+    expect(cases.json()).toEqual({ error: 'UNAUTHORIZED: No authenticated principal present' });
+    expect(getRevenueRadarMetrics).not.toHaveBeenCalled();
+    expect(listCases).not.toHaveBeenCalled();
+  });
+
   it('uses a tenant-scoped full-dataset metrics method rather than paginated cases', async () => {
     const getRevenueRadarMetrics = vi.fn(async (merchantId: string) => ({ revenueAtRisk: merchantId === merchantA ? '15000.00' : '0.00', verifiedRecovered: '0.30', activeRecoveries: 51, needsReview: 1, riskTypeBreakdown: { PAYMENT_FAILURE: { count: 51, amountAtRisk: '15000.00' } }, statusBreakdown: { OPEN: 50, NEEDS_REVIEW: 1 } }));
     const listCases = vi.fn();
