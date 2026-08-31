@@ -20,7 +20,9 @@
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
     "build:packages": "npm run --workspace=@recoverai/shared build && npm run --workspace=@recoverai/db build && npm run --workspace=@recoverai/core build && npm run --workspace=@recoverai/policy build && npm run --workspace=@recoverai/integrations build && npm run --workspace=@recoverai/evaluation build",
-    "db:migrate:deploy": "npx prisma migrate deploy --schema=packages/db/prisma/schema.prisma"
+    "db:migrate:deploy": "npx prisma migrate deploy --schema=packages/db/prisma/schema.prisma",
+    "demo:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/demo-setup.ps1",
+    "demo": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/demo.ps1"
   },
   "devDependencies": {
     "@testing-library/react": "^16.0.0",

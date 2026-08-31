@@ -310,6 +310,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     // Verify authoritative RecoveryOutcome was recorded
     const outcomes = await outcomeRepo.listOutcomesByCase(merchantId, testCase.id);
     expect(outcomes.some((o) => o.outcomeType === NormalizedEventType.PAYMENT_SUCCEEDED)).toBe(true);
+    console.log('DEMO A | EVENT subscription failure -> AGENT REQUEST_PAYMENT_UPDATE -> POLICY ALLOW -> EXECUTE SIMULATED_RECOVERY_PROVIDER -> WAITING -> PAYMENT_METHOD_UPDATED -> REPLAN RETRY_PAYMENT -> OBSERVE PAYMENT_SUCCEEDED -> RECOVERED | Verified recovered: ₹14,999 | Agent-attributed: ₹0');
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -385,6 +386,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     expect(finalDbCase?.status).toBe(CaseStatus.RECOVERED);
     expect(finalDbCase?.recoveredAmount).toBeDefined();
     expect(new Prisma.Decimal(finalDbCase!.recoveredAmount!).equals(new Prisma.Decimal('8499.00'))).toBe(true);
+    console.log('DEMO B | EVENT CHECKOUT_STARTED -> DETECT CHECKOUT_ABANDONMENT -> AGENT SEND_CHECKOUT_RECOVERY -> POLICY ALLOW -> EXECUTE SIMULATED_RECOVERY_PROVIDER -> WAITING -> OBSERVE CHECKOUT_COMPLETED -> RECOVERED | Verified recovered: ₹8,499 | Agent-attributed: ₹0');
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -500,6 +502,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     });
     expect(escalationAudits.length).toBeGreaterThan(0);
     expect(escalationAudits[0].reasonCode).toBe('BROKEN_PROMISE_TO_PAY');
+    console.log('DEMO C | EVENT INVOICE_CREATED -> DETECT OVERDUE_RECEIVABLE -> AGENT SEND_RECEIVABLE_REMINDER -> POLICY ALLOW -> EXECUTE SIMULATED_RECOVERY_PROVIDER -> PROMISE_TO_PAY -> PTP_BROKEN -> HUMAN_REVIEW PENDING -> STOP awaiting human takeover');
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -561,6 +564,25 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
       where: { caseId: testCase.id, eventType: 'CASE_RECOVERED_BY_PAYMENT' },
     });
     expect(recoveryAudits.length).toBe(1);
+  });
+
+  it('SAFETY TRACE: opted-out customer denies communication with zero provider dispatch', async () => {
+    if (!dbAvailable) return;
+    simulatedProvider.dispatchedCalls = [];
+    const customer = await customerRepo.getOrCreateCustomer(merchantId, {
+      externalCustomerId: `opted-out-${Date.now()}`,
+      contactConsent: true,
+    });
+    await customerRepo.setOptOut(merchantId, customer.id, true);
+    const testCase = await caseRepo.createCase(merchantId, {
+      customerId: customer.id, riskType: RiskType.PAYMENT_FAILURE, amountAtRisk: '14999.00', currency: 'INR',
+      incidentKey: `opted-out-${Date.now()}`, contextJson: { paymentId: `pay-opted-${Date.now()}` },
+    });
+    mockLLM.setMockResponse({ diagnosisCode: 'CONTACT_REQUIRED', diagnosisSummary: 'Would contact customer', confidence: 0.9, proposedActionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE, proposedActionParams: { channel: 'EMAIL' }, reasoningSummary: 'Contact', shouldStop: false, shouldEscalate: false });
+    const result = await orchestrator.runIteration(merchantId, testCase.id, 'SAFETY_OPT_OUT');
+    expect(result.iterationCompleted).toBe(true);
+    expect(simulatedProvider.dispatchedCalls).toHaveLength(0);
+    console.log('SAFETY | customer optedOut=true -> POLICY DENY / STOPPED -> provider calls=0');
   });
 
   // ──────────────────────────────────────────────────────────────────────────
