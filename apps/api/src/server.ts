@@ -2,7 +2,7 @@ import fastify, { FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import sensible from '@fastify/sensible';
 import { generateCorrelationId, createLogger, loadEnv } from '@recoverai/shared';
-import { checkDatabaseConnection, AuditRepository, CaseRepository, EventRepository } from '@recoverai/db';
+import { checkDatabaseConnection, AuditRepository, CaseRepository, EventRepository, PolicyConfigRepository } from '@recoverai/db';
 import { RazorpayWebhookService } from '@recoverai/integrations';
 
 import { EventIngestionService, HumanReviewService, OutcomeObserver } from '@recoverai/core';
@@ -11,6 +11,8 @@ import { authenticatePrincipalHook } from './auth/principal.js';
 import { razorpayWebhookRoutes } from './routes/razorpay-webhook-routes.js';
 import { caseRoutes } from './routes/case-routes.js';
 import { merchantEventRoutes } from './routes/merchant-event-routes.js';
+import { policyRoutes } from './routes/policy-routes.js';
+import { evaluationRoutes } from './routes/evaluation-routes.js';
 
 export interface BuildServerOptions {
   checkDbConnection?: () => Promise<boolean>;
@@ -18,6 +20,7 @@ export interface BuildServerOptions {
   razorpayWebhookService?: RazorpayWebhookService;
   caseRepo?: CaseRepository;
   auditRepo?: AuditRepository;
+  policyConfigRepo?: PolicyConfigRepository;
   merchantEventIngestionService?: EventIngestionService;
   merchantEventOutcomeObserver?: OutcomeObserver;
 }
@@ -113,6 +116,9 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     caseRepo: options.caseRepo || new CaseRepository(),
     auditRepo: options.auditRepo || new AuditRepository(),
   });
+
+  app.register(policyRoutes, { prefix: '/policy', policyConfigRepo: options.policyConfigRepo || new PolicyConfigRepository(), auditRepo: options.auditRepo || new AuditRepository() });
+  app.register(evaluationRoutes, { prefix: '/evaluation' });
 
   if (options.merchantEventIngestionService) {
     app.register(merchantEventRoutes, { prefix: '/merchant-events', ingestionService: options.merchantEventIngestionService, outcomeObserver: options.merchantEventOutcomeObserver });

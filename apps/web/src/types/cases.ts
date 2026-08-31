@@ -10,7 +10,7 @@ export interface RecoveryCase {
 }
 export interface PlanVersion { id: string; version: number; diagnosisCode: string; diagnosisSummary: string; confidence: number; proposedActionType: string; reasoningSummary?: string | null; createdAt: string; }
 export interface RecoveryAction { id: string; actionType: string; status: string; policyDecision: string; policyRationale?: string | null; providerName?: string | null; externalActionId?: string | null; createdAt: string; executedAt?: string | null; }
-export interface RecoveryOutcome { id: string; outcomeType: string; amountRecovered?: string | null; observedAt: string; detailsJson?: Record<string, unknown> | null; }
+export interface RecoveryOutcome { id: string; actionId?: string | null; outcomeType: string; amountRecovered?: string | null; observedAt: string; detailsJson?: Record<string, unknown> | null; }
 export interface AuditEvent { id: string; eventType: string; actorType: string; reasonCode?: string | null; createdAt: string; }
 export interface CaseDetailResponse { case: RecoveryCase; auditEvents: AuditEvent[]; }
-export interface RevenueRadarMetrics { revenueAtRisk: string; verifiedRecovered: string; activeRecoveries: number; needsReview: number; riskTypeBreakdown: Record<string, { count: number; amountAtRisk: string }>; statusBreakdown: Record<string, number>; }
+export interface RevenueRadarMetrics { revenueAtRisk: string; verifiedRecovered: string; agentAttributedRecovered: string; activeRecoveries: number; needsReview: number; riskTypeBreakdown: Record<string, { count: number; amountAtRisk: string }>; statusBreakdown: Record<string, number>; }

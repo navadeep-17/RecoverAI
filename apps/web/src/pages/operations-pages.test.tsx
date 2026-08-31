@@ -14,16 +14,17 @@ const caseItem = { id: 'case-1', customerId: 'customer-1', riskType: 'PAYMENT_FA
 
 describe('operational pages', () => {
   it('renders API-provided authoritative radar totals and monetary risk distribution', async () => {
-    api.getRevenueRadarMetrics.mockResolvedValue({ revenueAtRisk: '15000.00', verifiedRecovered: '0.30', activeRecoveries: 51, needsReview: 1, riskTypeBreakdown: { PAYMENT_FAILURE: { count: 51, amountAtRisk: '15000.00' } }, statusBreakdown: { OPEN: 50, NEEDS_REVIEW: 1 } });
+    api.getRevenueRadarMetrics.mockResolvedValue({ revenueAtRisk: '15000.00', verifiedRecovered: '0.30', agentAttributedRecovered: '0.10', activeRecoveries: 51, needsReview: 1, riskTypeBreakdown: { PAYMENT_FAILURE: { count: 51, amountAtRisk: '15000.00' } }, statusBreakdown: { OPEN: 50, NEEDS_REVIEW: 1 } });
     renderPage(<RevenueRadarPage />);
     expect((await screen.findAllByText('₹15,000.00')).length).toBe(2);
     expect(screen.getByText('₹0.30')).toBeTruthy();
     expect(screen.getByText('Revenue at risk by risk type')).toBeTruthy();
+    expect(screen.getByText('Agent-attributed recovered')).toBeTruthy();
     expect(screen.getByText('Payment failure')).toBeTruthy();
   });
 
   it('renders an intentional empty dashboard state', async () => {
-    api.getRevenueRadarMetrics.mockResolvedValue({ revenueAtRisk: '0.00', verifiedRecovered: '0.00', activeRecoveries: 0, needsReview: 0, riskTypeBreakdown: {}, statusBreakdown: {} });
+    api.getRevenueRadarMetrics.mockResolvedValue({ revenueAtRisk: '0.00', verifiedRecovered: '0.00', agentAttributedRecovered: '0.00', activeRecoveries: 0, needsReview: 0, riskTypeBreakdown: {}, statusBreakdown: {} });
     renderPage(<RevenueRadarPage />);
     expect(await screen.findByText('No recovery cases yet')).toBeTruthy();
   });
@@ -40,17 +41,18 @@ describe('operational pages', () => {
   });
 
   it('renders persisted plan, action, outcome, and audit evidence without oracle fields', async () => {
-    api.getCase.mockResolvedValue({ case: { ...caseItem, planVersions: [{ id: 'plan-1', version: 1, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.9, proposedActionType: 'SEND_PAYMENT_LINK', reasoningSummary: 'Persisted evidence', createdAt: '2025-01-01T00:00:00.000Z' }], actions: [{ id: 'action-1', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', policyRationale: 'Within policy', providerName: 'razorpay-test', createdAt: '2025-01-01T00:00:00.000Z', executedAt: '2025-01-01T00:01:00.000Z' }], outcomes: [{ id: 'outcome-1', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', observedAt: '2025-01-01T00:02:00.000Z' }] }, auditEvents: [{ id: 'audit-1', eventType: 'OUTCOME_RECORDED', actorType: 'SYSTEM', reasonCode: 'VERIFIED', createdAt: '2025-01-01T00:02:00.000Z' }] });
+    api.getCase.mockResolvedValue({ case: { ...caseItem, planVersions: [{ id: 'plan-1', version: 1, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.9, proposedActionType: 'SEND_PAYMENT_LINK', reasoningSummary: 'Persisted evidence', createdAt: '2025-01-01T00:00:00.000Z' }], actions: [{ id: 'action-1', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', policyRationale: 'Within policy', providerName: 'razorpay-test', createdAt: '2025-01-01T00:00:00.000Z', executedAt: '2025-01-01T00:01:00.000Z' }], outcomes: [{ id: 'outcome-1', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: 'action-1', observedAt: '2025-01-01T00:02:00.000Z' }] }, auditEvents: [{ id: 'audit-1', eventType: 'OUTCOME_RECORDED', actorType: 'SYSTEM', reasonCode: 'VERIFIED', createdAt: '2025-01-01T00:02:00.000Z' }] });
     renderPage(<CaseDetailPage caseId="case-1" navigate={vi.fn()} />);
     expect(await screen.findByText('Payment declined')).toBeTruthy();
     expect(screen.getByText('SEND PAYMENT LINK')).toBeTruthy();
     expect(screen.getByText('PAYMENT_SUCCEEDED')).toBeTruthy();
     expect(screen.getByText('OUTCOME_RECORDED')).toBeTruthy();
+    expect(screen.getAllByText('Agent-attributed verified recovery').length).toBeGreaterThan(0);
     expect(screen.queryByText(/oracle/i)).toBeNull();
   });
 
   it('shows a retryable visible API error', async () => {
-    api.getRevenueRadarMetrics.mockRejectedValueOnce(new Error('API unavailable')).mockResolvedValueOnce({ revenueAtRisk: '0.00', verifiedRecovered: '0.00', activeRecoveries: 0, needsReview: 0, riskTypeBreakdown: {}, statusBreakdown: {} });
+    api.getRevenueRadarMetrics.mockRejectedValueOnce(new Error('API unavailable')).mockResolvedValueOnce({ revenueAtRisk: '0.00', verifiedRecovered: '0.00', agentAttributedRecovered: '0.00', activeRecoveries: 0, needsReview: 0, riskTypeBreakdown: {}, statusBreakdown: {} });
     renderPage(<RevenueRadarPage />);
     expect(await screen.findByText('API unavailable')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /try again/i }));
