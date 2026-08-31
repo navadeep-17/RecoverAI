@@ -1,7 +1,7 @@
 import { AuditActorType, Role } from '@prisma/client';
 import { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { AuditRepository, PolicyConfigRepository } from '@recoverai/db';
+import { AuditRepository, InvalidPolicyConfigurationError, PolicyConfigRepository } from '@recoverai/db';
 import { requirePrincipal } from '../auth/principal.js';
 
 export interface PolicyRoutesOptions {
@@ -26,6 +26,10 @@ const policyPatchSchema = z.object({
   overdueGracePeriodDays: integer(0, 365).optional(),
 }).strict().refine((value) => Object.keys(value).length > 0, 'At least one policy setting is required');
 
+function isUnauthorized(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith('UNAUTHORIZED');
+}
+
 function dto(config: Awaited<ReturnType<PolicyConfigRepository['getOrCreateConfig']>>) {
   return { ...config, highValueThreshold: config.highValueThreshold.toFixed(2), createdAt: config.createdAt.toISOString(), updatedAt: config.updatedAt.toISOString() };
 }
@@ -36,7 +40,8 @@ export const policyRoutes: FastifyPluginAsync<PolicyRoutesOptions> = async (app,
       const principal = requirePrincipal(req);
       return reply.send({ policy: dto(await options.policyConfigRepo.getOrCreateConfig(principal.merchantId)) });
     } catch (error) {
-      return reply.status(401).send({ error: error instanceof Error ? error.message : 'Unauthorized' });
+      if (isUnauthorized(error)) return reply.status(401).send({ error: (error as Error).message });
+      return reply.status(500).send({ error: 'Unable to load policy configuration' });
     }
   });
 
@@ -53,7 +58,9 @@ export const policyRoutes: FastifyPluginAsync<PolicyRoutesOptions> = async (app,
       return reply.send({ policy: dto(policy) });
     } catch (error) {
       if (error instanceof z.ZodError) return reply.status(400).send({ error: 'Validation failed', details: error.errors });
-      return reply.status(400).send({ error: error instanceof Error ? error.message : 'Policy update failed' });
+      if (isUnauthorized(error)) return reply.status(401).send({ error: (error as Error).message });
+      if (error instanceof InvalidPolicyConfigurationError) return reply.status(400).send({ error: error.message });
+      return reply.status(500).send({ error: 'Unable to update policy configuration' });
     }
   });
 };

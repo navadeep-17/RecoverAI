@@ -22,9 +22,12 @@
     "build:packages": "npm run --workspace=@recoverai/shared build && npm run --workspace=@recoverai/db build && npm run --workspace=@recoverai/core build && npm run --workspace=@recoverai/policy build && npm run --workspace=@recoverai/integrations build && npm run --workspace=@recoverai/evaluation build",
     "db:migrate:deploy": "npx prisma migrate deploy --schema=packages/db/prisma/schema.prisma",
     "demo:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/demo-setup.ps1",
-    "demo": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/demo.ps1"
+    "demo": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/demo.ps1",
+    "e2e": "playwright test",
+    "e2e:install": "playwright install chromium"
   },
   "devDependencies": {
+    "@playwright/test": "^1.55.0",
     "@testing-library/react": "^16.0.0",
     "@testing-library/user-event": "^14.5.2",
     "@types/node": "^20.14.9",

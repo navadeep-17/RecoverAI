@@ -65,3 +65,9 @@ jobs:
 
       - name: Build All Workspaces
         run: npm run build
+
+      - name: Install Chromium for critical product E2E
+        run: npx playwright install --with-deps chromium
+
+      - name: Run critical product E2E
+        run: npm run e2e

@@ -1,12 +1,13 @@
-import { customAlphabet } from 'nanoid';
+import { randomBytes } from 'node:crypto';
 
-const alphabet = '0123456789abcdefghijklmnopqrstuvwxyz';
-const nanoid16 = customAlphabet(alphabet, 16);
+function randomId(): string {
+  return randomBytes(12).toString('hex');
+}
 
 export function generateCorrelationId(): string {
-  return `req_${nanoid16()}`;
+  return `req_${randomId()}`;
 }
 
 export function generateEntityId(prefix: string): string {
-  return `${prefix}_${nanoid16()}`;
+  return `${prefix}_${randomId()}`;
 }

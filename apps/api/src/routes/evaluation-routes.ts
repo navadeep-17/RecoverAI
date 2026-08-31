@@ -3,7 +3,13 @@ import path from 'node:path';
 import { FastifyPluginAsync } from 'fastify';
 import { requirePrincipal } from '../auth/principal.js';
 
-const artifactPath = path.resolve(process.cwd(), 'packages/evaluation/results/heldout-summary.json');
+// Resolve from the installed workspace package, never from the caller's cwd. This
+// is stable for tsx source execution and compiled CommonJS API execution alike.
+export function resolveFrozenEvaluationArtifact(packageJsonPath = require.resolve('@recoverai/evaluation/package.json')): string {
+  return path.join(path.dirname(packageJsonPath), 'results', 'heldout-summary.json');
+}
+
+const artifactPath = resolveFrozenEvaluationArtifact();
 const FINGERPRINT = 'sha256:f07508e41e4c7a29a1a3c09b2206fa5d7c8cb2dca20a75de9d59e927f8bb8e96';
 const CHECKPOINT = 'f599312bd1e81ea4f9d4d9fc3d2acd880b2d9849';
 
