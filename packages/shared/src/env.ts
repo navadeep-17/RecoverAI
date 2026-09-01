@@ -5,6 +5,8 @@ export const EnvSchema = z.object({
   PORT: z.coerce.number().default(3000),
   HOST: z.string().default('0.0.0.0'),
   CORS_ORIGIN: z.string().default('http://localhost:5173'),
+  AUTH_MODE: z.enum(['dev_headers', 'trusted_headers']).optional(),
+  AUTH_TRUST_SECRET: z.string().min(32).optional(),
   DATABASE_URL: z
     .string()
     .default('postgresql://recoverai:recoverai_secret@localhost:5432/recoverai?schema=public'),
@@ -20,6 +22,15 @@ export const EnvSchema = z.object({
   RAZORPAY_WEBHOOK_SECRET: z.string().min(1).optional(),
   RAZORPAY_TEST_MERCHANT_ID: z.string().min(1).optional(),
 }).superRefine((env, ctx) => {
+  if (env.NODE_ENV === 'development' && env.AUTH_MODE !== 'dev_headers') {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['AUTH_MODE'], message: 'must be dev_headers for local development' });
+  }
+  if (env.NODE_ENV === 'production') {
+    if (env.AUTH_MODE !== 'trusted_headers') ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['AUTH_MODE'], message: 'must be trusted_headers in production' });
+    if (!env.AUTH_TRUST_SECRET) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['AUTH_TRUST_SECRET'], message: 'is required for trusted production headers' });
+    if (env.CORS_ORIGIN === '*' || env.CORS_ORIGIN.includes('localhost')) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['CORS_ORIGIN'], message: 'must be an explicit non-localhost production origin' });
+    if (env.SESSION_SECRET === 'development_secret_must_be_overridden_in_prod') ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['SESSION_SECRET'], message: 'must be replaced in production' });
+  }
   if (env.AI_PROVIDER === 'gemini' && !env.GEMINI_API_KEY) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['GEMINI_API_KEY'], message: 'is required when AI_PROVIDER=gemini' });
   }

@@ -147,7 +147,7 @@ describe('Human Review API Routes & AuthenticatedPrincipal Boundary', () => {
     expect(res.statusCode).toBe(404);
   });
 
-  it('MEMBER principal cannot approve review (returns 403 Forbidden)', async () => {
+  it('rejects an invalid MEMBER role rather than treating it as a principal', async () => {
     const res = await app.inject({
       method: 'POST',
       url: `/reviews/${reviewAId}/approve`,
@@ -161,12 +161,10 @@ describe('Human Review API Routes & AuthenticatedPrincipal Boundary', () => {
       },
     });
 
-    expect(res.statusCode).toBe(403);
-    const body = JSON.parse(res.payload);
-    expect(body.error).toContain('UNAUTHORIZED_ROLE');
+    expect(res.statusCode).toBe(401);
   });
 
-  it('MEMBER principal cannot reject or takeover review (returns 403 Forbidden)', async () => {
+  it('rejects an invalid MEMBER role for reject and takeover', async () => {
     const rejectRes = await app.inject({
       method: 'POST',
       url: `/reviews/${reviewAId}/reject`,
@@ -179,7 +177,7 @@ describe('Human Review API Routes & AuthenticatedPrincipal Boundary', () => {
         reason: 'Unauthorized rejection attempt',
       },
     });
-    expect(rejectRes.statusCode).toBe(403);
+    expect(rejectRes.statusCode).toBe(401);
 
     const takeoverRes = await app.inject({
       method: 'POST',
@@ -190,7 +188,7 @@ describe('Human Review API Routes & AuthenticatedPrincipal Boundary', () => {
         'x-user-role': 'MEMBER',
       },
     });
-    expect(takeoverRes.statusCode).toBe(403);
+    expect(takeoverRes.statusCode).toBe(401);
   });
 
   it('REVIEWER principal can resolve review (returns 200 OK)', async () => {

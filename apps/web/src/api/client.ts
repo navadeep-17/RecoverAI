@@ -1,4 +1,4 @@
-const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000';
+const baseUrl = import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:3000' : '');
 
 export class ApiError<T = unknown> extends Error { constructor(public status: number, message: string, public data?: T) { super(message); } }
 
@@ -8,9 +8,11 @@ export async function requestJson<T>(method: string, path: string, body?: unknow
     method,
     headers: {
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-      'x-merchant-id': import.meta.env.VITE_DEV_MERCHANT_ID || '',
-      'x-user-id': import.meta.env.VITE_DEV_USER_ID || '',
-      'x-user-role': import.meta.env.VITE_DEV_USER_ROLE || 'MERCHANT_ADMIN',
+      ...(import.meta.env.DEV ? {
+        'x-merchant-id': import.meta.env.VITE_DEV_MERCHANT_ID || '',
+        'x-user-id': import.meta.env.VITE_DEV_USER_ID || '',
+        'x-user-role': import.meta.env.VITE_DEV_USER_ROLE || '',
+      } : {}),
     }, body: body === undefined ? undefined : JSON.stringify(body),
   });
   const responseBody = await response.json().catch(() => ({}));

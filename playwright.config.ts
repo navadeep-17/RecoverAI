@@ -21,15 +21,17 @@ export default defineConfig({
     {
       command: 'npm run --workspace=@recoverai/api start',
       url: 'http://127.0.0.1:3000/ready',
-      reuseExistingServer: !process.env.CI,
+      // Critical E2E owns its API/web environment and must not attach to a manually
+      // started service with incompatible development authentication settings.
+      reuseExistingServer: false,
       // CI runs the Playwright parent in test mode; the executable intentionally
       // does not start in that mode, so isolate this child as a development service.
-      env: { ...commonEnv, NODE_ENV: 'development', PORT: '3000', HOST: '127.0.0.1', CORS_ORIGIN: 'http://127.0.0.1:5173', AI_PROVIDER: 'mock', LOG_LEVEL: 'error', SESSION_SECRET: 'phase_9c_playwright_session_secret' },
+      env: { ...commonEnv, NODE_ENV: 'development', AUTH_MODE: 'dev_headers', PORT: '3000', HOST: '127.0.0.1', CORS_ORIGIN: 'http://127.0.0.1:5173', AI_PROVIDER: 'mock', LOG_LEVEL: 'error', SESSION_SECRET: 'phase_9c_playwright_session_secret' },
     },
     {
       command: 'npm run --workspace=@recoverai/web dev -- --host 127.0.0.1 --port 5173',
       url: 'http://127.0.0.1:5173',
-      reuseExistingServer: !process.env.CI,
+      reuseExistingServer: false,
       env: { VITE_API_BASE_URL: 'http://127.0.0.1:3000', VITE_DEV_MERCHANT_ID: 'phase-9c-e2e-merchant', VITE_DEV_USER_ID: 'phase-9c-e2e-admin', VITE_DEV_USER_ROLE: 'MERCHANT_ADMIN' },
     },
   ],

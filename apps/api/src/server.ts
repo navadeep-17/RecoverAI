@@ -1,13 +1,13 @@
 import fastify, { FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import sensible from '@fastify/sensible';
-import { generateCorrelationId, createLogger, loadEnv } from '@recoverai/shared';
+import { EnvConfig, generateCorrelationId, createLogger, loadEnv } from '@recoverai/shared';
 import { checkDatabaseConnection, AuditRepository, CaseRepository, EventRepository, PolicyConfigRepository } from '@recoverai/db';
 import { RazorpayWebhookService } from '@recoverai/integrations';
 
 import { EventIngestionService, HumanReviewService, OutcomeObserver } from '@recoverai/core';
 import { reviewRoutes } from './routes/review-routes.js';
-import { authenticatePrincipalHook } from './auth/principal.js';
+import { createAuthenticatePrincipalHook, PrincipalResolver } from './auth/principal.js';
 import { razorpayWebhookRoutes } from './routes/razorpay-webhook-routes.js';
 import { caseRoutes } from './routes/case-routes.js';
 import { merchantEventRoutes } from './routes/merchant-event-routes.js';
@@ -23,10 +23,12 @@ export interface BuildServerOptions {
   policyConfigRepo?: PolicyConfigRepository;
   merchantEventIngestionService?: EventIngestionService;
   merchantEventOutcomeObserver?: OutcomeObserver;
+  env?: EnvConfig;
+  principalResolver?: PrincipalResolver;
 }
 
 export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
-  const env = loadEnv();
+  const env = options.env ?? loadEnv();
   const logger = createLogger({ level: env.LOG_LEVEL, isProduction: env.NODE_ENV === 'production' });
   const checkDb = options.checkDbConnection ?? checkDatabaseConnection;
 
@@ -56,7 +58,8 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   });
 
   app.decorateRequest('principal', null);
-  app.addHook('preHandler', authenticatePrincipalHook);
+  const testResolver: PrincipalResolver = { resolve: async (candidate) => candidate };
+  app.addHook('preHandler', createAuthenticatePrincipalHook(env, options.principalResolver ?? (env.NODE_ENV === 'test' ? testResolver : undefined)));
 
   // Request/Response logging & correlation header injection
   app.addHook('onRequest', async (req, reply) => {
