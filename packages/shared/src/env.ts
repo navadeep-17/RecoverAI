@@ -22,6 +22,14 @@ export const EnvSchema = z.object({
   RAZORPAY_WEBHOOK_SECRET: z.string().min(1).optional(),
   RAZORPAY_TEST_MERCHANT_ID: z.string().min(1).optional(),
 }).superRefine((env, ctx) => {
+  const hasRazorpayKeyId = Boolean(env.RAZORPAY_KEY_ID);
+  const hasRazorpayKeySecret = Boolean(env.RAZORPAY_KEY_SECRET);
+  if (hasRazorpayKeyId !== hasRazorpayKeySecret) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['RAZORPAY_KEY_ID'], message: 'and RAZORPAY_KEY_SECRET must be configured together' });
+  }
+  if (env.RAZORPAY_KEY_ID?.startsWith('rzp_live_')) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['RAZORPAY_KEY_ID'], message: 'live Razorpay keys are not supported; RecoverAI is Test Mode only' });
+  }
   if (env.NODE_ENV === 'development' && env.AUTH_MODE !== 'dev_headers') {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['AUTH_MODE'], message: 'must be dev_headers for local development' });
   }
