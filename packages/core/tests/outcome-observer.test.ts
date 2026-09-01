@@ -499,7 +499,7 @@ describe('OutcomeObserver Unit Tests', () => {
 
   // ──────────────────────────────────────────────────────────────────────────
   describe('2. Non-Monetary Events & Orchestrator Waking', () => {
-    it('PAYMENT_METHOD_UPDATED records outcome and wakes orchestrator to replan', async () => {
+    it('PAYMENT_METHOD_UPDATED records outcome and durably wakes the worker to replan', async () => {
       const methodUpdateEvent: any = {
         eventId: 'evt_method_01',
         merchantId,
@@ -515,11 +515,13 @@ describe('OutcomeObserver Unit Tests', () => {
 
       expect(result.observed).toBe(true);
       expect(result.replanTriggered).toBe(true);
-      expect(mockOrchestrator.runIteration).toHaveBeenCalledWith(
+      expect(mockOrchestrator.runIteration).not.toHaveBeenCalled();
+      expect(mockJobScheduler.schedule).toHaveBeenCalledWith(expect.objectContaining({
         merchantId,
         caseId,
-        expect.objectContaining({ triggerType: 'OBSERVATION_ARRIVED' }),
-      );
+        jobType: 'RECOVERY_ITERATION',
+        payloadJson: expect.objectContaining({ triggerType: 'OBSERVATION_ARRIVED' }),
+      }));
 
       expect(inMemoryOutcomes.some((o) => o.outcomeType === 'PAYMENT_METHOD_UPDATED')).toBe(true);
     });

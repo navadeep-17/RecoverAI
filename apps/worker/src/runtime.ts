@@ -100,6 +100,7 @@ export function composeWorkerRuntime(env: EnvConfig = loadEnv()): WorkerRuntime 
     connectionString: env.DATABASE_URL, schema: env.PG_BOSS_SCHEMA, bossInstance: boss,
     caseRepo, customerRepo, policyConfigRepo, auditRepo, eventRepo, scheduledJobRepo,
     reviewGateRequester: reviewService, scheduler, riskDetector: detector,
+    orchestrator,
     eventIngestionService: new EventIngestionService(eventRepo, auditRepo, detector, customerRepo),
     outcomeObserver: observer,
   });

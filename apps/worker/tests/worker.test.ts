@@ -45,6 +45,29 @@ describe('RecoveryWorkerService Unit Tests', () => {
     expect((mockBoss.stop as any)).toHaveBeenCalledTimes(1);
   });
 
+  it('fails a RECOVERY_ITERATION without falsely completing its ScheduledJob when orchestration throws', async () => {
+    const handlers = new Map<string, (job: { data: unknown }) => Promise<void>>();
+    const mockBoss = {
+      start: vi.fn(async () => mockBoss as unknown as PgBoss),
+      stop: vi.fn(async () => {}),
+      on: vi.fn(() => mockBoss),
+      work: vi.fn(async (name: string, handler: (job: { data: unknown }) => Promise<void>) => { handlers.set(name, handler); return name; }),
+      send: vi.fn(async () => 'mock_send_id'),
+    } as unknown as PgBoss;
+    const scheduledJobRepo = {
+      getJobById: vi.fn(async () => ({ id: 'job-iteration-1', merchantId: 'merchant-1', caseId: 'case-1', jobType: 'RECOVERY_ITERATION', payloadJson: { caseId: 'case-1', triggerKey: 'CASE_OPENED:case-1', triggerType: 'CASE_OPENED' } })),
+      updateJobStatus: vi.fn(async () => ({})),
+    };
+    const orchestrator = { runIteration: vi.fn(async () => { throw new Error('deterministic orchestration failure'); }) };
+    const worker = new RecoveryWorkerService({ bossInstance: mockBoss, scheduledJobRepo: scheduledJobRepo as any, orchestrator: orchestrator as any });
+    await worker.start();
+
+    await expect(handlers.get('RECOVERY_ITERATION')!({ data: { merchantId: 'merchant-1', caseId: 'case-1', jobRecordId: 'job-iteration-1', triggerKey: 'CASE_OPENED:case-1', triggerType: 'CASE_OPENED' } })).rejects.toThrow('deterministic orchestration failure');
+    expect(orchestrator.runIteration).toHaveBeenCalledTimes(1);
+    expect(scheduledJobRepo.updateJobStatus).not.toHaveBeenCalled();
+    await worker.stop();
+  });
+
   it('PgBossJobScheduler transitions ScheduledJob to SCHEDULED with pgBossJobId on successful dispatch', async () => {
     let jobRecord: any = {
       id: 'job_local_01',

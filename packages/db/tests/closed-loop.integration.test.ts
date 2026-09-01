@@ -286,6 +286,23 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     expect(observationResult.observed).toBe(true);
     expect(observationResult.replanTriggered).toBe(true);
 
+    // Production consumes this durable wake in the worker. This historical
+    // orchestration test intentionally invokes the already-scheduled trigger
+    // directly so it can continue testing the loop itself without a second
+    // pg-boss harness.
+    const observationJob = (await scheduledJobRepo.listJobsByCase(merchantId, testCase.id)).find((job) => {
+      const payload = job.payloadJson as Record<string, unknown>;
+      return job.jobType === 'RECOVERY_ITERATION' && payload.triggerType === 'OBSERVATION_ARRIVED';
+    });
+    expect(observationJob).toBeDefined();
+    const observationPayload = observationJob!.payloadJson as Record<string, string>;
+    await orchestrator.runIteration(merchantId, testCase.id, {
+      triggerKey: observationPayload.triggerKey,
+      triggerType: observationPayload.triggerType,
+      scheduledJobId: observationJob!.id,
+    });
+    await scheduledJobRepo.updateJobStatus(merchantId, observationJob!.id, 'COMPLETED');
+
     // Verify Plan Version 2 was created in DB
     const dbCaseRechecked = await caseRepo.getCaseById(merchantId, testCase.id);
     expect(dbCaseRechecked?.planVersions?.length).toBe(2);

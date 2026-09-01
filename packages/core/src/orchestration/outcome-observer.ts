@@ -25,7 +25,7 @@ import {
   RiskType,
 } from '@recoverai/shared';
 import { generateIncidentKey } from '../detection/incident-identity.js';
-import { IJobScheduler } from '../detection/job-scheduler-interface.js';
+import { IJobScheduler, RecoveryIterationJob } from '../detection/job-scheduler-interface.js';
 import { CustomerReplyClassifier, CustomerReplyIntent } from './customer-reply-classifier.js';
 import { RecoveryOrchestrator } from './recovery-orchestrator.js';
 import { ReviewGateRequester } from '../review/review-gate-requester.js';
@@ -240,13 +240,23 @@ export class OutcomeObserver {
         reasonCode: 'PAYMENT_METHOD_UPDATED_OBSERVED',
       });
 
-      // Wake orchestrator to replan next action (e.g. RETRY_PAYMENT)
+      // Replanning is worker-owned: the API persists this observation and hands
+      // the authoritative wake to the same durable iteration consumer.
       let replanTriggered = false;
-      if (this.orchestrator && (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING)) {
-        await this.orchestrator.runIteration(merchantId, caseId, {
-          triggerKey: `OBSERVATION:${outcomeResult.outcome.id}`,
-          triggerType: 'OBSERVATION_ARRIVED',
-          merchantEventId,
+      if (this.jobScheduler && (matchedCase.status === CaseStatus.OPEN || matchedCase.status === CaseStatus.WAITING)) {
+        const triggerKey = `OBSERVATION:${outcomeResult.outcome.id}`;
+        await this.jobScheduler.schedule({
+          merchantId,
+          caseId,
+          jobKey: `recovery-iteration:${caseId}:observation:${outcomeResult.outcome.id}`,
+          jobType: RecoveryIterationJob.type,
+          scheduledFor: this.now(),
+          payloadJson: {
+            caseId,
+            triggerKey,
+            triggerType: 'OBSERVATION_ARRIVED',
+            merchantEventId,
+          },
         });
         replanTriggered = true;
       }

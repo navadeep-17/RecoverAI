@@ -170,4 +170,67 @@ describe('pg-boss Real Integration Smoke Test', () => {
       await e2eWorker.stop();
     }
   });
+
+  it('AUTONOMY PROOF: a persisted PAYMENT_FAILED event creates and consumes one durable RECOVERY_ITERATION without a caller invoking runIteration', async () => {
+    if (!dbAvailable) throw new Error('PostgreSQL is required for autonomous runtime evidence');
+
+    const { composeWorkerRuntime } = await import('../src/runtime.js');
+    const { RecoveryWorkerService } = await import('../src/worker.js');
+    const { MerchantRepository, ScheduledJobRepository, prisma } = await import('@recoverai/db');
+    const { MerchantEventSource, NormalizedEventType } = await import('@recoverai/shared');
+    const merchant = await new MerchantRepository().createMerchant({
+      name: 'pg-boss autonomous iteration merchant',
+      slug: `mch-autonomy-${Date.now()}`,
+    });
+    const runtime = composeWorkerRuntime({
+      NODE_ENV: 'test', AI_PROVIDER: 'mock', DATABASE_URL: process.env.DATABASE_URL!, PG_BOSS_SCHEMA: process.env.PG_BOSS_SCHEMA || 'pgboss', LOG_LEVEL: 'error',
+    } as any);
+    const autonomousWorker = runtime.worker as unknown as InstanceType<typeof RecoveryWorkerService>;
+    const jobs = new ScheduledJobRepository();
+    await autonomousWorker.start();
+
+    try {
+      const ingester = autonomousWorker.getEventIngestionService();
+      expect(ingester).not.toBeNull();
+      const eventSuffix = Date.now();
+      const failureEvent = {
+        merchantId: merchant.id,
+        source: MerchantEventSource.MERCHANT,
+        externalEventId: `evt-autonomous-payment-${eventSuffix}`,
+        eventType: NormalizedEventType.PAYMENT_FAILED,
+        occurredAt: new Date(),
+        dedupeKey: `merchant:evt-autonomous-payment-${eventSuffix}`,
+        amount: '1250.00',
+        currency: 'INR',
+        payment: { paymentId: `pay-autonomous-${eventSuffix}`, verifiedFailureCode: 'INSUFFICIENT_FUNDS' },
+      };
+      const ingested = await ingester!.ingestEvent(failureEvent);
+      const duplicate = await ingester!.ingestEvent(failureEvent);
+
+      expect(ingested.detectionResult.caseCreated).toBe(true);
+      expect(duplicate.deduplicated).toBe(true);
+      const caseId = ingested.detectionResult.caseId!;
+      const scheduled = await jobs.listJobsByCase(merchant.id, caseId);
+      expect(scheduled).toHaveLength(1);
+      expect(scheduled[0]).toMatchObject({ jobType: 'RECOVERY_ITERATION', jobKey: `recovery-iteration:${caseId}:case-opened` });
+
+      const deadline = Date.now() + 20000;
+      let completed = false;
+      while (Date.now() < deadline) {
+        const current = await jobs.getJobById(merchant.id, scheduled[0].id);
+        if (current?.status === 'COMPLETED') { completed = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      expect(completed).toBe(true);
+
+      const plans = await prisma.recoveryPlanVersion.findMany({ where: { caseId } });
+      const actions = await prisma.recoveryAction.findMany({ where: { caseId } });
+      const reviews = await prisma.humanReview.findMany({ where: { caseId } });
+      expect(plans).toHaveLength(1);
+      expect(actions.length + reviews.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      await autonomousWorker.stop();
+      await runtime.closeDatabase();
+    }
+  });
 });

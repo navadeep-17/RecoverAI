@@ -57,6 +57,18 @@ describe('merchant event ingress route', () => {
     expect((await accepted.inject({ method: 'POST', url: '/merchant-events', headers: headers(), payload: { ...valid, eventType: 'PAYMENT_SUCCEEDED', payment: { paymentId: 'pay-1' } } })).statusCode).toBe(202);
   });
 
+  it('accepts PAYMENT_METHOD_UPDATED only with an authoritative payment identity and routes it to OutcomeObserver', async () => {
+    const ingest = vi.fn(async () => ({ created: true, deduplicated: false, event: { id: 'method-update', receivedAt: new Date() } }));
+    const observer = { observeMerchantEvent: vi.fn(async () => ({ observed: true })) };
+    const app = buildServer({ checkDbConnection: async () => true, merchantEventIngestionService: { ingestEvent: ingest } as any, merchantEventOutcomeObserver: observer as any }); apps.push(app);
+    const missingIdentity = await app.inject({ method: 'POST', url: '/merchant-events', headers: headers(), payload: { externalEventId: 'evt-method-1', eventType: 'PAYMENT_METHOD_UPDATED', occurredAt: '2026-08-30T10:00:00.000Z' } });
+    expect(missingIdentity.statusCode).toBe(400);
+    const accepted = await app.inject({ method: 'POST', url: '/merchant-events', headers: headers(), payload: { externalEventId: 'evt-method-2', eventType: 'PAYMENT_METHOD_UPDATED', occurredAt: '2026-08-30T10:00:00.000Z', payment: { paymentId: 'pay-method-1' } } });
+    expect(accepted.statusCode).toBe(202);
+    expect(ingest).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'PAYMENT_METHOD_UPDATED', payment: { paymentId: 'pay-method-1' } }), { skipRiskDetection: true });
+    expect(observer.observeMerchantEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'PAYMENT_METHOD_UPDATED' }), 'method-update');
+  });
+
   it('hands a newly persisted monetary success to OutcomeObserver, never directly to a case writer', async () => {
     const ingest = vi.fn(async () => ({ created: true, deduplicated: false, event: { id: 'event-success', receivedAt: new Date() } }));
     const observer = { observeMerchantEvent: vi.fn(async () => ({ observed: false })) };

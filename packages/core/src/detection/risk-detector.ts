@@ -16,7 +16,7 @@ import {
   RevenueRiskCase,
 } from '@recoverai/db';
 import { generateIncidentKey } from './incident-identity.js';
-import { IJobScheduler } from './job-scheduler-interface.js';
+import { IJobScheduler, RecoveryIterationJob } from './job-scheduler-interface.js';
 
 export interface DetectionResult {
   riskDetected: boolean;
@@ -39,6 +39,45 @@ export class RiskDetector {
     private eventRepo: EventRepository,
     private jobScheduler?: IJobScheduler,
   ) {}
+
+  /** Enqueues the first autonomous iteration only for a newly persisted case. */
+  private async scheduleInitialRecoveryIteration(merchantId: string, caseId: string): Promise<string | undefined> {
+    if (!this.jobScheduler) {
+      await this.auditRepo.record(merchantId, {
+        caseId,
+        eventType: 'DETECTION_ERROR',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { caseId, jobType: RecoveryIterationJob.type },
+        reasonCode: 'RECOVERY_ITERATION_SCHEDULER_UNAVAILABLE',
+      });
+      return undefined;
+    }
+
+    const triggerKey = RecoveryIterationJob.initialTriggerKey(caseId);
+    const job = await this.jobScheduler.schedule({
+      merchantId,
+      caseId,
+      jobKey: RecoveryIterationJob.initialJobKey(caseId),
+      jobType: RecoveryIterationJob.type,
+      scheduledFor: new Date(),
+      payloadJson: {
+        caseId,
+        triggerKey,
+        triggerType: RecoveryIterationJob.initialTriggerType,
+      },
+    });
+
+    if (job.created !== false) {
+      await this.auditRepo.record(merchantId, {
+        caseId,
+        eventType: 'RECOVERY_ITERATION_SCHEDULED',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: { jobId: job.id, triggerKey, triggerType: RecoveryIterationJob.initialTriggerType },
+        reasonCode: 'CASE_OPENED_RECOVERY_ITERATION_SCHEDULED',
+      });
+    }
+    return job.id;
+  }
 
   /** Revenue-risk cases require authoritative, positive, exactly representable money. */
   private async validateRevenueRiskMoney(
@@ -238,6 +277,7 @@ export class RiskDetector {
       outputSummaryJson: { caseId: newCase.id, status: CaseStatus.OPEN },
       reasonCode: 'PAYMENT_FAILED_DETECTED',
     });
+    const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, newCase.id);
 
     return {
       riskDetected: true,
@@ -245,6 +285,7 @@ export class RiskDetector {
       caseId: newCase.id,
       case: newCase,
       riskType: RiskType.PAYMENT_FAILURE,
+      scheduledJobId,
       reason: 'Payment failure detected; case opened',
     };
   }
@@ -358,6 +399,7 @@ export class RiskDetector {
       outputSummaryJson: { caseId: newCase.id, status: CaseStatus.OPEN },
       reasonCode: 'SUBSCRIPTION_RENEWAL_FAILED_DETECTED',
     });
+    const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, newCase.id);
 
     return {
       riskDetected: true,
@@ -365,6 +407,7 @@ export class RiskDetector {
       caseId: newCase.id,
       case: newCase,
       riskType: RiskType.SUBSCRIPTION_FAILURE,
+      scheduledJobId,
       reason: 'Subscription renewal failure detected; case opened',
     };
   }
@@ -644,6 +687,7 @@ export class RiskDetector {
       outputSummaryJson: { caseId: newCase.id, status: CaseStatus.OPEN },
       reasonCode: 'CHECKOUT_ABANDONMENT_CONFIRMED',
     });
+    const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, newCase.id);
 
     return {
       riskDetected: true,
@@ -651,6 +695,7 @@ export class RiskDetector {
       caseId: newCase.id,
       case: newCase,
       riskType: RiskType.CHECKOUT_ABANDONMENT,
+      scheduledJobId,
       reason: 'Checkout abandonment threshold elapsed without completion; case opened',
     };
   }
@@ -920,6 +965,7 @@ export class RiskDetector {
       outputSummaryJson: { caseId: newCase.id, status: CaseStatus.OPEN },
       reasonCode: 'INVOICE_OVERDUE_CONFIRMED',
     });
+    const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, newCase.id);
 
     return {
       riskDetected: true,
@@ -927,6 +973,7 @@ export class RiskDetector {
       caseId: newCase.id,
       case: newCase,
       riskType: RiskType.OVERDUE_RECEIVABLE,
+      scheduledJobId,
       reason: 'Invoice due date and grace period elapsed without payment; case opened',
     };
   }

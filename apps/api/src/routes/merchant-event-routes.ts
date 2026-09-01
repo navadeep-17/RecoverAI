@@ -27,6 +27,7 @@ const merchantEventSchema = z.object({
     NormalizedEventType.INVOICE_PAID,
     NormalizedEventType.PAYMENT_FAILED,
     NormalizedEventType.PAYMENT_SUCCEEDED,
+    NormalizedEventType.PAYMENT_METHOD_UPDATED,
     NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED,
   ]),
   occurredAt: z.string().datetime({ offset: true }),
@@ -38,11 +39,12 @@ const merchantEventSchema = z.object({
   checkout: z.object({ checkoutSessionId: safeString, cartItemsSummary: z.string().max(500).optional() }).strict().optional(),
   metadata: safeMetadata.optional(),
 }).strict().superRefine((body, ctx) => {
-  if (!body.amount || !body.currency || Number(body.amount) <= 0) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'A positive exact amount and ISO currency are required' });
+  if (body.eventType !== NormalizedEventType.PAYMENT_METHOD_UPDATED && (!body.amount || !body.currency || Number(body.amount) <= 0)) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'A positive exact amount and ISO currency are required' });
   if ((body.eventType === NormalizedEventType.CHECKOUT_STARTED || body.eventType === NormalizedEventType.CHECKOUT_COMPLETED) && !body.checkout) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'checkout is required for checkout events' });
   if ((body.eventType === NormalizedEventType.INVOICE_CREATED || body.eventType === NormalizedEventType.INVOICE_PAID) && !body.invoice) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'invoice is required for invoice events' });
   if (body.eventType === NormalizedEventType.PAYMENT_FAILED && !body.payment?.paymentId) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'payment.paymentId is required for payment failures' });
   if (body.eventType === NormalizedEventType.PAYMENT_SUCCEEDED && !body.payment?.paymentId) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'payment.paymentId is required for payment successes' });
+  if (body.eventType === NormalizedEventType.PAYMENT_METHOD_UPDATED && !body.payment?.paymentId) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'payment.paymentId is required for payment method updates' });
   if (body.eventType === NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED && !body.payment?.subscriptionId) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'payment.subscriptionId is required for subscription failures' });
   if (body.customer?.contactConsent !== undefined && !body.customer.externalCustomerId) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Consent requires externalCustomerId' });
 });
@@ -62,9 +64,10 @@ export const merchantEventRoutes: FastifyPluginAsync<MerchantEventRoutesOptions>
         invoice: body.invoice || null, checkout: body.checkout || null, metadata: body.metadata || {},
       });
       const isMonetarySuccess = event.eventType === NormalizedEventType.PAYMENT_SUCCEEDED || event.eventType === NormalizedEventType.CHECKOUT_COMPLETED || event.eventType === NormalizedEventType.INVOICE_PAID;
-      const ingested = await options.ingestionService.ingestEvent(event, { skipRiskDetection: isMonetarySuccess });
-      if (isMonetarySuccess) {
-        if (!options.outcomeObserver) throw new Error('Authoritative monetary observer is unavailable');
+      const isAuthoritativeObservation = isMonetarySuccess || event.eventType === NormalizedEventType.PAYMENT_METHOD_UPDATED;
+      const ingested = await options.ingestionService.ingestEvent(event, { skipRiskDetection: isAuthoritativeObservation });
+      if (isAuthoritativeObservation) {
+        if (!options.outcomeObserver) throw new Error('Authoritative outcome observer is unavailable');
         // Re-observe exact duplicates: persistence is deduplicated, while OutcomeObserver
         // owns idempotent recovery and repairs a prior post-persistence failure.
         await options.outcomeObserver.observeMerchantEvent(event, ingested.event.id);

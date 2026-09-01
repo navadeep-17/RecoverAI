@@ -12,7 +12,7 @@ import {
   CommitmentRepository,
   HumanReviewRepository,
 } from '@recoverai/db';
-import { DurableReviewGateService, ReviewGateRequester, RiskDetector, OutcomeObserver, EventIngestionService } from '@recoverai/core';
+import { DurableReviewGateService, ReviewGateRequester, RiskDetector, OutcomeObserver, EventIngestionService, RecoveryOrchestrator, RecoveryIterationJob } from '@recoverai/core';
 import { RazorpayEventNormalizer, RazorpayPaymentLinkProvider } from '@recoverai/integrations';
 import { PgBossJobScheduler } from './scheduler.js';
 
@@ -31,6 +31,7 @@ export interface RecoveryWorkerConfig {
   scheduler?: PgBossJobScheduler;
   riskDetector?: RiskDetector;
   eventIngestionService?: EventIngestionService;
+  orchestrator?: RecoveryOrchestrator;
 }
 
 export class RecoveryWorkerService {
@@ -45,6 +46,7 @@ export class RecoveryWorkerService {
   private riskDetector: RiskDetector | null = null;
   private outcomeObserver: OutcomeObserver | null = null;
   private eventIngestionService: EventIngestionService | null = null;
+  private orchestrator: RecoveryOrchestrator | null = null;
 
   constructor(private config?: RecoveryWorkerConfig) {
     if (config?.bossInstance) {
@@ -52,6 +54,9 @@ export class RecoveryWorkerService {
     }
     if (config?.outcomeObserver) {
       this.outcomeObserver = config.outcomeObserver;
+    }
+    if (config?.orchestrator) {
+      this.orchestrator = config.orchestrator;
     }
   }
 
@@ -174,6 +179,30 @@ export class RecoveryWorkerService {
         await this.outcomeObserver.observeMerchantEvent(normalized, ingested.event.id);
       }
       await eventRepo.markWebhookProcessed(data.merchantId, 'RAZORPAY', receipt.dedupeKey);
+    });
+
+    await this.boss.work(RecoveryIterationJob.type, async (job) => {
+      const data = job.data as { merchantId?: unknown; caseId?: unknown; triggerKey?: unknown; triggerType?: unknown; jobRecordId?: unknown };
+      if (!this.orchestrator) throw new Error('RECOVERY_ITERATION requires the composed RecoveryOrchestrator');
+      if (typeof data.merchantId !== 'string' || typeof data.caseId !== 'string' || typeof data.triggerKey !== 'string' || typeof data.triggerType !== 'string' || typeof data.jobRecordId !== 'string') {
+        throw new Error('RECOVERY_ITERATION payload is missing authoritative identifiers');
+      }
+
+      const scheduledJob = await scheduledJobRepo.getJobById(data.merchantId, data.jobRecordId);
+      if (!scheduledJob || scheduledJob.jobType !== RecoveryIterationJob.type || scheduledJob.caseId !== data.caseId) {
+        throw new Error('RECOVERY_ITERATION scheduled job does not match the authoritative payload');
+      }
+      const payload = scheduledJob.payloadJson as Record<string, unknown>;
+      if (payload.triggerKey !== data.triggerKey || payload.triggerType !== data.triggerType || payload.caseId !== data.caseId) {
+        throw new Error('RECOVERY_ITERATION persisted payload does not match the transport payload');
+      }
+
+      await this.orchestrator.runIteration(data.merchantId, data.caseId, {
+        triggerKey: data.triggerKey,
+        triggerType: data.triggerType,
+        scheduledJobId: data.jobRecordId,
+      });
+      await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
     });
 
     // 1. Checkout Abandonment Recheck
@@ -351,5 +380,9 @@ export class RecoveryWorkerService {
 
   getOutcomeObserver(): OutcomeObserver | null {
     return this.outcomeObserver;
+  }
+
+  getEventIngestionService(): EventIngestionService | null {
+    return this.eventIngestionService;
   }
 }

@@ -224,6 +224,12 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
       expect(result.case?.amountAtRisk).toBe('14999.00');
       expect(result.case?.currency).toBe('INR');
       expect(result.case?.status).toBe(CaseStatus.OPEN);
+      expect(scheduledJobs).toContainEqual(expect.objectContaining({
+        caseId: result.caseId,
+        jobType: 'RECOVERY_ITERATION',
+        jobKey: `recovery-iteration:${result.caseId}:case-opened`,
+        payloadJson: expect.objectContaining({ triggerKey: `CASE_OPENED:${result.caseId}`, triggerType: 'CASE_OPENED' }),
+      }));
 
       const contextJson = result.case?.contextJson as Record<string, unknown>;
       expect(contextJson.verifiedPaymentFailureCode).toBe('INSUFFICIENT_FUNDS');
@@ -279,6 +285,7 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
       expect(res2.caseCreated).toBe(false);
       expect(res2.deduplicated).toBe(true);
       expect(res2.caseId).toBe(res1.caseId);
+      expect(scheduledJobs.filter((job) => job.jobType === 'RECOVERY_ITERATION')).toHaveLength(1);
     });
   });
 
