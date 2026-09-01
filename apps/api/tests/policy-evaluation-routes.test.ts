@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Role } from '@prisma/client';
-import { buildServer } from '../src/server.js';
+import { buildTestServer as buildServer } from './test-server.js';
 import { resolveFrozenEvaluationArtifact } from '../src/routes/evaluation-routes.js';
 
 const headers = (role = Role.MERCHANT_ADMIN, merchantId = 'merchant-a') => ({ 'x-merchant-id': merchantId, 'x-user-id': 'admin-a', 'x-user-role': role });

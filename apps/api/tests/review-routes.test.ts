@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ReviewStatus, Role } from '@prisma/client';
-import { buildServer } from '../src/server.js';
+import { buildTestServer as buildServer } from './test-server.js';
 import { ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
 
 describe('Human Review API Routes & AuthenticatedPrincipal Boundary', () => {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildServer } from '../src/server.js';
+import { buildTestServer as buildServer } from './test-server.js';
 
 const headers = (merchantId = 'merchant-a') => ({ 'x-merchant-id': merchantId, 'x-user-id': 'user-a', 'x-user-role': 'MERCHANT_ADMIN' });
 const valid = { externalEventId: 'evt-1', eventType: 'CHECKOUT_STARTED', occurredAt: '2026-08-30T10:00:00.000Z', amount: '8499.00', currency: 'INR', checkout: { checkoutSessionId: 'checkout-1' }, customer: { externalCustomerId: 'cust-1', contactConsent: true } };

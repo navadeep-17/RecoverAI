@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Role } from '@prisma/client';
-import { buildServer } from '../src/server.js';
+import { buildTestServer as buildServer } from './test-server.js';
 
 const merchantA = 'merchant-a';
 const merchantB = 'merchant-b';
