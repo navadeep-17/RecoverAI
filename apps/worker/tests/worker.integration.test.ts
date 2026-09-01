@@ -2,6 +2,20 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { RecoveryWorkerService } from '../src/worker.js';
 import { checkDatabaseConnection } from '@recoverai/db';
 
+async function waitFor<T>(
+  label: string,
+  read: () => Promise<T | null | undefined>,
+  ready: (value: T) => boolean,
+): Promise<T> {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const value = await read();
+    if (value != null && ready(value)) return value;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
 describe('pg-boss Real Integration Smoke Test', () => {
   let dbAvailable = false;
   let worker: RecoveryWorkerService | null = null;
@@ -212,22 +226,193 @@ describe('pg-boss Real Integration Smoke Test', () => {
       const caseId = ingested.detectionResult.caseId!;
       const scheduled = await jobs.listJobsByCase(merchant.id, caseId);
       expect(scheduled).toHaveLength(1);
-      expect(scheduled[0]).toMatchObject({ jobType: 'RECOVERY_ITERATION', jobKey: `recovery-iteration:${caseId}:case-opened` });
-
-      const deadline = Date.now() + 20000;
-      let completed = false;
-      while (Date.now() < deadline) {
-        const current = await jobs.getJobById(merchant.id, scheduled[0].id);
-        if (current?.status === 'COMPLETED') { completed = true; break; }
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      }
-      expect(completed).toBe(true);
+      expect(scheduled[0]).toMatchObject({
+        jobType: 'RECOVERY_ITERATION',
+        jobKey: `recovery-iteration:${caseId}:case-opened`,
+        payloadJson: { caseId, triggerKey: `CASE_OPENED:${caseId}`, triggerType: 'CASE_OPENED' },
+      });
+      await waitFor(
+        'initial payment-failure recovery iteration to be consumed by pg-boss',
+        () => jobs.getJobById(merchant.id, scheduled[0].id),
+        (job) => job.status === 'COMPLETED',
+      );
 
       const plans = await prisma.recoveryPlanVersion.findMany({ where: { caseId } });
       const actions = await prisma.recoveryAction.findMany({ where: { caseId } });
       const reviews = await prisma.humanReview.findMany({ where: { caseId } });
       expect(plans).toHaveLength(1);
       expect(actions.length + reviews.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      await autonomousWorker.stop();
+      await runtime.closeDatabase();
+    }
+  });
+
+  it('AUTONOMY PROOF: subscription, checkout-abandonment, and overdue-invoice ingress each reach a real pg-boss recovery iteration', async () => {
+    if (!dbAvailable) throw new Error('PostgreSQL is required for autonomous runtime evidence');
+
+    const { composeWorkerRuntime } = await import('../src/runtime.js');
+    const { RecoveryWorkerService } = await import('../src/worker.js');
+    const { MerchantRepository, ScheduledJobRepository, CaseRepository, prisma, RiskType } = await import('@recoverai/db');
+    const { MerchantEventSource, NormalizedEventType } = await import('@recoverai/shared');
+    const { generateIncidentKey } = await import('@recoverai/core');
+    const suffix = Date.now();
+    const merchant = await new MerchantRepository().createMerchant({
+      name: 'pg-boss timer autonomy merchant',
+      slug: `mch-timer-autonomy-${suffix}`,
+    });
+    const runtime = composeWorkerRuntime({
+      NODE_ENV: 'test', AI_PROVIDER: 'mock', DATABASE_URL: process.env.DATABASE_URL!, PG_BOSS_SCHEMA: process.env.PG_BOSS_SCHEMA || 'pgboss', LOG_LEVEL: 'error',
+    } as any);
+    const autonomousWorker = runtime.worker as unknown as InstanceType<typeof RecoveryWorkerService>;
+    const jobs = new ScheduledJobRepository();
+    const cases = new CaseRepository();
+    await autonomousWorker.start();
+
+    const assertConsumedIteration = async (caseId: string, flow: string) => {
+      const iteration = await waitFor(
+        `${flow} initial RECOVERY_ITERATION persistence`,
+        async () => (await jobs.listJobsByCase(merchant.id, caseId))[0],
+        () => true,
+      );
+      expect(iteration).toMatchObject({
+        jobType: 'RECOVERY_ITERATION',
+        jobKey: `recovery-iteration:${caseId}:case-opened`,
+        payloadJson: { caseId, triggerKey: `CASE_OPENED:${caseId}`, triggerType: 'CASE_OPENED' },
+      });
+      await waitFor(
+        `${flow} RECOVERY_ITERATION pg-boss consumption`,
+        () => jobs.getJobById(merchant.id, iteration.id),
+        (job) => job.status === 'COMPLETED',
+      );
+      const [plans, actions, reviews] = await Promise.all([
+        prisma.recoveryPlanVersion.findMany({ where: { caseId } }),
+        prisma.recoveryAction.findMany({ where: { caseId } }),
+        prisma.humanReview.findMany({ where: { caseId } }),
+      ]);
+      expect(plans.length).toBeGreaterThanOrEqual(1);
+      expect(actions.length + reviews.length).toBeGreaterThanOrEqual(1);
+    };
+
+    try {
+      const ingester = autonomousWorker.getEventIngestionService();
+      expect(ingester).not.toBeNull();
+
+      const subscriptionId = `sub-autonomous-${suffix}`;
+      const subscription = await ingester!.ingestEvent({
+        merchantId: merchant.id, source: MerchantEventSource.MERCHANT,
+        externalEventId: `evt-subscription-${suffix}`, dedupeKey: `merchant:evt-subscription-${suffix}`,
+        eventType: NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED, occurredAt: new Date(), amount: '2400.00', currency: 'INR',
+        payment: { subscriptionId, paymentId: `pay-subscription-${suffix}`, verifiedFailureCode: 'INSUFFICIENT_FUNDS' },
+      });
+      expect(subscription.detectionResult.caseCreated).toBe(true);
+      await assertConsumedIteration(subscription.detectionResult.caseId!, 'subscription renewal failure');
+
+      const checkoutSessionId = `checkout-autonomous-${suffix}`;
+      const checkout = await ingester!.ingestEvent({
+        merchantId: merchant.id, source: MerchantEventSource.MERCHANT,
+        externalEventId: `evt-checkout-${suffix}`, dedupeKey: `merchant:evt-checkout-${suffix}`,
+        eventType: NormalizedEventType.CHECKOUT_STARTED, occurredAt: new Date(Date.now() - 31 * 60 * 1000), amount: '800.00', currency: 'INR',
+        checkout: { checkoutSessionId },
+      });
+      const checkoutTimer = await waitFor(
+        'checkout abandonment timer pg-boss consumption',
+        () => jobs.getJobById(merchant.id, checkout.detectionResult.scheduledJobId!),
+        (job) => job.status === 'COMPLETED',
+      );
+      expect(checkoutTimer.jobType).toBe('CHECKOUT_ABANDONMENT_CHECK');
+      const checkoutCase = await waitFor(
+        'checkout abandonment case creation',
+        () => cases.findActiveCaseByIncidentKey(merchant.id, generateIncidentKey(merchant.id, RiskType.CHECKOUT_ABANDONMENT, checkoutSessionId)),
+        () => true,
+      );
+      await assertConsumedIteration(checkoutCase.id, 'checkout abandonment');
+
+      const invoiceId = `invoice-autonomous-${suffix}`;
+      const invoice = await ingester!.ingestEvent({
+        merchantId: merchant.id, source: MerchantEventSource.MERCHANT,
+        externalEventId: `evt-invoice-${suffix}`, dedupeKey: `merchant:evt-invoice-${suffix}`,
+        eventType: NormalizedEventType.INVOICE_CREATED, occurredAt: new Date(), amount: '3600.00', currency: 'INR',
+        invoice: { invoiceId, dueDate: new Date(Date.now() - 4 * 24 * 60 * 60 * 1000), paid: false },
+      });
+      const invoiceTimer = await waitFor(
+        'invoice overdue timer pg-boss consumption',
+        () => jobs.getJobById(merchant.id, invoice.detectionResult.scheduledJobId!),
+        (job) => job.status === 'COMPLETED',
+      );
+      expect(invoiceTimer.jobType).toBe('INVOICE_OVERDUE_CHECK');
+      const invoiceCase = await waitFor(
+        'overdue receivable case creation',
+        () => cases.findActiveCaseByIncidentKey(merchant.id, generateIncidentKey(merchant.id, RiskType.OVERDUE_RECEIVABLE, invoiceId)),
+        () => true,
+      );
+      await assertConsumedIteration(invoiceCase.id, 'overdue invoice');
+    } finally {
+      await autonomousWorker.stop();
+      await runtime.closeDatabase();
+    }
+  });
+
+  it('AUTONOMY PROOF: a durable PAYMENT_METHOD_UPDATED observation wakes exactly one real pg-boss replan and records no recovered money', async () => {
+    if (!dbAvailable) throw new Error('PostgreSQL is required for autonomous runtime evidence');
+
+    const { composeWorkerRuntime } = await import('../src/runtime.js');
+    const { RecoveryWorkerService } = await import('../src/worker.js');
+    const { MerchantRepository, ScheduledJobRepository, OutcomeRepository, prisma } = await import('@recoverai/db');
+    const { MerchantEventSource, NormalizedEventType } = await import('@recoverai/shared');
+    const suffix = Date.now();
+    const merchant = await new MerchantRepository().createMerchant({ name: 'pg-boss replan autonomy merchant', slug: `mch-replan-autonomy-${suffix}` });
+    const runtime = composeWorkerRuntime({
+      NODE_ENV: 'test', AI_PROVIDER: 'mock', DATABASE_URL: process.env.DATABASE_URL!, PG_BOSS_SCHEMA: process.env.PG_BOSS_SCHEMA || 'pgboss', LOG_LEVEL: 'error',
+    } as any);
+    const autonomousWorker = runtime.worker as unknown as InstanceType<typeof RecoveryWorkerService>;
+    const jobs = new ScheduledJobRepository();
+    const outcomes = new OutcomeRepository();
+    await autonomousWorker.start();
+
+    try {
+      const ingester = autonomousWorker.getEventIngestionService();
+      const observer = autonomousWorker.getOutcomeObserver();
+      expect(ingester).not.toBeNull();
+      expect(observer).not.toBeNull();
+      const paymentId = `pay-replan-${suffix}`;
+      const failed = await ingester!.ingestEvent({
+        merchantId: merchant.id, source: MerchantEventSource.MERCHANT,
+        externalEventId: `evt-replan-failure-${suffix}`, dedupeKey: `merchant:evt-replan-failure-${suffix}`,
+        eventType: NormalizedEventType.PAYMENT_FAILED, occurredAt: new Date(), amount: '1750.00', currency: 'INR',
+        payment: { paymentId, verifiedFailureCode: 'INSUFFICIENT_FUNDS' },
+      });
+      const caseId = failed.detectionResult.caseId!;
+      const initialJob = (await jobs.listJobsByCase(merchant.id, caseId))[0];
+      await waitFor('first recovery iteration before payment-method replan', () => jobs.getJobById(merchant.id, initialJob.id), (job) => job.status === 'COMPLETED');
+      const firstPlans = await prisma.recoveryPlanVersion.count({ where: { caseId } });
+      expect(firstPlans).toBeGreaterThanOrEqual(1);
+
+      const methodUpdate = {
+        merchantId: merchant.id, source: MerchantEventSource.MERCHANT,
+        externalEventId: `evt-replan-method-${suffix}`, dedupeKey: `merchant:evt-replan-method-${suffix}`,
+        eventType: NormalizedEventType.PAYMENT_METHOD_UPDATED, occurredAt: new Date(),
+        payment: { paymentId },
+      };
+      const observedEvent = await ingester!.ingestEvent(methodUpdate, { skipRiskDetection: true });
+      const observation = await observer!.observeMerchantEvent(methodUpdate, observedEvent.event.id);
+      const duplicateEvent = await ingester!.ingestEvent(methodUpdate, { skipRiskDetection: true });
+      const duplicateObservation = await observer!.observeMerchantEvent(methodUpdate, duplicateEvent.event.id);
+      expect(observation).toMatchObject({ observed: true, caseId, replanTriggered: true });
+      expect(duplicateEvent.deduplicated).toBe(true);
+      expect(duplicateObservation).toMatchObject({ observed: true, deduplicated: true, caseId });
+
+      const replanJobs = await waitFor(
+        'single persisted payment-method recovery iteration',
+        async () => (await jobs.listJobsByCase(merchant.id, caseId)).filter((job) => (job.payloadJson as Record<string, unknown>).triggerType === 'OBSERVATION_ARRIVED'),
+        (found) => found.length === 1,
+      );
+      expect(replanJobs).toHaveLength(1);
+      await waitFor('payment-method replan pg-boss consumption', () => jobs.getJobById(merchant.id, replanJobs[0].id), (job) => job.status === 'COMPLETED');
+      expect(await prisma.recoveryPlanVersion.count({ where: { caseId } })).toBeGreaterThan(firstPlans);
+      const methodOutcomes = await outcomes.listOutcomesByCase(merchant.id, caseId);
+      expect(methodOutcomes.filter((outcome) => outcome.outcomeType === 'PAYMENT_METHOD_UPDATED')).toHaveLength(1);
+      expect(methodOutcomes.filter((outcome) => outcome.outcomeType === 'PAYMENT_METHOD_UPDATED').every((outcome) => outcome.amountRecovered === null)).toBe(true);
     } finally {
       await autonomousWorker.stop();
       await runtime.closeDatabase();
