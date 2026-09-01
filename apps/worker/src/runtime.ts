@@ -49,9 +49,6 @@ export function composeWorkerRuntime(env: EnvConfig = loadEnv()): WorkerRuntime 
   if (env.AI_PROVIDER === 'mock' && env.NODE_ENV === 'production') {
     throw new Error('AI_PROVIDER=mock is development/test-only; production worker refuses fake AI');
   }
-  if (env.AI_PROVIDER === 'openai' || env.AI_PROVIDER === 'anthropic') {
-    throw new Error(`AI_PROVIDER=${env.AI_PROVIDER} is unsupported at runtime`);
-  }
   const llmProvider = env.AI_PROVIDER === 'gemini'
     ? new GeminiLLMProvider({ apiKey: env.GEMINI_API_KEY!, model: env.GEMINI_MODEL })
     : new MockLLMProvider();
