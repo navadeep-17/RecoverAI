@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { calculateRuntimeProofMetrics } from './metrics.js';
 import { assertRuntimeProofSafety } from './safety.js';
 import { RUNTIME_PROOF_LABEL, RUNTIME_PROOF_PROVIDER, RUNTIME_PROOF_SCENARIOS, validateRuntimeProofScenarios } from './scenarios.js';
+import { classifyRuntimeExecutionEvidence } from './execution-evidence.js';
 
 describe('Deterministic Runtime Acceptance Batch definitions', () => {
   it('is a fixed 20-case batch covering all frozen risk types with deterministic mock disclosure', () => {
@@ -35,4 +36,18 @@ describe('runtime-proof safety assertions', () => {
   it('passes only for persisted safety-compatible evidence', () => expect(assertRuntimeProofSafety(safe).noDenyActionExecuted).toBe(true));
   it('fails non-zero callers when a safety invariant is violated', () => expect(() => assertRuntimeProofSafety({ ...safe, denyExecuted: 1 })).toThrow('DENY action executed'));
   it('fails if agent attribution exceeds verified money', () => expect(() => assertRuntimeProofSafety({ ...safe, agentAttributedRecovered: '10.01' })).toThrow('agent-attributed recovery exceeds verified recovery'));
+});
+
+describe('runtime execution evidence classification', () => {
+  it('treats absent provider identity as internal rather than external', () => {
+    expect(classifyRuntimeExecutionEvidence(null)).toEqual({ category: 'internal', razorpayTestMode: false });
+  });
+
+  it('classifies explicit simulated provider identity as simulated', () => {
+    expect(classifyRuntimeExecutionEvidence('SIMULATED_RECOVERY_PROVIDER')).toEqual({ category: 'simulated', razorpayTestMode: false });
+  });
+
+  it('classifies explicit non-simulated Razorpay Test Mode identity as external', () => {
+    expect(classifyRuntimeExecutionEvidence('RAZORPAY_TEST_MODE_PAYMENT_LINKS')).toEqual({ category: 'externalProvider', razorpayTestMode: true });
+  });
 });
