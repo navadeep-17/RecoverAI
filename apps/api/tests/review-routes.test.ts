@@ -116,6 +116,13 @@ describe('Human Review API Routes & AuthenticatedPrincipal Boundary', () => {
     expect(body.review.merchantId).toBeUndefined();
   });
 
+  it('exposes persisted consent and opt-out facts on the tenant-scoped review read DTO', async () => {
+    mockReviewService.getReviewById.mockResolvedValueOnce({ id: reviewAId, merchantId: merchantAId, caseId: 'case_01', status: ReviewStatus.PENDING, reasonForReview: 'Alpha test review', case: { id: 'case_01', status: 'NEEDS_REVIEW', riskType: 'PAYMENT_FAILURE', amountAtRisk: { toString: () => '10.00' }, currency: 'INR', customer: { id: 'customer-1', name: 'Ada', email: 'ada@example.test', contactConsent: null, optedOut: true } } });
+    const res = await app.inject({ method: 'GET', url: `/reviews/${reviewAId}`, headers: { 'x-merchant-id': merchantAId, 'x-user-id': userAdminAId, 'x-user-role': Role.MERCHANT_ADMIN } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().review.case.customer).toMatchObject({ id: 'customer-1', contactConsent: null, optedOut: true });
+  });
+
   it('Merchant B principal cannot read Merchant A review (returns 404)', async () => {
     const res = await app.inject({
       method: 'GET',

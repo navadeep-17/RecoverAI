@@ -40,12 +40,17 @@ describe('operational pages', () => {
     expect(navigate).toHaveBeenCalledWith('/recoveries/case-1');
   });
 
-  it('renders persisted plan, action, outcome, and audit evidence without oracle fields', async () => {
-    api.getCase.mockResolvedValue({ case: { ...caseItem, planVersions: [{ id: 'plan-1', version: 1, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.9, proposedActionType: 'SEND_PAYMENT_LINK', reasoningSummary: 'Persisted evidence', createdAt: '2025-01-01T00:00:00.000Z' }], actions: [{ id: 'action-1', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', policyRationale: 'Within policy', providerName: 'razorpay-test', createdAt: '2025-01-01T00:00:00.000Z', executedAt: '2025-01-01T00:01:00.000Z' }], outcomes: [{ id: 'outcome-1', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: 'action-1', observedAt: '2025-01-01T00:02:00.000Z' }] }, auditEvents: [{ id: 'audit-1', eventType: 'OUTCOME_RECORDED', actorType: 'SYSTEM', reasonCode: 'VERIFIED', createdAt: '2025-01-01T00:02:00.000Z' }] });
+  it('renders persisted recovery decision evidence, replan, provider classification, and attribution without oracle fields', async () => {
+    api.getCase.mockResolvedValue({ case: { ...caseItem, status: 'RECOVERED', contextJson: { verifiedPaymentFailureCode: 'CARD_EXPIRED', cardNetwork: 'Visa', cardLast4: '4242' }, planVersions: [{ id: 'plan-2', version: 2, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.92, proposedActionType: 'SEND_PAYMENT_LINK', reasoningSummary: 'Persisted evidence', createdAt: '2025-01-02T00:00:00.000Z' }, { id: 'plan-1', version: 1, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.9, proposedActionType: 'SCHEDULE_FOLLOWUP', reasoningSummary: 'Earlier evidence', createdAt: '2025-01-01T00:00:00.000Z' }], actions: [{ id: 'action-1', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', policyRationale: 'Within policy', providerName: null, createdAt: '2025-01-01T00:00:00.000Z', executedAt: '2025-01-01T00:01:00.000Z' }], outcomes: [{ id: 'outcome-1', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: 'action-1', observedAt: '2025-01-01T00:02:00.000Z' }] }, auditEvents: [{ id: 'audit-1', eventType: 'OUTCOME_RECORDED', actorType: 'SYSTEM', reasonCode: 'VERIFIED', createdAt: '2025-01-01T00:02:00.000Z' }] });
     renderPage(<CaseDetailPage caseId="case-1" navigate={vi.fn()} />);
     expect(await screen.findByText('Payment declined')).toBeTruthy();
     expect(screen.getByText('SEND PAYMENT LINK')).toBeTruthy();
-    expect(screen.getByText('PAYMENT_SUCCEEDED')).toBeTruthy();
+    expect(screen.getAllByText('PAYMENT_SUCCEEDED').length).toBeGreaterThan(0);
+    expect(screen.getByText('RECOVERY DECISION')).toBeTruthy();
+    expect(screen.getByText('CARD_EXPIRED · Visa •••• 4242')).toBeTruthy();
+    expect(screen.getByText('SEND PAYMENT LINK · 92%')).toBeTruthy();
+    expect(screen.getByText('Plan v2')).toBeTruthy();
+    expect(screen.getByText('SUCCESS · Internal / no external provider')).toBeTruthy();
     expect(screen.getByText('OUTCOME_RECORDED')).toBeTruthy();
     expect(screen.getAllByText('Agent-attributed verified recovery').length).toBeGreaterThan(0);
     expect(screen.queryByText(/oracle/i)).toBeNull();

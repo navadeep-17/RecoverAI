@@ -20,7 +20,7 @@ const reviewDto = (review: any) => ({
   reasonForReview: review.reasonForReview, planVersionId: review.planVersionId, actionId: review.actionId,
   createdAt: review.createdAt, resolvedAt: review.resolvedAt, reviewDecision: review.reviewDecision,
   reviewNotes: review.reviewNotes, revalidatedPolicyDecision: review.revalidatedPolicyDecision,
-  case: review.case ? { id: review.case.id, status: review.case.status, riskType: review.case.riskType, amountAtRisk: review.case.amountAtRisk?.toString?.() ?? review.case.amountAtRisk, currency: review.case.currency, customer: review.case.customer ? { id: review.case.customer.id, name: review.case.customer.name, email: review.case.customer.email } : undefined } : undefined,
+  case: review.case ? { id: review.case.id, status: review.case.status, riskType: review.case.riskType, amountAtRisk: review.case.amountAtRisk?.toString?.() ?? review.case.amountAtRisk, currency: review.case.currency, customer: review.case.customer ? { id: review.case.customer.id, name: review.case.customer.name, email: review.case.customer.email, contactConsent: review.case.customer.contactConsent, optedOut: review.case.customer.optedOut } : undefined } : undefined,
   planVersion: review.planVersion ? { id: review.planVersion.id, version: review.planVersion.version, diagnosisSummary: review.planVersion.diagnosisSummary, confidence: review.planVersion.confidence, proposedActionType: review.planVersion.proposedActionType, proposedActionParams: safeParams(review.planVersion.proposedActionParams) } : undefined,
   action: review.action ? { id: review.action.id, actionType: review.action.actionType, policyRationale: review.action.policyRationale, actionParams: safeParams(review.action.actionParams) } : undefined,
 });

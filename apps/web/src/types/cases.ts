@@ -5,7 +5,7 @@ export interface RecoveryCase {
   id: string; merchantId: string; customerId?: string | null; riskType: RiskType; amountAtRisk: string;
   recoveredAmount?: string | null; currency: string; status: CaseStatus; openedAt: string; updatedAt?: string;
   contextJson?: Record<string, unknown> | null;
-  customer?: { id: string; name?: string | null; email?: string | null } | null;
+  customer?: { id: string; name?: string | null; email?: string | null; contactConsent?: boolean | null; optedOut?: boolean } | null;
   planVersions?: PlanVersion[]; actions?: RecoveryAction[]; outcomes?: RecoveryOutcome[];
 }
 export interface PlanVersion { id: string; version: number; diagnosisCode: string; diagnosisSummary: string; confidence: number; proposedActionType: string; reasoningSummary?: string | null; createdAt: string; }

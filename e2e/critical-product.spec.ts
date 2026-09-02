@@ -76,7 +76,7 @@ test('pending review detail exposes its authoritative case, reason, and proposal
   await page.getByText(reviewCaseId).click();
   await expect(page.getByRole('heading', { name: `Review ${reviewId}` })).toBeVisible();
   await expect(page.getByText('High-value recovery requires review')).toBeVisible();
-  await expect(page.getByText('SEND_RECEIVABLE_REMINDER')).toBeVisible();
+  await expect(page.getByText('SEND RECEIVABLE REMINDER')).toBeVisible();
   await expect(page.getByText('EMAIL')).toBeVisible();
 });
 
