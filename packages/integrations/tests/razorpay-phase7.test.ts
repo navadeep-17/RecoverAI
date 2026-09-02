@@ -85,6 +85,28 @@ describe('Phase 7 Razorpay boundaries', () => {
     expect(result.outcome).toBe(ProviderExecutionOutcome.SUCCESS);
     expect(result.metadata).toMatchObject({ amountPaise: 12345, currency: 'INR', recoveryConfirmed: false });
     expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toMatchObject({ amount: 12345, currency: 'INR', notes: { recoverai_case_id: 'case_001', recoverai_action_id: 'act_001' } });
+    expect(fetchImpl.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('aborts a hung request once and reports ambiguous retryable failure without recovered money', async () => {
+    const fetchImpl = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+    }));
+    const provider = new RazorpayPaymentLinkProvider({
+      keyId: 'rzp_test_key',
+      keySecret: 'test_secret',
+      fetchImpl: fetchImpl as typeof fetch,
+      timeoutMs: 10,
+    });
+    const result = await provider.execute({ merchantId, caseId: 'case_timeout', actionId: 'act_timeout', actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK, idempotencyKey: 'idem_timeout', actionParams: {}, caseSummary: { riskType: 'PAYMENT_FAILURE', amountAtRisk: '123.45', currency: 'INR' } });
+    expect(result).toMatchObject({
+      outcome: ProviderExecutionOutcome.RETRYABLE_FAILURE,
+      errorClassification: 'NETWORK_TIMEOUT',
+      idempotencyKey: 'idem_timeout',
+    });
+    expect(result.errorMessage).toContain('ambiguous provider state');
+    expect(result.metadata).toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it('fails closed when credentials are missing or the provider rejects the request', async () => {

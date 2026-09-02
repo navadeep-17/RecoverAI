@@ -19,8 +19,8 @@ export class PgBossJobScheduler implements IJobScheduler {
       payloadJson: params.payloadJson,
     });
 
-    // If another concurrent caller already created this ScheduledJob, return the existing authoritative job
-    if (!created) {
+    // A completed handoff is authoritative and needs no repair.
+    if (!created && jobRecord.status !== 'PENDING_DISPATCH') {
       return {
         id: jobRecord.id,
         pgBossJobId: jobRecord.pgBossJobId || undefined,
@@ -28,28 +28,25 @@ export class PgBossJobScheduler implements IJobScheduler {
       };
     }
 
-    // 2. Schedule with pg-boss using startAfter delay
-    const now = Date.now();
-    const diffSeconds = Math.max(0, Math.floor((params.scheduledFor.getTime() - now) / 1000));
-
-    let pgBossJobId: string | null = null;
+    // Use the ScheduledJob UUID as the pg-boss UUID. Retrying an interrupted
+    // PENDING_DISPATCH handoff therefore converges on the same queue record,
+    // including when two processes repair it concurrently.
+    const pgBossJobId = jobRecord.id;
     try {
-      pgBossJobId = await this.boss.send(
-        params.jobType,
-        {
+      await this.boss.insert([{
+        id: pgBossJobId,
+        name: jobRecord.jobType,
+        data: {
           jobRecordId: jobRecord.id,
-          merchantId: params.merchantId,
-          ...params.payloadJson,
+          merchantId: jobRecord.merchantId,
+          ...(jobRecord.payloadJson as Record<string, unknown>),
         },
-        {
-          startAfter: diffSeconds,
-          singletonKey: params.jobKey || undefined,
-        },
-      );
+        startAfter: jobRecord.scheduledFor,
+        singletonKey: jobRecord.jobKey || jobRecord.id,
+      }]);
 
-      if (!pgBossJobId) {
-        throw new Error('pg-boss returned empty job identifier');
-      }
+      const acceptedJob = await this.boss.getJobById(pgBossJobId);
+      if (!acceptedJob || acceptedJob.id !== pgBossJobId) throw new Error('pg-boss did not confirm the deterministic job identifier');
 
       // 3. Mark SCHEDULED only after pg-boss has accepted the job with authoritative pgBossJobId
       await this.scheduledJobRepo.updateJobStatus(
@@ -59,17 +56,12 @@ export class PgBossJobScheduler implements IJobScheduler {
         pgBossJobId,
       );
 
-      return { id: jobRecord.id, pgBossJobId, created: true };
+      return { id: jobRecord.id, pgBossJobId, created };
     } catch (err: unknown) {
-      // 4. On failure, mark DB record as FAILED and fail closed
-      await this.scheduledJobRepo.updateJobStatus(
-        params.merchantId,
-        jobRecord.id,
-        'FAILED',
-      );
-
+      // Keep the authoritative row repairable. Dispatch errors can be
+      // ambiguous, so FAILED would incorrectly make a later safe repair skip it.
       const errMsg = err instanceof Error ? err.message : String(err);
-      throw new JobSchedulingError(params.jobType, errMsg, err);
+      throw new JobSchedulingError(jobRecord.jobType, errMsg, err);
     }
   }
 }

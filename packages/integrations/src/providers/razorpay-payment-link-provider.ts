@@ -11,7 +11,10 @@ export interface RazorpayPaymentLinkProviderOptions {
   keySecret?: string;
   apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  timeoutMs?: number;
 }
+
+export const DEFAULT_RAZORPAY_REQUEST_TIMEOUT_MS = 10_000;
 
 type RazorpayPaymentLinkResponse = {
   id?: string;
@@ -29,10 +32,15 @@ export class RazorpayPaymentLinkProvider implements IActionProvider {
   readonly isSimulated = false;
   private readonly apiBaseUrl: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly timeoutMs: number;
 
   constructor(private readonly options: RazorpayPaymentLinkProviderOptions = {}) {
     this.apiBaseUrl = options.apiBaseUrl || 'https://api.razorpay.com';
     this.fetchImpl = options.fetchImpl || fetch;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_RAZORPAY_REQUEST_TIMEOUT_MS;
+    if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0) {
+      throw new RangeError('Razorpay request timeout must be a positive finite duration');
+    }
   }
 
   supports(actionType: RecoveryActionType): boolean {
@@ -73,12 +81,19 @@ export class RazorpayPaymentLinkProvider implements IActionProvider {
       },
     };
 
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.timeoutMs);
     try {
       const authorization = Buffer.from(`${this.options.keyId}:${this.options.keySecret}`).toString('base64');
       const response = await this.fetchImpl(`${this.apiBaseUrl}/v1/payment_links`, {
         method: 'POST',
         headers: { authorization: `Basic ${authorization}`, 'content-type': 'application/json' },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
       const payload = await this.parseResponse(response);
       if (!response.ok || !payload.id) {
@@ -101,8 +116,18 @@ export class RazorpayPaymentLinkProvider implements IActionProvider {
         },
       };
     } catch {
-      // A timeout has ambiguous provider state. The executor marks FAILED; it never retries by issuing a second link.
-      return this.failure(input, 'Razorpay payment-link request could not be confirmed', 'NETWORK_TIMEOUT');
+      // Both timeout and transport loss have ambiguous provider state. The
+      // executor records retryable failure; this invocation never issues a
+      // second payment link or claims recovered money.
+      return this.failure(
+        input,
+        timedOut
+          ? 'Razorpay payment-link request timed out with ambiguous provider state'
+          : 'Razorpay payment-link request could not be confirmed',
+        'NETWORK_TIMEOUT',
+      );
+    } finally {
+      clearTimeout(timeout);
     }
   }
 

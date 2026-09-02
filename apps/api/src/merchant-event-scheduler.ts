@@ -8,15 +8,16 @@ export class ApiPgBossJobScheduler implements IJobScheduler {
   constructor(private readonly boss: PgBoss, private readonly jobs: ScheduledJobRepository) {}
   async schedule(params: ScheduleJobParams): Promise<{ id: string; pgBossJobId?: string; created: boolean }> {
     const { created, job } = await this.jobs.createJob(params.merchantId, { caseId: params.caseId, jobKey: params.jobKey, jobType: params.jobType, scheduledFor: params.scheduledFor, payloadJson: params.payloadJson });
-    if (!created) return { id: job.id, pgBossJobId: job.pgBossJobId || undefined, created: false };
+    if (!created && job.status !== 'PENDING_DISPATCH') return { id: job.id, pgBossJobId: job.pgBossJobId || undefined, created: false };
     try {
-      const pgBossJobId = await this.boss.send(params.jobType, { jobRecordId: job.id, merchantId: params.merchantId, ...params.payloadJson }, { startAfter: Math.max(0, Math.floor((params.scheduledFor.getTime() - Date.now()) / 1000)), singletonKey: params.jobKey || undefined });
-      if (!pgBossJobId) throw new Error('pg-boss returned empty job identifier');
+      const pgBossJobId = job.id;
+      await this.boss.insert([{ id: pgBossJobId, name: job.jobType, data: { jobRecordId: job.id, merchantId: job.merchantId, ...(job.payloadJson as Record<string, unknown>) }, startAfter: job.scheduledFor, singletonKey: job.jobKey || job.id }]);
+      const acceptedJob = await this.boss.getJobById(pgBossJobId);
+      if (!acceptedJob || acceptedJob.id !== pgBossJobId) throw new Error('pg-boss did not confirm the deterministic job identifier');
       await this.jobs.updateJobStatus(params.merchantId, job.id, 'SCHEDULED', pgBossJobId);
-      return { id: job.id, pgBossJobId, created: true };
+      return { id: job.id, pgBossJobId, created };
     } catch (error) {
-      await this.jobs.updateJobStatus(params.merchantId, job.id, 'FAILED');
-      throw new JobSchedulingError(params.jobType, error instanceof Error ? error.message : String(error), error);
+      throw new JobSchedulingError(job.jobType, error instanceof Error ? error.message : String(error), error);
     }
   }
 }

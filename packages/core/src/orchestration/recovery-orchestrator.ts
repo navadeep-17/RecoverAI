@@ -31,6 +31,11 @@ import {
   OrchestrationTrigger,
   OrchestrationTriggerPayload,
 } from './orchestrator-types.js';
+import {
+  capScheduleToRecoveryWindow,
+  getBoundedFollowUpTime,
+  getNextLawfulContactTime,
+} from './recovery-timing.js';
 
 export interface RecoveryOrchestratorOptions {
   caseRepo: CaseRepository;
@@ -553,11 +558,22 @@ export class RecoveryOrchestrator {
         case PolicyReasonCodes.COOLDOWN_VIOLATION: {
           if (this.jobScheduler) {
             const cooldownHours = policyConfig.cooldownHoursBetweenActions;
-            const scheduledFor = new Date(currentTime.getTime() + cooldownHours * 60 * 60 * 1000);
+            const { scheduledFor } = capScheduleToRecoveryWindow(
+              currentTime,
+              new Date(currentTime.getTime() + cooldownHours * 60 * 60 * 1000),
+              caseRecord.openedAt,
+              policyConfig.maxRecoveryWindowDays,
+            );
+            if (!scheduledFor) {
+              await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.EXHAUSTED);
+              await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', { status: CaseStatus.EXHAUSTED }, claimResult.trigger.attemptCount);
+              return { caseId, status: CaseStatus.EXHAUSTED, iterationCompleted: true, planVersion, policyDecision: PolicyDecision.DENY, exhaustedReason: 'No recovery window remains for a cooldown wake' };
+            }
             try {
               await this.jobScheduler.schedule({
                 merchantId,
                 caseId,
+                jobKey: `followup:${caseId}:${planVersion.id}:cooldown`,
                 jobType: 'RECOVERY_FOLLOWUP_CHECK',
                 scheduledFor,
                 payloadJson: { caseId, reason: 'COOLDOWN_ELAPSED' },
@@ -594,11 +610,28 @@ export class RecoveryOrchestrator {
 
         case PolicyReasonCodes.QUIET_HOURS_VIOLATION: {
           if (this.jobScheduler) {
-            const scheduledFor = new Date(currentTime.getTime() + 8 * 60 * 60 * 1000);
             try {
+              const lawfulContactTime = getNextLawfulContactTime({
+                currentTime,
+                timezone: policyConfig.quietHoursTimezone,
+                startHour: policyConfig.quietHoursStart,
+                endHour: policyConfig.quietHoursEnd,
+              });
+              const { scheduledFor } = capScheduleToRecoveryWindow(
+                currentTime,
+                lawfulContactTime,
+                caseRecord.openedAt,
+                policyConfig.maxRecoveryWindowDays,
+              );
+              if (!scheduledFor) {
+                await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.EXHAUSTED);
+                await this.triggerRepo.completeTrigger(merchantId, caseId, claimResult.trigger.id, 'COMPLETED', { status: CaseStatus.EXHAUSTED }, claimResult.trigger.attemptCount);
+                return { caseId, status: CaseStatus.EXHAUSTED, iterationCompleted: true, planVersion, policyDecision: PolicyDecision.DENY, exhaustedReason: 'No recovery window remains after quiet hours' };
+              }
               await this.jobScheduler.schedule({
                 merchantId,
                 caseId,
+                jobKey: `followup:${caseId}:${planVersion.id}:quiet-hours`,
                 jobType: 'RECOVERY_FOLLOWUP_CHECK',
                 scheduledFor,
                 payloadJson: { caseId, reason: 'QUIET_HOURS_ELAPSED' },
@@ -773,41 +806,59 @@ export class RecoveryOrchestrator {
           });
         } else {
           try {
-            const followUpSeconds = proposal.followUpAfterSeconds || 86400; // default 24h
-            const scheduledFor = new Date(currentTime.getTime() + followUpSeconds * 1000);
+            const boundedTiming = getBoundedFollowUpTime({
+              now: currentTime,
+              caseOpenedAt: caseRecord.openedAt,
+              maxRecoveryWindowDays: policyConfig.maxRecoveryWindowDays,
+              requestedDelaySeconds: proposal.followUpAfterSeconds,
+            });
 
-            await this.jobScheduler.schedule({
-              merchantId,
-              caseId,
-              jobType: 'RECOVERY_FOLLOWUP_CHECK',
-              scheduledFor,
-              payloadJson: {
+            if (!boundedTiming.scheduledFor) {
+              const exhaustedCase = await this.caseRepo.compareAndSetStatus(merchantId, caseId, currentStatus, CaseStatus.EXHAUSTED);
+              finalStatus = exhaustedCase.status;
+              await this.auditRepo.record(merchantId, {
                 caseId,
-                planVersionId: planVersion.id,
-                actionId: authResult.action.id,
-              },
-            });
+                eventType: 'CASE_EXHAUSTED',
+                actorType: AuditActorType.SYSTEM,
+                inputSummaryJson: { reason: 'No recovery window remains for a follow-up' },
+                reasonCode: 'RECOVERY_WINDOW_EXPIRED',
+              });
+            } else {
+              await this.jobScheduler.schedule({
+                merchantId,
+                caseId,
+                jobKey: `followup:${caseId}:${planVersion.id}`,
+                jobType: 'RECOVERY_FOLLOWUP_CHECK',
+                scheduledFor: boundedTiming.scheduledFor,
+                payloadJson: {
+                  caseId,
+                  planVersionId: planVersion.id,
+                  actionId: authResult.action.id,
+                },
+              });
 
-            // ONLY after durable job is scheduled successfully:
-            const waitingCase = await this.caseRepo.compareAndSetStatus(
-              merchantId,
-              caseId,
-              currentStatus,
-              CaseStatus.WAITING,
-            );
-            finalStatus = waitingCase.status;
+              // ONLY after durable job is scheduled successfully:
+              const waitingCase = await this.caseRepo.compareAndSetStatus(
+                merchantId,
+                caseId,
+                currentStatus,
+                CaseStatus.WAITING,
+              );
+              finalStatus = waitingCase.status;
 
-            await this.auditRepo.record(merchantId, {
-              caseId,
-              eventType: 'CASE_WAITING',
-              actorType: AuditActorType.SYSTEM,
-              inputSummaryJson: {
-                actionType: proposal.proposedActionType,
-                followUpSeconds,
-                scheduledFor,
-              },
-              reasonCode: 'CASE_ENTERED_WAITING_FOR_RESPONSE',
-            });
+              await this.auditRepo.record(merchantId, {
+                caseId,
+                eventType: 'CASE_WAITING',
+                actorType: AuditActorType.SYSTEM,
+                inputSummaryJson: {
+                  actionType: proposal.proposedActionType,
+                  requestedFollowUpSeconds: boundedTiming.requestedDelaySeconds,
+                  followUpSeconds: boundedTiming.boundedDelaySeconds,
+                  scheduledFor: boundedTiming.scheduledFor,
+                },
+                reasonCode: 'CASE_ENTERED_WAITING_FOR_RESPONSE',
+              });
+            }
           } catch (schedErr) {
             // Scheduling failed: route safely to NEEDS_REVIEW
             await this.routeToHumanReview(merchantId, caseId, { planVersionId: planVersion.id, actionId: authResult.action.id, reasonForReview: 'Durable follow-up scheduling failed' });

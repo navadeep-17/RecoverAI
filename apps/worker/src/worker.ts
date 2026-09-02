@@ -188,21 +188,26 @@ export class RecoveryWorkerService {
         throw new Error('RECOVERY_ITERATION payload is missing authoritative identifiers');
       }
 
-      const scheduledJob = await scheduledJobRepo.getJobById(data.merchantId, data.jobRecordId);
-      if (!scheduledJob || scheduledJob.jobType !== RecoveryIterationJob.type || scheduledJob.caseId !== data.caseId) {
-        throw new Error('RECOVERY_ITERATION scheduled job does not match the authoritative payload');
-      }
-      const payload = scheduledJob.payloadJson as Record<string, unknown>;
-      if (payload.triggerKey !== data.triggerKey || payload.triggerType !== data.triggerType || payload.caseId !== data.caseId) {
-        throw new Error('RECOVERY_ITERATION persisted payload does not match the transport payload');
-      }
+      try {
+        const scheduledJob = await scheduledJobRepo.getJobById(data.merchantId, data.jobRecordId);
+        if (!scheduledJob || scheduledJob.jobType !== RecoveryIterationJob.type || scheduledJob.caseId !== data.caseId) {
+          throw new Error('RECOVERY_ITERATION scheduled job does not match the authoritative payload');
+        }
+        const payload = scheduledJob.payloadJson as Record<string, unknown>;
+        if (payload.triggerKey !== data.triggerKey || payload.triggerType !== data.triggerType || payload.caseId !== data.caseId) {
+          throw new Error('RECOVERY_ITERATION persisted payload does not match the transport payload');
+        }
 
-      await this.orchestrator.runIteration(data.merchantId, data.caseId, {
-        triggerKey: data.triggerKey,
-        triggerType: data.triggerType,
-        scheduledJobId: data.jobRecordId,
-      });
-      await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+        await this.orchestrator.runIteration(data.merchantId, data.caseId, {
+          triggerKey: data.triggerKey,
+          triggerType: data.triggerType,
+          scheduledJobId: data.jobRecordId,
+        });
+        await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+      } catch (err) {
+        await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'FAILED');
+        throw err;
+      }
     });
 
     // 1. Checkout Abandonment Recheck
@@ -215,12 +220,17 @@ export class RecoveryWorkerService {
       };
       this.logger.info({ msg: 'Processing CHECKOUT_ABANDONMENT_CHECK', data });
 
-      if (this.riskDetector) {
-        await this.riskDetector.evaluateCheckoutTimer(data.merchantId, data.checkoutSessionId, data);
-      }
+      try {
+        if (this.riskDetector) {
+          await this.riskDetector.evaluateCheckoutTimer(data.merchantId, data.checkoutSessionId, data);
+        }
 
-      if (data.jobRecordId) {
-        await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+        if (data.jobRecordId) {
+          await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+        }
+      } catch (err) {
+        if (data.jobRecordId) await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'FAILED');
+        throw err;
       }
     });
 
@@ -234,12 +244,17 @@ export class RecoveryWorkerService {
       };
       this.logger.info({ msg: 'Processing INVOICE_OVERDUE_CHECK', data });
 
-      if (this.riskDetector) {
-        await this.riskDetector.evaluateInvoiceTimer(data.merchantId, data.invoiceId, data);
-      }
+      try {
+        if (this.riskDetector) {
+          await this.riskDetector.evaluateInvoiceTimer(data.merchantId, data.invoiceId, data);
+        }
 
-      if (data.jobRecordId) {
-        await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+        if (data.jobRecordId) {
+          await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'COMPLETED');
+        }
+      } catch (err) {
+        if (data.jobRecordId) await scheduledJobRepo.updateJobStatus(data.merchantId, data.jobRecordId, 'FAILED');
+        throw err;
       }
     });
 

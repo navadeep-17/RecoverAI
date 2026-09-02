@@ -285,7 +285,11 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
       expect(res2.caseCreated).toBe(false);
       expect(res2.deduplicated).toBe(true);
       expect(res2.caseId).toBe(res1.caseId);
-      expect(scheduledJobs.filter((job) => job.jobType === 'RECOVERY_ITERATION')).toHaveLength(1);
+      const initialRequests = scheduledJobs.filter((job) => job.jobType === 'RECOVERY_ITERATION');
+      expect(initialRequests).toHaveLength(2);
+      expect(new Set(initialRequests.map((job) => job.jobKey))).toEqual(
+        new Set([`recovery-iteration:${res1.caseId}:case-opened`]),
+      );
     });
   });
 
@@ -363,6 +367,7 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
       expect(result.caseCreated).toBe(false);
       expect(scheduledJobs.length).toBe(1);
       expect(scheduledJobs[0].jobType).toBe('CHECKOUT_ABANDONMENT_CHECK');
+      expect(scheduledJobs[0].jobKey).toBe('checkout-abandonment:sess_chk_101');
       expect(scheduledJobs[0].merchantId).toBe(merchantId);
 
       // Scheduled 30 minutes in future
@@ -460,6 +465,7 @@ describe('RiskDetector Specification & Deterministic Risk Invariants', () => {
       expect(result.caseCreated).toBe(false);
       expect(scheduledJobs.length).toBe(1);
       expect(scheduledJobs[0].jobType).toBe('INVOICE_OVERDUE_CHECK');
+      expect(scheduledJobs[0].jobKey).toBe('invoice-overdue:inv_corp_999');
 
       // Scheduled for dueDate + 3 days grace
       const expectedScheduledTime = dueDate.getTime() + 3 * 24 * 60 * 60 * 1000;

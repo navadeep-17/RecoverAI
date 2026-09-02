@@ -559,6 +559,26 @@ describe('RecoveryOrchestrator Unit Tests', () => {
       expect(inMemoryAudits.some((a) => a.eventType === 'CASE_WAITING')).toBe(true);
     });
 
+    it('bounds an AI follow-up below five minutes and assigns stable plan identity', async () => {
+      mockLLM.setMockResponse({
+        diagnosisCode: 'SHORT_MODEL_DELAY',
+        diagnosisSummary: 'Model requested an unsafe short delay',
+        confidence: 0.9,
+        proposedActionType: RecoveryActionType.REQUEST_PAYMENT_UPDATE,
+        proposedActionParams: { channel: 'WHATSAPP' },
+        reasoningSummary: 'Request update and recheck immediately',
+        followUpAfterSeconds: 1,
+        shouldStop: false,
+        shouldEscalate: false,
+      });
+
+      const result = await orchestrator.runIteration(merchantId, caseId);
+      const followUp = inMemoryJobs.find((job) => job.jobType === 'RECOVERY_FOLLOWUP_CHECK');
+      expect(result.status).toBe(CaseStatus.WAITING);
+      expect(followUp.scheduledFor).toEqual(new Date(new Date('2026-08-28T14:00:00+05:30').getTime() + 5 * 60 * 1000));
+      expect(followUp.jobKey).toBe(`followup:${caseId}:${result.planVersion?.id}`);
+    });
+
     it('transitions case to NEEDS_REVIEW when PolicyEngine returns REVIEW decision', async () => {
       // High value case (₹85,000 > ₹50,000 threshold) -> HighValueCaseRule triggers REVIEW
       const c = inMemoryCases.get(caseId);

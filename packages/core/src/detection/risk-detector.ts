@@ -142,6 +142,23 @@ export class RiskDetector {
   }
 
   /**
+   * Replays only deterministic risk-origin boundaries after event persistence
+   * dedupe. This repairs a crashed timer/initial-iteration handoff without
+   * inserting a second MerchantEvent or a second case.
+   */
+  async reconcileDuplicateEvent(event: NormalizedMerchantEvent): Promise<DetectionResult | null> {
+    switch (event.eventType) {
+      case NormalizedEventType.PAYMENT_FAILED:
+      case NormalizedEventType.SUBSCRIPTION_RENEWAL_FAILED:
+      case NormalizedEventType.CHECKOUT_STARTED:
+      case NormalizedEventType.INVOICE_CREATED:
+        return this.handleNormalizedEvent(event);
+      default:
+        return null;
+    }
+  }
+
+  /**
    * 1. PAYMENT_FAILED -> PAYMENT_FAILURE
    */
   private async handlePaymentFailed(event: NormalizedMerchantEvent): Promise<DetectionResult> {
@@ -180,6 +197,7 @@ export class RiskDetector {
     // 2. Case Deduplication: Check if an active case already exists for this incident
     const existingCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, incidentKey);
     if (existingCase) {
+      const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, existingCase.id);
       await this.auditRepo.record(merchantId, {
         caseId: existingCase.id,
         eventType: 'DETECTION_SKIPPED_DUPLICATE',
@@ -194,6 +212,7 @@ export class RiskDetector {
         case: existingCase,
         riskType: RiskType.PAYMENT_FAILURE,
         deduplicated: true,
+        scheduledJobId,
         reason: 'Active case already exists for this payment failure incident',
       };
     }
@@ -246,6 +265,7 @@ export class RiskDetector {
     });
 
     if (!created) {
+      const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, newCase.id);
       await this.auditRepo.record(merchantId, {
         caseId: newCase.id,
         eventType: 'DETECTION_SKIPPED_DUPLICATE',
@@ -260,6 +280,7 @@ export class RiskDetector {
         case: newCase,
         riskType: RiskType.PAYMENT_FAILURE,
         deduplicated: true,
+        scheduledJobId,
         reason: 'Concurrent creation resolved to existing incident case',
       };
     }
@@ -307,6 +328,7 @@ export class RiskDetector {
     // 1. Case Deduplication
     const existingCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, incidentKey);
     if (existingCase) {
+      const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, existingCase.id);
       await this.auditRepo.record(merchantId, {
         caseId: existingCase.id,
         eventType: 'DETECTION_SKIPPED_DUPLICATE',
@@ -321,6 +343,7 @@ export class RiskDetector {
         case: existingCase,
         riskType: RiskType.SUBSCRIPTION_FAILURE,
         deduplicated: true,
+        scheduledJobId,
         reason: 'Active case already exists for this subscription renewal incident',
       };
     }
@@ -372,6 +395,7 @@ export class RiskDetector {
     });
 
     if (!created) {
+      const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, newCase.id);
       await this.auditRepo.record(merchantId, {
         caseId: newCase.id,
         eventType: 'DETECTION_SKIPPED_DUPLICATE',
@@ -386,6 +410,7 @@ export class RiskDetector {
         case: newCase,
         riskType: RiskType.SUBSCRIPTION_FAILURE,
         deduplicated: true,
+        scheduledJobId,
         reason: 'Concurrent creation resolved to existing incident case',
       };
     }
@@ -456,6 +481,7 @@ export class RiskDetector {
     // 2. Check if active CHECKOUT_ABANDONMENT case already exists
     const existingCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, incidentKey);
     if (existingCase) {
+      const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, existingCase.id);
       return {
         riskDetected: true,
         caseCreated: false,
@@ -463,6 +489,7 @@ export class RiskDetector {
         case: existingCase,
         riskType: RiskType.CHECKOUT_ABANDONMENT,
         deduplicated: true,
+        scheduledJobId,
         reason: 'Active abandonment case already exists for checkout session',
       };
     }
@@ -506,6 +533,7 @@ export class RiskDetector {
     try {
       const job = await this.jobScheduler.schedule({
         merchantId,
+        jobKey: `checkout-abandonment:${checkoutSessionId}`,
         jobType: 'CHECKOUT_ABANDONMENT_CHECK',
         scheduledFor,
         payloadJson: {
@@ -598,6 +626,7 @@ export class RiskDetector {
     // 2. Case Deduplication
     const existingCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, incidentKey);
     if (existingCase) {
+      const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, existingCase.id);
       await this.auditRepo.record(merchantId, {
         caseId: existingCase.id,
         eventType: 'DETECTION_SKIPPED_DUPLICATE',
@@ -612,6 +641,7 @@ export class RiskDetector {
         case: existingCase,
         riskType: RiskType.CHECKOUT_ABANDONMENT,
         deduplicated: true,
+        scheduledJobId,
         reason: 'Active case already exists for this checkout abandonment incident',
       };
     }
@@ -660,6 +690,7 @@ export class RiskDetector {
     });
 
     if (!created) {
+      const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, newCase.id);
       await this.auditRepo.record(merchantId, {
         caseId: newCase.id,
         eventType: 'DETECTION_SKIPPED_DUPLICATE',
@@ -674,6 +705,7 @@ export class RiskDetector {
         case: newCase,
         riskType: RiskType.CHECKOUT_ABANDONMENT,
         deduplicated: true,
+        scheduledJobId,
         reason: 'Concurrent creation resolved to existing incident case',
       };
     }
@@ -781,6 +813,7 @@ export class RiskDetector {
     try {
       const job = await this.jobScheduler.schedule({
         merchantId,
+        jobKey: `invoice-overdue:${invoiceId}`,
         jobType: 'INVOICE_OVERDUE_CHECK',
         scheduledFor,
         payloadJson: {
@@ -875,6 +908,7 @@ export class RiskDetector {
     // 2. Case Deduplication
     const existingCase = await this.caseRepo.findActiveCaseByIncidentKey(merchantId, incidentKey);
     if (existingCase) {
+      const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, existingCase.id);
       await this.auditRepo.record(merchantId, {
         caseId: existingCase.id,
         eventType: 'DETECTION_SKIPPED_DUPLICATE',
@@ -889,6 +923,7 @@ export class RiskDetector {
         case: existingCase,
         riskType: RiskType.OVERDUE_RECEIVABLE,
         deduplicated: true,
+        scheduledJobId,
         reason: 'Active case already exists for this overdue invoice incident',
       };
     }
@@ -938,6 +973,7 @@ export class RiskDetector {
     });
 
     if (!created) {
+      const scheduledJobId = await this.scheduleInitialRecoveryIteration(merchantId, newCase.id);
       await this.auditRepo.record(merchantId, {
         caseId: newCase.id,
         eventType: 'DETECTION_SKIPPED_DUPLICATE',
@@ -952,6 +988,7 @@ export class RiskDetector {
         case: newCase,
         riskType: RiskType.OVERDUE_RECEIVABLE,
         deduplicated: true,
+        scheduledJobId,
         reason: 'Concurrent creation resolved to existing incident case',
       };
     }

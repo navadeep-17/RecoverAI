@@ -64,7 +64,25 @@ describe('RecoveryWorkerService Unit Tests', () => {
 
     await expect(handlers.get('RECOVERY_ITERATION')!({ data: { merchantId: 'merchant-1', caseId: 'case-1', jobRecordId: 'job-iteration-1', triggerKey: 'CASE_OPENED:case-1', triggerType: 'CASE_OPENED' } })).rejects.toThrow('deterministic orchestration failure');
     expect(orchestrator.runIteration).toHaveBeenCalledTimes(1);
-    expect(scheduledJobRepo.updateJobStatus).not.toHaveBeenCalled();
+    expect(scheduledJobRepo.updateJobStatus).toHaveBeenCalledWith('merchant-1', 'job-iteration-1', 'FAILED');
+    await worker.stop();
+  });
+
+  it('marks a checkout timer FAILED when deterministic risk evaluation throws', async () => {
+    const handlers = new Map<string, (job: { data: unknown }) => Promise<void>>();
+    const mockBoss = {
+      start: vi.fn(async () => mockBoss as unknown as PgBoss),
+      stop: vi.fn(async () => {}),
+      on: vi.fn(() => mockBoss),
+      work: vi.fn(async (name: string, handler: (job: { data: unknown }) => Promise<void>) => { handlers.set(name, handler); return name; }),
+    } as unknown as PgBoss;
+    const scheduledJobRepo = { updateJobStatus: vi.fn(async () => ({})) };
+    const riskDetector = { evaluateCheckoutTimer: vi.fn(async () => { throw new Error('checkout evaluation failed'); }) };
+    const worker = new RecoveryWorkerService({ bossInstance: mockBoss, scheduledJobRepo: scheduledJobRepo as any, riskDetector: riskDetector as any });
+    await worker.start();
+
+    await expect(handlers.get('CHECKOUT_ABANDONMENT_CHECK')!({ data: { merchantId: 'merchant-1', checkoutSessionId: 'checkout-1', jobRecordId: 'job-checkout-1' } })).rejects.toThrow('checkout evaluation failed');
+    expect(scheduledJobRepo.updateJobStatus).toHaveBeenCalledWith('merchant-1', 'job-checkout-1', 'FAILED');
     await worker.stop();
   });
 
@@ -78,9 +96,10 @@ describe('RecoveryWorkerService Unit Tests', () => {
     };
 
     const mockJobRepo = {
-      createJob: async (params: any) => {
+      createJob: async (_merchantId: string, params: any) => {
         jobRecord = {
           id: 'job_local_01',
+          merchantId: _merchantId,
           status: 'PENDING_DISPATCH',
           ...params,
         };
@@ -94,7 +113,8 @@ describe('RecoveryWorkerService Unit Tests', () => {
     };
 
     const mockBoss = {
-      send: async () => 'pg_boss_uuid_123',
+      insert: async () => {},
+      getJobById: async (id: string) => ({ id }),
     };
 
     const scheduler = new (await import('../src/scheduler.js')).PgBossJobScheduler(
@@ -110,12 +130,12 @@ describe('RecoveryWorkerService Unit Tests', () => {
     });
 
     expect(result.id).toBe('job_local_01');
-    expect(result.pgBossJobId).toBe('pg_boss_uuid_123');
+    expect(result.pgBossJobId).toBe('job_local_01');
     expect(jobRecord.status).toBe('SCHEDULED');
-    expect(jobRecord.pgBossJobId).toBe('pg_boss_uuid_123');
+    expect(jobRecord.pgBossJobId).toBe('job_local_01');
   });
 
-  it('PgBossJobScheduler transitions ScheduledJob to FAILED and throws JobSchedulingError when boss.send fails', async () => {
+  it('PgBossJobScheduler leaves an ambiguous dispatch repairable and throws JobSchedulingError', async () => {
     let jobRecord: any = {
       id: 'job_local_02',
       merchantId: 'mch_01',
@@ -125,7 +145,7 @@ describe('RecoveryWorkerService Unit Tests', () => {
     };
 
     const mockJobRepo = {
-      createJob: async (params: any) => {
+      createJob: async (_merchantId: string, params: any) => {
         jobRecord = {
           id: 'job_local_02',
           status: 'PENDING_DISPATCH',
@@ -140,7 +160,7 @@ describe('RecoveryWorkerService Unit Tests', () => {
     };
 
     const mockBoss = {
-      send: async () => {
+      insert: async () => {
         throw new Error('Connection refused to pg-boss broker');
       },
     };
@@ -159,6 +179,63 @@ describe('RecoveryWorkerService Unit Tests', () => {
       }),
     ).rejects.toThrow(/Failed to schedule durable job "INVOICE_OVERDUE_CHECK"/);
 
-    expect(jobRecord.status).toBe('FAILED');
+    expect(jobRecord.status).toBe('PENDING_DISPATCH');
+  });
+
+  it('repairs a stale PENDING_DISPATCH row with one deterministic logical pg-boss identity', async () => {
+    const jobRecord: any = {
+      id: '2be8c270-6364-4a31-b4cc-aaef8897f051',
+      merchantId: 'mch_01',
+      caseId: 'case_01',
+      jobKey: 'recovery-iteration:case_01:case-opened',
+      jobType: 'RECOVERY_ITERATION',
+      status: 'PENDING_DISPATCH',
+      pgBossJobId: null,
+      scheduledFor: new Date('2026-09-02T12:00:00.000Z'),
+      payloadJson: { caseId: 'case_01', triggerKey: 'CASE_OPENED:case_01', triggerType: 'CASE_OPENED' },
+    };
+    const mockJobRepo = {
+      createJob: vi.fn(async () => ({ created: false, job: jobRecord })),
+      updateJobStatus: vi.fn(async (_merchantId: string, _jobId: string, status: string, pgBossJobId?: string) => {
+        jobRecord.status = status;
+        jobRecord.pgBossJobId = pgBossJobId || null;
+        return jobRecord;
+      }),
+    };
+    const inserted: any[][] = [];
+    const mockBoss = {
+      insert: vi.fn(async (jobs: any[]) => { inserted.push(jobs); }),
+      getJobById: vi.fn(async (id: string) => ({ id })),
+    };
+    const scheduler = new (await import('../src/scheduler.js')).PgBossJobScheduler(mockBoss as any, mockJobRepo as any);
+    const params = {
+      merchantId: 'mch_01',
+      caseId: 'case_01',
+      jobKey: jobRecord.jobKey,
+      jobType: 'RECOVERY_ITERATION',
+      scheduledFor: jobRecord.scheduledFor,
+      payloadJson: { caseId: 'case_01', triggerKey: 'CASE_OPENED:case_01', triggerType: 'CASE_OPENED' },
+    };
+
+    const [first, second] = await Promise.all([
+      scheduler.schedule(params),
+      scheduler.schedule({
+        ...params,
+        scheduledFor: new Date('2026-09-01T00:00:00.000Z'),
+        payloadJson: { caseId: 'wrong-case', triggerKey: 'wrong-trigger', triggerType: 'CASE_OPENED' },
+      }),
+    ]);
+    expect(first).toMatchObject({ id: jobRecord.id, pgBossJobId: jobRecord.id, created: false });
+    expect(second).toMatchObject({ id: jobRecord.id, pgBossJobId: jobRecord.id, created: false });
+    expect(new Set(inserted.flat().map((job) => job.id))).toEqual(new Set([jobRecord.id]));
+    expect(new Set(inserted.flat().map((job) => job.singletonKey))).toEqual(new Set([jobRecord.jobKey]));
+    expect(inserted.flat()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        startAfter: params.scheduledFor,
+        data: expect.objectContaining({ caseId: 'case_01', triggerKey: 'CASE_OPENED:case_01' }),
+      }),
+    ]));
+    expect(inserted.flat().some((job) => job.data.caseId === 'wrong-case')).toBe(false);
+    expect(jobRecord).toMatchObject({ status: 'SCHEDULED', pgBossJobId: jobRecord.id });
   });
 });

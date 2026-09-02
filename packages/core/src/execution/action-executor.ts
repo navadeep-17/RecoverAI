@@ -20,6 +20,7 @@ import {
 } from '@recoverai/db';
 import { ActionExecutionError, jsonStructurallyEqual } from '@recoverai/shared';
 import { IJobScheduler } from '../detection/job-scheduler-interface.js';
+import { getBoundedFollowUpTime } from '../orchestration/recovery-timing.js';
 import { ReviewGateRequester } from '../review/review-gate-requester.js';
 import { generateActionIdempotencyKey } from './idempotency-generator.js';
 import {
@@ -1164,14 +1165,28 @@ export class ActionExecutor {
       }
 
       const params = action.actionParams as Record<string, unknown>;
-      const scheduledFor = params.scheduledFor
-        ? new Date(params.scheduledFor as string)
-        : new Date(Date.now() + 86400000);
+      const now = this.clock ? this.clock() : new Date();
+      const requestedTime = params.scheduledFor ? new Date(params.scheduledFor as string) : null;
+      if (requestedTime && Number.isNaN(requestedTime.getTime())) {
+        throw new Error('SCHEDULE_FOLLOWUP scheduledFor must be a valid timestamp');
+      }
+      const timingPolicy = await this.policyConfigRepo.getOrCreateConfig(merchantId);
+      const timing = getBoundedFollowUpTime({
+        now,
+        caseOpenedAt: caseRecord.openedAt,
+        maxRecoveryWindowDays: timingPolicy.maxRecoveryWindowDays,
+        requestedDelaySeconds: requestedTime
+          ? (requestedTime.getTime() - now.getTime()) / 1000
+          : undefined,
+      });
+      if (!timing.scheduledFor) throw new Error('SCHEDULE_FOLLOWUP cannot exceed the case recovery window');
+      const scheduledFor = timing.scheduledFor;
 
       // If scheduler throws, this will propagate to executeInternalActionSafely → action FAILED
       await this.jobScheduler.schedule({
         merchantId,
         caseId: caseRecord.id,
+        jobKey: `followup:${caseRecord.id}:action:${action.id}`,
         jobType: 'RECOVERY_FOLLOWUP_CHECK',
         scheduledFor,
         payloadJson: { caseId: caseRecord.id, actionId: action.id },

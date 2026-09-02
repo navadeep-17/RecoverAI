@@ -60,6 +60,101 @@ describe('pg-boss Real Integration Smoke Test', () => {
     expect(worker.getStatus().isRunning).toBe(false);
   });
 
+  it('repairs real PENDING_DISPATCH handoff and reconciles a deduped event case missing its initial iteration', async () => {
+    if (!dbAvailable) throw new Error('PostgreSQL is required for durable repair evidence');
+    const { composeWorkerRuntime } = await import('../src/runtime.js');
+    const {
+      MerchantRepository, CaseRepository, EventRepository, ScheduledJobRepository, RiskType,
+    } = await import('@recoverai/db');
+    const { MerchantEventSource, NormalizedEventType, RecoveryIterationJob } = await import('@recoverai/core');
+    const suffix = Date.now();
+    const merchant = await new MerchantRepository().createMerchant({ name: 'durable repair merchant', slug: `durable-repair-${suffix}` });
+    const cases = new CaseRepository();
+    const events = new EventRepository();
+    const jobs = new ScheduledJobRepository();
+    const runtime = composeWorkerRuntime({
+      NODE_ENV: 'test', AI_PROVIDER: 'mock', DATABASE_URL: process.env.DATABASE_URL!, PG_BOSS_SCHEMA: process.env.PG_BOSS_SCHEMA || 'pgboss', LOG_LEVEL: 'error',
+    } as any);
+    const repairWorker = runtime.worker as unknown as RecoveryWorkerService;
+    await repairWorker.start();
+
+    try {
+      const scheduler = repairWorker.getScheduler()!;
+      const staleKey = `checkout-abandonment:repair-${suffix}`;
+      const stale = await jobs.createJob(merchant.id, {
+        jobKey: staleKey,
+        jobType: 'CHECKOUT_ABANDONMENT_CHECK',
+        scheduledFor: new Date(Date.now() + 60 * 60 * 1000),
+        payloadJson: { checkoutSessionId: `repair-${suffix}` },
+      });
+      expect(stale.job).toMatchObject({ status: 'PENDING_DISPATCH', pgBossJobId: null });
+      const repairParams = {
+        merchantId: merchant.id,
+        jobKey: staleKey,
+        jobType: 'CHECKOUT_ABANDONMENT_CHECK',
+        scheduledFor: stale.job.scheduledFor,
+        payloadJson: { checkoutSessionId: `repair-${suffix}` },
+      };
+      const repaired = await Promise.all([scheduler.schedule(repairParams), scheduler.schedule(repairParams)]);
+      expect(new Set(repaired.map((result) => result.id))).toEqual(new Set([stale.job.id]));
+      expect(new Set(repaired.map((result) => result.pgBossJobId))).toEqual(new Set([stale.job.id]));
+      expect(await jobs.getJobById(merchant.id, stale.job.id)).toMatchObject({ status: 'SCHEDULED', pgBossJobId: stale.job.id });
+      expect(await repairWorker.getBoss()!.getJobById(stale.job.id)).toMatchObject({ id: stale.job.id });
+
+      const paymentId = `pay-reconcile-${suffix}`;
+      const incidentKey = `${merchant.id}:PAYMENT_FAILURE:${paymentId}`;
+      const orphanedCase = await cases.createCase(merchant.id, {
+        riskType: RiskType.PAYMENT_FAILURE,
+        amountAtRisk: '500.00',
+        currency: 'INR',
+        incidentKey,
+        contextJson: { incidentKey, paymentId, verifiedPaymentFailureCode: 'INSUFFICIENT_FUNDS' },
+      });
+      const event = {
+        merchantId: merchant.id,
+        source: MerchantEventSource.MERCHANT,
+        externalEventId: `evt-reconcile-${suffix}`,
+        eventType: NormalizedEventType.PAYMENT_FAILED,
+        occurredAt: new Date(),
+        dedupeKey: `merchant:evt-reconcile-${suffix}`,
+        amount: '500.00',
+        currency: 'INR',
+        payment: { paymentId, verifiedFailureCode: 'INSUFFICIENT_FUNDS' },
+      };
+      await events.recordMerchantEvent(merchant.id, {
+        source: event.source,
+        externalEventId: event.externalEventId,
+        type: event.eventType,
+        occurredAt: event.occurredAt,
+        dedupeKey: event.dedupeKey,
+        payloadJson: JSON.parse(JSON.stringify(event)),
+      });
+      expect(await jobs.listJobsByCase(merchant.id, orphanedCase.id)).toHaveLength(0);
+
+      const reconciliation = await repairWorker.getEventIngestionService()!.ingestEvent(event);
+      expect(reconciliation).toMatchObject({ created: false, deduplicated: true });
+      const initial = await waitFor(
+        'reconciled initial recovery iteration',
+        async () => (await jobs.listJobsByCase(merchant.id, orphanedCase.id))[0],
+        (job) => job.status === 'COMPLETED',
+      );
+      expect(initial).toMatchObject({
+        jobType: RecoveryIterationJob.type,
+        jobKey: RecoveryIterationJob.initialJobKey(orphanedCase.id),
+        pgBossJobId: initial.id,
+        payloadJson: {
+          caseId: orphanedCase.id,
+          triggerKey: RecoveryIterationJob.initialTriggerKey(orphanedCase.id),
+          triggerType: RecoveryIterationJob.initialTriggerType,
+        },
+      });
+      expect(await jobs.listJobsByCase(merchant.id, orphanedCase.id)).toHaveLength(1);
+    } finally {
+      await repairWorker.stop();
+      await runtime.closeDatabase();
+    }
+  });
+
   it('END-TO-END PROOF: real pg-boss delivers PROMISE_TO_PAY_CHECK timer to worker subscriber and mutates database', async () => {
     if (!dbAvailable) {
       console.warn('PostgreSQL database not available in local environment; test will run in CI');

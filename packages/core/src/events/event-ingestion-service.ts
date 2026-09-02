@@ -59,11 +59,18 @@ export class EventIngestionService {
         reasonCode: 'DUPLICATE_EVENT_INGESTION_SKIPPED',
       });
 
+      // Event persistence remains deduplicated. Re-enter only the narrow,
+      // deterministic scheduling boundary so a crash after case/timer
+      // persistence cannot orphan otherwise eligible recovery work.
+      const repairedDetection = options.skipRiskDetection
+        ? null
+        : await this.riskDetector.reconcileDuplicateEvent(validatedEvent);
+
       return {
         deduplicated: true,
         created: false,
         event,
-        detectionResult: {
+        detectionResult: repairedDetection || {
           riskDetected: false,
           caseCreated: false,
           deduplicated: true,
