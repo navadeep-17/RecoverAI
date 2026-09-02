@@ -229,6 +229,17 @@ describe('Deterministic PolicyEngine Specification & Invariant Tests', () => {
       expect(result.violations).toContain('MISSING_CONTACT_CONSENT');
     });
 
+    it('DENY: policy rejects an injected communication proposal even when it bypasses the pre-AI feasibility list', () => {
+      const context = createBaseContext({
+        proposedActionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+        customer: { id: 'cust_1', contactConsent: false, optedOut: false },
+      });
+      const result = engine.evaluate(context);
+
+      expect(result.decision).toBe(PolicyDecision.DENY);
+      expect(result.reasonCode).toBe(PolicyReasonCodes.CONTACT_CONSENT_MISSING);
+    });
+
     it('DENY: malformed monetary amount at risk (REQUIRED_FACTS_MISSING)', () => {
       const context = createBaseContext({
         case: { ...createBaseContext().case, amountAtRisk: '14999.005' }, // >2 decimals

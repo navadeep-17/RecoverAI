@@ -160,6 +160,29 @@ describe('RecoveryAgent & Agent Contracts Specification & Bounds', () => {
       const proposal = await agent.generateProposal(restrictedContext);
       expect(proposal.proposedActionType).toBe(RecoveryActionType.REQUEST_PAYMENT_UPDATE);
     });
+
+    it('normal deterministic checkout proposal falls back when checkout recovery is infeasible', async () => {
+      const context: AgentContext = {
+        ...baseContext,
+        riskType: RiskType.CHECKOUT_ABANDONMENT,
+        allowedActions: [RecoveryActionType.SCHEDULE_FOLLOWUP, RecoveryActionType.ESCALATE_TO_HUMAN],
+      };
+      const proposal = await agent.generateProposal(context);
+      expect(proposal.proposedActionType).not.toBe(RecoveryActionType.SEND_CHECKOUT_RECOVERY);
+      expect(context.allowedActions).toContain(proposal.proposedActionType);
+      expect(proposal.proposedActionType).toBe(RecoveryActionType.SCHEDULE_FOLLOWUP);
+    });
+
+    it('normal deterministic payment proposal falls back when retry is infeasible', async () => {
+      const context: AgentContext = {
+        ...baseContext,
+        allowedActions: [RecoveryActionType.ESCALATE_TO_HUMAN, RecoveryActionType.STOP_RECOVERY],
+      };
+      const proposal = await agent.generateProposal(context);
+      expect(proposal.proposedActionType).not.toBe(RecoveryActionType.RETRY_PAYMENT);
+      expect(context.allowedActions).toContain(proposal.proposedActionType);
+      expect(proposal.proposedActionType).toBe(RecoveryActionType.ESCALATE_TO_HUMAN);
+    });
   });
 
   describe('3. Deterministic Proposals & Formats Across Risk Families', () => {

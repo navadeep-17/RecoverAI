@@ -147,9 +147,9 @@ describe('RecoveryOrchestrator Unit Tests', () => {
     };
 
     mockCaseRepo = {
-      getCaseById: vi.fn(async (_mId: string, cId: string) => {
+      getCaseById: vi.fn(async (requestedMerchantId: string, cId: string) => {
         const c = inMemoryCases.get(cId);
-        if (!c) return null;
+        if (!c || c.merchantId !== requestedMerchantId) return null;
         return {
           ...c,
           customer: inMemoryCustomers.get(c.customerId),
@@ -471,6 +471,58 @@ describe('RecoveryOrchestrator Unit Tests', () => {
       // Verify v1 truth was preserved
       expect(plans?.find((p) => p.version === 1)?.diagnosisCode).toBe('CARD_DECLINED_TEMPORARY');
       expect(plans?.find((p) => p.version === 2)?.diagnosisCode).toBe('CARD_DECLINED_SECOND_CHECK');
+    });
+  });
+
+  describe('2A. Truthful AI Context & Feasibility', () => {
+    it('passes persisted verified payment evidence to AI without fabricated customer history', async () => {
+      const c = inMemoryCases.get(caseId);
+      c.contextJson = {
+        verifiedPaymentFailureCode: 'CARD_EXPIRED',
+        gatewayErrorMessage: 'Issuer reports expired card',
+        paymentMethod: 'card',
+        cardNetwork: 'VISA',
+        cardLast4: '4242',
+        bankName: 'Example Bank',
+        retryAttemptNumber: 2,
+      };
+
+      await orchestrator.runIteration(merchantId, caseId);
+      const request = mockLLM.getLastRequest();
+      expect(request?.userPrompt).toContain('"gatewayErrorCode": "CARD_EXPIRED"');
+      expect(request?.userPrompt).toContain('"paymentMethod": "card"');
+      expect(request?.userPrompt).toContain('"cardNetwork": "VISA"');
+      expect(request?.userPrompt).toContain('"retryAttemptNumber": 2');
+      expect(request?.userPrompt).toContain('"customerHistory": null');
+      expect(request?.userPrompt).not.toContain('"totalPastCases"');
+      expect(request?.userPrompt).not.toContain('"successfullyRecoveredCases"');
+    });
+
+    it('does not expose case context across merchant boundaries', async () => {
+      await expect(orchestrator.runIteration('mch_other_tenant', caseId, 'CROSS_TENANT_CONTEXT')).rejects.toThrow('not found');
+      expect(mockLLM.getLastRequest()).toBeNull();
+    });
+
+    it('removes communication actions before AI when contact consent is false', async () => {
+      Object.assign(inMemoryCustomers.get(customerId), { contactConsent: false, optedOut: false });
+      await orchestrator.runIteration(merchantId, caseId);
+      const prompt = mockLLM.getLastRequest()?.userPrompt || '';
+      for (const action of [
+        RecoveryActionType.REQUEST_PAYMENT_UPDATE,
+        RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+        RecoveryActionType.SEND_CHECKOUT_RECOVERY,
+        RecoveryActionType.SEND_RECEIVABLE_REMINDER,
+      ]) {
+        expect(prompt).not.toContain(`"${action}"`);
+      }
+      expect(prompt).toContain(`"${RecoveryActionType.RETRY_PAYMENT}"`);
+    });
+
+    it('halts an opted-out case before it can reach AI', async () => {
+      Object.assign(inMemoryCustomers.get(customerId), { contactConsent: true, optedOut: true });
+      const result = await orchestrator.runIteration(merchantId, caseId);
+      expect(result.status).toBe(CaseStatus.STOPPED);
+      expect(mockLLM.getLastRequest()).toBeNull();
     });
   });
 

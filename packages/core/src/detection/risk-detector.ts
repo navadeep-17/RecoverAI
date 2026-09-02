@@ -240,6 +240,7 @@ export class RiskDetector {
         cardNetwork: event.payment?.cardNetwork,
         cardLast4: event.payment?.cardLast4,
         bankName: event.payment?.bankName,
+        retryAttemptNumber: event.payment?.retryAttemptNumber,
         metadata: event.metadata,
       },
     });
@@ -362,6 +363,10 @@ export class RiskDetector {
         verifiedPaymentFailureCode: verifiedFailureCode,
         gatewayErrorMessage: event.payment?.gatewayErrorMessage,
         paymentMethod: event.payment?.paymentMethod,
+        cardNetwork: event.payment?.cardNetwork,
+        cardLast4: event.payment?.cardLast4,
+        bankName: event.payment?.bankName,
+        retryAttemptNumber: event.payment?.retryAttemptNumber,
         metadata: event.metadata,
       },
     });

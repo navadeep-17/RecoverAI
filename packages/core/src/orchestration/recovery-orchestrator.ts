@@ -354,16 +354,7 @@ export class RecoveryOrchestrator {
       retryCount,
       contactCount,
       allowedActions,
-      verifiedPaymentFacts: (caseRecord.contextJson as Record<string, unknown> | null)?.verifiedPaymentFacts as Record<string, unknown> | undefined,
-      customerHistory: caseRecord.customer
-        ? {
-            totalPastCases: 1,
-            successfullyRecoveredCases: 0,
-            contactConsent: caseRecord.customer.contactConsent ?? false,
-            optedOut: caseRecord.customer.optedOut,
-            lastContactedAt: caseRecord.customer.lastContactedAt,
-          }
-        : undefined,
+      verifiedPaymentFacts: this.getVerifiedPaymentFacts(caseRecord.contextJson),
       priorActions,
       priorOutcomes,
       policySummary: {
@@ -914,8 +905,10 @@ export class RecoveryOrchestrator {
     // Filter by risk compatibility
     let compatible = allActions.filter((a) => isActionCompatible(c.riskType, a));
 
-    // If customer opted out, exclude communication actions
-    if (c.customer?.optedOut) {
+    // Communication requires an explicit authoritative consent grant and no
+    // opt-out. This only narrows AI choices; policy independently evaluates
+    // the final proposal before authorization or execution.
+    if (c.customer?.contactConsent !== true || c.customer.optedOut === true) {
       compatible = compatible.filter((a) => !this.isContactAction(a));
     }
 
@@ -956,6 +949,26 @@ export class RecoveryOrchestrator {
       actionType === RecoveryActionType.SEND_CHECKOUT_RECOVERY ||
       actionType === RecoveryActionType.SEND_RECEIVABLE_REMINDER
     );
+  }
+
+  private getVerifiedPaymentFacts(contextJson: unknown): AgentContext['verifiedPaymentFacts'] {
+    if (!contextJson || typeof contextJson !== 'object' || Array.isArray(contextJson)) return undefined;
+    const facts = contextJson as Record<string, unknown>;
+    const stringFact = (field: string): string | undefined =>
+      typeof facts[field] === 'string' ? facts[field] : undefined;
+    const retryAttemptNumber = facts.retryAttemptNumber;
+    const result = {
+      gatewayErrorCode: stringFact('verifiedPaymentFailureCode'),
+      gatewayErrorMessage: stringFact('gatewayErrorMessage'),
+      paymentMethod: stringFact('paymentMethod'),
+      cardNetwork: stringFact('cardNetwork'),
+      cardLast4: stringFact('cardLast4'),
+      bankName: stringFact('bankName'),
+      ...(typeof retryAttemptNumber === 'number' && Number.isInteger(retryAttemptNumber) && retryAttemptNumber >= 0
+        ? { retryAttemptNumber }
+        : {}),
+    };
+    return Object.values(result).some((value) => value !== undefined) ? result : undefined;
   }
 
   private isWaitingAction(actionType: RecoveryActionType): boolean {

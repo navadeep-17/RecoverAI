@@ -153,10 +153,43 @@ export class MockLLMProvider implements LLMProvider {
       }
     }
 
+    // Explicit overrides deliberately remain unconstrained so safety tests can
+    // exercise RecoveryAgent's rejection path. Normal deterministic output,
+    // however, must not contradict the authoritative feasible-action list.
+    const allowedActions = this.extractAllowedActions(request.userPrompt);
+    if (allowedActions.length > 0 && !allowedActions.includes(proposal.proposedActionType)) {
+      const fallback = [
+        RecoveryActionType.SCHEDULE_FOLLOWUP,
+        RecoveryActionType.ESCALATE_TO_HUMAN,
+        RecoveryActionType.STOP_RECOVERY,
+      ].find((action) => allowedActions.includes(action)) || allowedActions[0];
+      proposal = {
+        ...proposal,
+        proposedActionType: fallback,
+        proposedActionParams: {},
+        reasoningSummary: `${proposal.reasoningSummary} Preferred action is not currently feasible; selected an authoritative fallback.`,
+        shouldStop: fallback === RecoveryActionType.STOP_RECOVERY,
+        shouldEscalate: fallback === RecoveryActionType.ESCALATE_TO_HUMAN,
+      };
+    }
+
     return {
       rawText: JSON.stringify(proposal, null, 2),
       modelName: 'deterministic-mock-v1',
       usage: { promptTokens: 150, completionTokens: 80 },
     };
+  }
+
+  private extractAllowedActions(userPrompt: string): RecoveryActionType[] {
+    const match = userPrompt.match(/"allowedActions"\s*:\s*(\[[\s\S]*?\])/);
+    if (!match) return [];
+    try {
+      const parsed: unknown = JSON.parse(match[1]);
+      return Array.isArray(parsed) && parsed.every((value) => typeof value === 'string')
+        ? parsed as RecoveryActionType[]
+        : [];
+    } catch {
+      return [];
+    }
   }
 }

@@ -14,7 +14,10 @@ export class CustomerRepository {
         ...(data.email !== undefined ? { email: data.email } : {}),
         ...(data.phone !== undefined ? { phone: data.phone } : {}),
         ...(data.name !== undefined ? { name: data.name } : {}),
-        ...(data.contactConsent !== undefined ? { contactConsent: data.contactConsent } : {}),
+        // Provider normalizers intentionally represent unknown consent as null.
+        // Only an explicit boolean is an authoritative update to an existing
+        // merchant-owned consent fact; null/absent must preserve it.
+        ...(typeof data.contactConsent === 'boolean' ? { contactConsent: data.contactConsent } : {}),
       },
     });
   }

@@ -80,7 +80,11 @@ export class EventIngestionService {
         email: validatedEvent.customer.email || undefined,
         phone: validatedEvent.customer.phone || undefined,
         name: validatedEvent.customer.name || undefined,
-        ...(validatedEvent.customer.contactConsent !== undefined ? { contactConsent: validatedEvent.customer.contactConsent } : {}),
+        // Unknown provider consent is not an authoritative instruction to
+        // erase an existing merchant-provided consent fact.
+        ...(typeof validatedEvent.customer.contactConsent === 'boolean'
+          ? { contactConsent: validatedEvent.customer.contactConsent }
+          : {}),
       });
     }
 

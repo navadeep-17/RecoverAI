@@ -201,4 +201,40 @@ describe('MerchantEvent Tenant-Scoped Deduplication & Idempotent Ingestion', () 
     await ingestionService.ingestEvent({ ...common, externalEventId: `evt-unknown-${customerId}`, dedupeKey: `dedupe-unknown-${customerId}`, checkout: { checkoutSessionId: `checkout-${unknownId}` }, eventType: NormalizedEventType.CHECKOUT_STARTED, customer: { externalCustomerId: unknownId } });
     expect((await customerRepo.getOrCreateCustomer(merchantAId, { externalCustomerId: unknownId })).contactConsent).toBeNull();
   });
+
+  it('preserves merchant consent when Razorpay reports unknown consent, while explicit booleans remain authoritative', async () => {
+    if (!dbAvailable) return;
+    const suffix = Date.now();
+    const grantedCustomer = `consent-granted-${suffix}`;
+    const deniedCustomer = `consent-denied-${suffix}`;
+    await customerRepo.upsertAuthoritativeCustomerFacts(merchantAId, { externalCustomerId: grantedCustomer, contactConsent: true });
+    await customerRepo.upsertAuthoritativeCustomerFacts(merchantAId, { externalCustomerId: deniedCustomer, contactConsent: false });
+
+    const unknownConsentEvent = async (externalCustomerId: string, externalEventId: string) => ingestionService.ingestEvent({
+      merchantId: merchantAId,
+      source: MerchantEventSource.RAZORPAY,
+      externalEventId,
+      dedupeKey: `razorpay:${externalEventId}`,
+      eventType: NormalizedEventType.CHECKOUT_STARTED,
+      occurredAt: new Date(),
+      amount: '500.00',
+      currency: 'INR',
+      checkout: { checkoutSessionId: `checkout-${externalEventId}` },
+      customer: { externalCustomerId, contactConsent: null },
+    });
+
+    await unknownConsentEvent(grantedCustomer, `evt-consent-unknown-granted-${suffix}`);
+    await unknownConsentEvent(deniedCustomer, `evt-consent-unknown-denied-${suffix}`);
+    expect((await customerRepo.getOrCreateCustomer(merchantAId, { externalCustomerId: grantedCustomer })).contactConsent).toBe(true);
+    expect((await customerRepo.getOrCreateCustomer(merchantAId, { externalCustomerId: deniedCustomer })).contactConsent).toBe(false);
+
+    await customerRepo.upsertAuthoritativeCustomerFacts(merchantAId, { externalCustomerId: grantedCustomer, contactConsent: false });
+    await customerRepo.upsertAuthoritativeCustomerFacts(merchantAId, { externalCustomerId: deniedCustomer, contactConsent: true });
+    expect((await customerRepo.getOrCreateCustomer(merchantAId, { externalCustomerId: grantedCustomer })).contactConsent).toBe(false);
+    expect((await customerRepo.getOrCreateCustomer(merchantAId, { externalCustomerId: deniedCustomer })).contactConsent).toBe(true);
+
+    await customerRepo.upsertAuthoritativeCustomerFacts(merchantBId, { externalCustomerId: grantedCustomer, contactConsent: true });
+    expect((await customerRepo.getOrCreateCustomer(merchantBId, { externalCustomerId: grantedCustomer })).contactConsent).toBe(true);
+    expect((await customerRepo.getOrCreateCustomer(merchantAId, { externalCustomerId: grantedCustomer })).contactConsent).toBe(false);
+  });
 });
