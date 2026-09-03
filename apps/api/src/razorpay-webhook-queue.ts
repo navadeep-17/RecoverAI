@@ -21,6 +21,9 @@ export class PgBossRazorpayWebhookQueue implements RazorpayWebhookQueue {
   async enqueue(payload: { merchantId: string; webhookEventId: string }): Promise<void> {
     const jobId = await this.boss.send('RAZORPAY_WEBHOOK_PROCESS', payload, {
       singletonKey: `razorpay-webhook:${payload.webhookEventId}`,
+      retryLimit: 8,
+      retryDelay: 5,
+      retryBackoff: true,
     });
     if (!jobId) throw new Error('Durable Razorpay webhook queue did not accept receipt');
   }

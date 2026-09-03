@@ -6,6 +6,7 @@ export interface RazorpayTestModeRuntimeConfig {
   enabled: boolean;
   keyId?: string;
   keySecret?: string;
+  boundMerchantId?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -25,7 +26,7 @@ export class ProviderRegistry extends BaseProviderRegistry {
       // first so payment links use Test Mode, while retaining simulation for all
       // other supported recovery actions.
       return new ProviderRegistry([
-        new RazorpayPaymentLinkProvider({ keyId: config.keyId, keySecret: config.keySecret, fetchImpl: config.fetchImpl }),
+        new RazorpayPaymentLinkProvider({ keyId: config.keyId, keySecret: config.keySecret, boundMerchantId: config.boundMerchantId, fetchImpl: config.fetchImpl }),
         new SimulatedRecoveryProvider(),
       ]);
     }

@@ -247,6 +247,7 @@ export class RazorpayEventNormalizer {
         // This is provider-supplied lookup evidence only. The worker resolves it
         // against a tenant-scoped persisted RecoveryAction before any recovery.
         razorpayPaymentLinkId: paymentLinkId,
+        razorpayPaymentLinkReferenceId: paymentLinkEntity?.reference_id || null,
       },
       rawPayload: raw as Record<string, unknown>,
     };

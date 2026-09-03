@@ -19,6 +19,7 @@ import {
 } from '@recoverai/db';
 import {
   CaseStateConflictError,
+  MerchantEventSource,
   Money,
   NormalizedEventType,
   NormalizedMerchantEvent,
@@ -1080,6 +1081,26 @@ export class OutcomeObserver {
     authoritativeActionCorrelation?: AuthoritativeActionCorrelation,
   ): Promise<ObservationResult> {
     const caseId = matchedCase.id;
+
+    if (event.source !== MerchantEventSource.RAZORPAY && event.source !== MerchantEventSource.SIMULATOR) {
+      await this.auditRepo.record(merchantId, {
+        caseId,
+        eventType: 'MONETARY_RECOVERY_REJECTED',
+        actorType: AuditActorType.SYSTEM,
+        inputSummaryJson: {
+          eventType: event.eventType,
+          eventSource: event.source,
+          externalEventId: event.externalEventId,
+        },
+        reasonCode: 'UNTRUSTED_MONETARY_EVENT_SOURCE',
+      });
+      return {
+        observed: false,
+        caseId,
+        caseStatus: matchedCase.status,
+        reason: `Monetary recovery evidence source "${event.source}" is not authorized`,
+      };
+    }
 
     // 1. Validate currency presence and exact match
     if (!event.currency) {

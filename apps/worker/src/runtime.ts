@@ -74,6 +74,7 @@ export function composeWorkerRuntime(env: EnvConfig = loadEnv()): WorkerRuntime 
     enabled: Boolean(env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET),
     keyId: env.RAZORPAY_KEY_ID,
     keySecret: env.RAZORPAY_KEY_SECRET,
+    boundMerchantId: env.RAZORPAY_TEST_MERCHANT_ID,
   });
   const actionExecutor = new ActionExecutor({
     actionRepo, caseRepo, customerRepo, merchantRepo, policyConfigRepo, auditRepo,

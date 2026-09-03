@@ -158,15 +158,24 @@ export class RecoveryWorkerService {
         receipt.externalEventId || undefined,
       );
       const paymentLinkId = (normalized.metadata as Record<string, unknown> | null)?.razorpayPaymentLinkId;
+      const paymentLinkReferenceId = (normalized.metadata as Record<string, unknown> | null)?.razorpayPaymentLinkReferenceId;
       const paymentLinkSuccess = normalized.eventType === 'PAYMENT_SUCCEEDED' && typeof paymentLinkId === 'string';
       const ingested = await this.eventIngestionService.ingestEvent(normalized, { skipRiskDetection: paymentLinkSuccess });
       if (paymentLinkSuccess) {
         const actionRepo = new ActionRepository();
+        const providerName = new RazorpayPaymentLinkProvider().providerName;
         const action = await actionRepo.findSuccessfulPaymentLinkAction(
           data.merchantId,
-          new RazorpayPaymentLinkProvider().providerName,
+          providerName,
           paymentLinkId,
-        );
+        ) || (typeof paymentLinkReferenceId === 'string'
+          ? await actionRepo.findSuccessfulPaymentLinkActionByReferenceId(
+              data.merchantId,
+              providerName,
+              paymentLinkReferenceId,
+              paymentLinkId,
+            )
+          : null);
         if (action) {
           await this.outcomeObserver.observeMerchantEvent(normalized, ingested.event.id, {
             actionId: action.id,
@@ -174,6 +183,15 @@ export class RecoveryWorkerService {
             providerName: action.providerName!,
             externalActionId: action.externalActionId!,
           });
+        } else {
+          this.logger.warn({
+            merchantId: data.merchantId,
+            webhookEventId: data.webhookEventId,
+            paymentLinkId,
+            paymentLinkReferenceId,
+            msg: 'Verified Razorpay payment-link event is not yet correlated; retaining receipt for retry',
+          });
+          throw new Error('Verified Razorpay payment-link event correlation is temporarily unavailable');
         }
       } else {
         await this.outcomeObserver.observeMerchantEvent(normalized, ingested.event.id);

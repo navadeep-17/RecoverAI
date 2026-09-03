@@ -234,6 +234,29 @@ export class ActionRepository {
     });
   }
 
+  async findSuccessfulPaymentLinkActionByReferenceId(
+    merchantId: string,
+    providerName: string,
+    referenceId: string,
+    externalActionId?: string,
+  ): Promise<RecoveryAction | null> {
+    if (!/^rcv_[A-Za-z0-9_-]{1,36}$/.test(referenceId)) return null;
+    const actions = await prisma.recoveryAction.findMany({
+      where: {
+        providerName,
+        actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+        status: ActionExecutionStatus.SUCCESS,
+        case: { merchantId },
+      },
+      include: { case: true },
+    });
+    return actions.find((action) => {
+      const metadata = action.executionMetadata as Record<string, unknown> | null;
+      const storedReference = metadata?.referenceId;
+      return storedReference === referenceId && (!externalActionId || action.externalActionId === externalActionId);
+    }) || null;
+  }
+
   /**
    * Atomically transitions an action from expectedStatus → nextStatus.
    *

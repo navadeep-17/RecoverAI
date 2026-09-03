@@ -28,6 +28,7 @@ export function composeApiReviewService(env: EnvConfig = loadEnv()): HumanReview
       enabled: Boolean(env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET),
       keyId: env.RAZORPAY_KEY_ID,
       keySecret: env.RAZORPAY_KEY_SECRET,
+      boundMerchantId: env.RAZORPAY_TEST_MERCHANT_ID,
     }),
     reviewGateRequester: new DurableReviewGateService(humanReviewRepo, caseRepo, auditRepo),
   });

@@ -32,6 +32,9 @@ export const EnvSchema = z.object({
   if (env.RAZORPAY_KEY_ID && !env.RAZORPAY_KEY_ID.startsWith('rzp_test_')) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['RAZORPAY_KEY_ID'], message: 'must be a Razorpay Test Mode key (rzp_test_...); live and unrecognized keys are not supported' });
   }
+  if (hasRazorpayKeyId && !env.RAZORPAY_TEST_MERCHANT_ID) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['RAZORPAY_TEST_MERCHANT_ID'], message: 'is required when Razorpay Test Mode credentials are configured' });
+  }
   if (env.NODE_ENV === 'development' && env.AUTH_MODE !== 'dev_headers') {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['AUTH_MODE'], message: 'must be dev_headers for local development' });
   }

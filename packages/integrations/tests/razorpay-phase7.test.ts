@@ -80,7 +80,7 @@ describe('Phase 7 Razorpay boundaries', () => {
 
   it('creates a real payment-link contract with exact paise and no recovery claim', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 'plink_001', short_url: 'https://rzp.io/i/test', status: 'created' }), { status: 200 }));
-    const provider = new RazorpayPaymentLinkProvider({ keyId: 'rzp_test_key', keySecret: 'test_secret', fetchImpl });
+    const provider = new RazorpayPaymentLinkProvider({ keyId: 'rzp_test_key', keySecret: 'test_secret', boundMerchantId: merchantId, fetchImpl });
     const result = await provider.execute({ merchantId, caseId: 'case_001', actionId: 'act_001', actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK, idempotencyKey: 'idem_001', actionParams: {}, caseSummary: { riskType: 'PAYMENT_FAILURE', amountAtRisk: '123.45', currency: 'INR' } });
     expect(result.outcome).toBe(ProviderExecutionOutcome.SUCCESS);
     expect(result.metadata).toMatchObject({ amountPaise: 12345, currency: 'INR', recoveryConfirmed: false });
@@ -95,6 +95,7 @@ describe('Phase 7 Razorpay boundaries', () => {
     const provider = new RazorpayPaymentLinkProvider({
       keyId: 'rzp_test_key',
       keySecret: 'test_secret',
+      boundMerchantId: merchantId,
       fetchImpl: fetchImpl as typeof fetch,
       timeoutMs: 10,
     });
@@ -109,11 +110,22 @@ describe('Phase 7 Razorpay boundaries', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it('fails closed for an unbound or foreign merchant before any network request', async () => {
+    const fetchImpl = vi.fn();
+    const input = { merchantId, caseId: 'case_merchant', actionId: 'act_merchant', actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK, idempotencyKey: 'idem_merchant', actionParams: {}, caseSummary: { riskType: 'PAYMENT_FAILURE', amountAtRisk: '123.45', currency: 'INR' } };
+    const foreign = new RazorpayPaymentLinkProvider({ keyId: 'rzp_test_key', keySecret: 'test_secret', boundMerchantId: 'merchant-other', fetchImpl });
+    const unbound = new RazorpayPaymentLinkProvider({ keyId: 'rzp_test_key', keySecret: 'test_secret', fetchImpl });
+
+    await expect(foreign.execute(input)).resolves.toMatchObject({ outcome: ProviderExecutionOutcome.PERMANENT_FAILURE, errorMessage: expect.stringContaining('not authorized') });
+    await expect(unbound.execute(input)).resolves.toMatchObject({ outcome: ProviderExecutionOutcome.PERMANENT_FAILURE });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('fails closed when credentials are missing or the provider rejects the request', async () => {
     const missing = new RazorpayPaymentLinkProvider();
     const input = { merchantId, caseId: 'case_001', actionId: 'act_001', actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK, idempotencyKey: 'idem_001', actionParams: {}, caseSummary: { riskType: 'PAYMENT_FAILURE', amountAtRisk: '1.00', currency: 'INR' } };
     expect((await missing.execute(input)).outcome).toBe(ProviderExecutionOutcome.PERMANENT_FAILURE);
-    const rejected = new RazorpayPaymentLinkProvider({ keyId: 'id', keySecret: 'secret', fetchImpl: vi.fn().mockResolvedValue(new Response('{}', { status: 500 })) });
+    const rejected = new RazorpayPaymentLinkProvider({ keyId: 'id', keySecret: 'secret', boundMerchantId: merchantId, fetchImpl: vi.fn().mockResolvedValue(new Response('{}', { status: 500 })) });
     expect((await rejected.execute(input)).outcome).toBe(ProviderExecutionOutcome.RETRYABLE_FAILURE);
   });
 
@@ -142,7 +154,7 @@ describe('Phase 7 Razorpay boundaries', () => {
   });
 
   it('uses the real payment-link adapter only through explicit Test Mode runtime configuration', () => {
-    const configured = ProviderRegistry.forRuntime({ enabled: true, keyId: 'rzp_test_key', keySecret: 'secret' });
+    const configured = ProviderRegistry.forRuntime({ enabled: true, keyId: 'rzp_test_key', keySecret: 'secret', boundMerchantId: merchantId });
     const safeDefault = ProviderRegistry.forRuntime({ enabled: false });
     expect(configured.getProviderForAction(RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK)?.providerName).toBe('RAZORPAY_TEST_MODE_PAYMENT_LINKS');
     expect(safeDefault.getProviderForAction(RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK)?.isSimulated).toBe(true);

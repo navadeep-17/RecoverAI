@@ -9,6 +9,7 @@ import {
 export interface RazorpayPaymentLinkProviderOptions {
   keyId?: string;
   keySecret?: string;
+  boundMerchantId?: string;
   apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
@@ -48,6 +49,9 @@ export class RazorpayPaymentLinkProvider implements IActionProvider {
   }
 
   async execute(input: ProviderActionInput): Promise<ProviderActionResult> {
+    if (!this.options.boundMerchantId || input.merchantId !== this.options.boundMerchantId) {
+      return this.failure(input, 'Merchant is not authorized for this Razorpay Test Mode integration', 'UNSUPPORTED');
+    }
     if (!this.options.keyId || !this.options.keySecret) {
       return this.failure(input, 'Razorpay Test Mode credentials are unavailable', 'UNSUPPORTED');
     }

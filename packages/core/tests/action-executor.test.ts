@@ -1041,7 +1041,7 @@ describe('ActionExecutor Unit Tests', () => {
 
   it('routes explicitly configured Test Mode payment-link execution through ActionExecutor to Razorpay, not the simulator', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 'plink_runtime', status: 'created' }), { status: 200 }));
-    const runtimeRegistry = ProviderRegistry.forRuntime({ enabled: true, keyId: 'rzp_test_key', keySecret: 'secret', fetchImpl });
+    const runtimeRegistry = ProviderRegistry.forRuntime({ enabled: true, keyId: 'rzp_test_key', keySecret: 'secret', boundMerchantId: merchantId, fetchImpl });
     const executor = new ActionExecutor({
       actionRepo: mockActionRepo, caseRepo: mockCaseRepo, customerRepo: mockCustomerRepo,
       policyConfigRepo: mockPolicyConfigRepo, auditRepo: mockAuditRepo, merchantRepo: mockMerchantRepo,

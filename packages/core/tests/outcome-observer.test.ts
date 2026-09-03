@@ -360,6 +360,29 @@ describe('OutcomeObserver Unit Tests', () => {
       expect(inMemoryAudits.some((a) => a.eventType === 'CASE_RECOVERED_BY_PAYMENT')).toBe(true);
     });
 
+    it.each([
+      NormalizedEventType.PAYMENT_SUCCEEDED,
+      NormalizedEventType.CHECKOUT_COMPLETED,
+      NormalizedEventType.INVOICE_PAID,
+    ])('rejects merchant-originated %s as monetary recovery evidence', async (eventType) => {
+      const result = await observer.observeMerchantEvent({
+        merchantId,
+        source: MerchantEventSource.MERCHANT,
+        externalEventId: `merchant_${eventType}`,
+        eventType,
+        occurredAt: new Date(),
+        amount: '14999.00',
+        currency: 'INR',
+        payment: { paymentId: 'pay_merchant' },
+      } as any);
+
+      expect(result.observed).toBe(false);
+      expect(inMemoryCases.get(caseId).status).not.toBe(CaseStatus.RECOVERED);
+      expect(inMemoryCases.get(caseId).recoveredAmount).toBeUndefined();
+      expect(inMemoryOutcomes).toHaveLength(0);
+      expect(inMemoryAudits.some((audit) => audit.reasonCode === 'UNTRUSTED_MONETARY_EVENT_SOURCE')).toBe(true);
+    });
+
     it('rejects recovery when currency does not match case currency (preserves case open)', async () => {
       const paymentEvent: any = {
         eventId: 'evt_pay_usd',
