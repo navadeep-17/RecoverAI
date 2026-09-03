@@ -98,6 +98,7 @@ export type CaseWithRelations = RevenueRiskCase & {
   customer?: Customer | null;
   actions?: RecoveryAction[];
   outcomes?: RecoveryOutcome[];
+  recoveryOutcome?: RecoveryOutcome | null;
   planVersions?: RecoveryPlanVersion[];
 };
 
@@ -185,6 +186,7 @@ export class CaseRepository {
         planVersions: { orderBy: { version: 'desc' } },
         actions: { orderBy: { createdAt: 'desc' } },
         outcomes: { orderBy: { observedAt: 'desc' } },
+        recoveryOutcome: true,
         customer: true,
       },
     });

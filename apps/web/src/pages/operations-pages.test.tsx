@@ -40,20 +40,30 @@ describe('operational pages', () => {
     expect(navigate).toHaveBeenCalledWith('/recoveries/case-1');
   });
 
-  it('renders persisted recovery decision evidence, replan, provider classification, and attribution without oracle fields', async () => {
-    api.getCase.mockResolvedValue({ case: { ...caseItem, status: 'RECOVERED', contextJson: { verifiedPaymentFailureCode: 'CARD_EXPIRED', cardNetwork: 'Visa', cardLast4: '4242' }, planVersions: [{ id: 'plan-2', version: 2, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.92, proposedActionType: 'SEND_PAYMENT_LINK', reasoningSummary: 'Persisted evidence', createdAt: '2025-01-02T00:00:00.000Z' }, { id: 'plan-1', version: 1, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.9, proposedActionType: 'SCHEDULE_FOLLOWUP', reasoningSummary: 'Earlier evidence', createdAt: '2025-01-01T00:00:00.000Z' }], actions: [{ id: 'action-1', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', policyRationale: 'Within policy', providerName: null, createdAt: '2025-01-01T00:00:00.000Z', executedAt: '2025-01-01T00:01:00.000Z' }], outcomes: [{ id: 'outcome-1', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: 'action-1', observedAt: '2025-01-01T00:02:00.000Z' }] }, auditEvents: [{ id: 'audit-1', eventType: 'OUTCOME_RECORDED', actorType: 'SYSTEM', reasonCode: 'VERIFIED', createdAt: '2025-01-01T00:02:00.000Z' }] });
+  it('renders structured safe evidence, winning attribution, replan, and provider classification', async () => {
+    api.getCase.mockResolvedValue({ case: { ...caseItem, status: 'RECOVERED', contextJson: { verifiedPaymentFailureCode: 'CARD_EXPIRED', gatewayErrorMessage: 'issuer declined', paymentMethod: 'card', cardNetwork: 'Visa', cardLast4: '4242', bankName: 'HDFC', retryAttemptNumber: 2 }, recoveryOutcome: { id: 'outcome-1', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: 'action-1' }, planVersions: [{ id: 'plan-2', version: 2, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.92, proposedActionType: 'SEND_PAYMENT_LINK', reasoningSummary: 'Persisted evidence', createdAt: '2025-01-02T00:00:00.000Z' }, { id: 'plan-1', version: 1, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.9, proposedActionType: 'SCHEDULE_FOLLOWUP', reasoningSummary: 'Earlier evidence', createdAt: '2025-01-01T00:00:00.000Z' }], actions: [{ id: 'action-1', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', policyRationale: 'Within policy', providerName: null, createdAt: '2025-01-01T00:00:00.000Z', executedAt: '2025-01-01T00:01:00.000Z' }], outcomes: [{ id: 'outcome-1', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: 'action-1', observedAt: '2025-01-01T00:02:00.000Z' }] }, auditEvents: [{ id: 'audit-1', eventType: 'OUTCOME_RECORDED', actorType: 'SYSTEM', reasonCode: 'VERIFIED', createdAt: '2025-01-01T00:02:00.000Z' }] });
     renderPage(<CaseDetailPage caseId="case-1" navigate={vi.fn()} />);
-    expect(await screen.findByText('Payment declined')).toBeTruthy();
-    expect(screen.getByText('SEND PAYMENT LINK')).toBeTruthy();
-    expect(screen.getAllByText('PAYMENT_SUCCEEDED').length).toBeGreaterThan(0);
-    expect(screen.getByText('RECOVERY DECISION')).toBeTruthy();
-    expect(screen.getByText('CARD_EXPIRED · Visa •••• 4242')).toBeTruthy();
-    expect(screen.getByText('SEND PAYMENT LINK · 92%')).toBeTruthy();
-    expect(screen.getByText('Plan v2')).toBeTruthy();
-    expect(screen.getByText('SUCCESS · Internal / no external provider')).toBeTruthy();
-    expect(screen.getByText('OUTCOME_RECORDED')).toBeTruthy();
+    expect(await screen.findByText('RECOVERY DECISION')).toBeTruthy();
+    for (const value of ['Failure:', 'CARD_EXPIRED', 'Method:', 'card', 'Card:', 'Visa •••• 4242', 'Bank:', 'HDFC', 'Retry attempt:', '2', 'Gateway:', 'issuer declined', 'SEND PAYMENT LINK · 92%', 'Plan v2', 'SUCCESS · Internal / unclassified provider evidence', 'OUTCOME_RECORDED']) expect(screen.getByText(value)).toBeTruthy();
     expect(screen.getAllByText('Agent-attributed verified recovery').length).toBeGreaterThan(0);
     expect(screen.queryByText(/oracle/i)).toBeNull();
+  });
+
+  it('uses only an organic winning outcome for attribution despite an unrelated action-bound observation', async () => {
+    api.getCase.mockResolvedValue({ case: { ...caseItem, status: 'RECOVERED', recoveryOutcome: { id: 'winning-organic', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: null }, planVersions: [], actions: [], outcomes: [{ id: 'unrelated-update', outcomeType: 'PAYMENT_METHOD_UPDATED', amountRecovered: null, actionId: 'action-update', observedAt: '2025-01-01T00:02:00.000Z' }, { id: 'winning-organic', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: null, observedAt: '2025-01-01T00:01:00.000Z' }] }, auditEvents: [] });
+    renderPage(<CaseDetailPage caseId="case-1" navigate={vi.fn()} />);
+    expect((await screen.findAllByText('Organic / unattributed verified recovery')).length).toBeGreaterThan(0);
+    expect(screen.getByText('Non-monetary observation')).toBeTruthy();
+    expect(screen.queryByText('Agent-attributed verified recovery')).toBeNull();
+  });
+
+  it('keeps unknown provider evidence unclassified and recognizes only explicit simulated and Razorpay Test Mode identities', async () => {
+    api.getCase.mockResolvedValue({ case: { ...caseItem, planVersions: [], outcomes: [], actions: [{ id: 'unknown', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', providerName: 'some-provider', createdAt: '2025-01-01T00:00:00.000Z' }, { id: 'simulated', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', providerName: 'SIMULATED_RECOVERY_PROVIDER', createdAt: '2025-01-01T00:00:00.000Z' }, { id: 'razorpay', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', createdAt: '2025-01-01T00:00:00.000Z' }] }, auditEvents: [] });
+    renderPage(<CaseDetailPage caseId="case-1" navigate={vi.fn()} />);
+    expect((await screen.findAllByText(/SUCCESS · Internal \/ unclassified provider evidence/)).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Simulated provider/)).toBeTruthy();
+    expect(screen.getByText(/Razorpay Test Mode/)).toBeTruthy();
+    expect(screen.queryByText('External provider')).toBeNull();
   });
 
   it('shows a retryable visible API error', async () => {

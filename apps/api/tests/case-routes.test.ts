@@ -52,13 +52,13 @@ describe('case read routes', () => {
     expect(response.json().cases[0]).toEqual({ id: 'case-1', customerId: 'customer-1', riskType: 'PAYMENT_FAILURE', amountAtRisk: '10.00', recoveredAmount: null, currency: 'INR', status: 'OPEN', openedAt: '2025-01-01T00:00:00.000Z', updatedAt: '2025-01-02T00:00:00.000Z', customer: { id: 'customer-1', name: 'Ada', email: 'ada@example.test' } });
   });
 
-  it('returns only safe persisted decision facts on the tenant-scoped detail route', async () => {
-    const getCaseById = vi.fn(async (merchantId: string) => merchantId === merchantA ? { id: 'case-1', customerId: 'customer-1', riskType: 'PAYMENT_FAILURE', amountAtRisk: { toString: () => '10.00' }, recoveredAmount: null, currency: 'INR', status: 'OPEN', openedAt: new Date('2025-01-01'), updatedAt: new Date('2025-01-02'), contextJson: { verifiedPaymentFailureCode: 'CARD_EXPIRED', cardLast4: '4242', webhookSecret: 'never exposed as a dedicated field' }, customer: { id: 'customer-1', name: 'Ada', email: 'ada@example.test', contactConsent: null, optedOut: false }, planVersions: [], actions: [], outcomes: [] } : null);
+  it('returns only safe persisted decision facts and the authoritative recovery winner on the tenant-scoped detail route', async () => {
+    const getCaseById = vi.fn(async (merchantId: string) => merchantId === merchantA ? { id: 'case-1', customerId: 'customer-1', riskType: 'PAYMENT_FAILURE', amountAtRisk: { toString: () => '10.00' }, recoveredAmount: { toString: () => '10.00' }, currency: 'INR', status: 'RECOVERED', openedAt: new Date('2025-01-01'), updatedAt: new Date('2025-01-02'), contextJson: { verifiedPaymentFailureCode: 'CARD_EXPIRED', cardLast4: '4242', webhookSecret: 'never exposed as a dedicated field' }, customer: { id: 'customer-1', name: 'Ada', email: 'ada@example.test', contactConsent: null, optedOut: false }, recoveryOutcome: { id: 'winner-1', actionId: null, amountRecovered: { toString: () => '10.00' }, outcomeType: 'PAYMENT_SUCCEEDED', detailsJson: { secret: 'never exposed' } }, planVersions: [], actions: [], outcomes: [] } : null);
     const listByCase = vi.fn(async () => []);
     const app = buildServer({ checkDbConnection: async () => true, caseRepo: { getCaseById } as any, auditRepo: { listByCase } as any });
     const response = await app.inject({ method: 'GET', url: '/cases/case-1', headers: headers() });
     expect(response.statusCode).toBe(200);
-    expect(response.json().case).toMatchObject({ contextJson: { verifiedPaymentFailureCode: 'CARD_EXPIRED', cardLast4: '4242' }, customer: { id: 'customer-1', contactConsent: null, optedOut: false } });
+    expect(response.json().case).toMatchObject({ contextJson: { verifiedPaymentFailureCode: 'CARD_EXPIRED', cardLast4: '4242' }, customer: { id: 'customer-1', contactConsent: null, optedOut: false }, recoveryOutcome: { id: 'winner-1', actionId: null, amountRecovered: '10.00', outcomeType: 'PAYMENT_SUCCEEDED' } });
     expect(response.json().case.contextJson.webhookSecret).toBeUndefined();
     expect(getCaseById).toHaveBeenCalledWith(merchantA, 'case-1');
   });
