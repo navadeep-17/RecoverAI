@@ -245,10 +245,15 @@ describe('ActionExecutor Unit Tests', () => {
     };
 
     mockCommitmentRepo = {
-      createCommitment: vi.fn(async (_mId: string, cId: string, params: any) => {
+      createCommitmentIdempotently: vi.fn(async (_mId: string, cId: string, params: any) => {
+        const existing = inMemoryCommitments.find(
+          (c) => c.caseId === cId && c.sourceActionId === params.sourceActionId,
+        );
+        if (existing) return { commitment: existing, created: false };
         const commitment = {
           id: `cmt_${Date.now()}`,
           caseId: cId,
+          sourceActionId: params.sourceActionId || null,
           promisedAmount: params.promisedAmount,
           promisedDate: params.promisedDate,
           status: params.status || 'PENDING',
@@ -257,7 +262,7 @@ describe('ActionExecutor Unit Tests', () => {
           updatedAt: new Date(),
         };
         inMemoryCommitments.push(commitment);
-        return commitment;
+        return { commitment, created: true };
       }),
     };
 
@@ -790,7 +795,7 @@ describe('ActionExecutor Unit Tests', () => {
       expect(inMemoryAudits.some((a) => a.eventType === 'ACTION_SUCCEEDED')).toBe(false);
     });
 
-    it('RECORD_PROMISE_TO_PAY: creates authoritative RecoveryCommitment, not just metadata', async () => {
+    it('RECORD_PROMISE_TO_PAY: creates one authoritative commitment and one durable promise check', async () => {
       const receivableCaseId = 'case_receivable_ptp_test';
       inMemoryCases.set(receivableCaseId, {
         id: receivableCaseId,
@@ -819,11 +824,12 @@ describe('ActionExecutor Unit Tests', () => {
       expect(execResult.success).toBe(true);
       expect(execResult.action?.status).toBe(ActionExecutionStatus.SUCCESS);
 
-      // commitmentRepo.createCommitment was called — authoritative record persisted
-      expect(mockCommitmentRepo.createCommitment).toHaveBeenCalledWith(
+      // Idempotent repository path persisted the authoritative record.
+      expect(mockCommitmentRepo.createCommitmentIdempotently).toHaveBeenCalledWith(
         merchantId,
         receivableCaseId,
         expect.objectContaining({
+          sourceActionId: action!.id,
           promisedAmount: '1500.00',
           promisedDate: expect.any(Date),
         }),
@@ -832,6 +838,18 @@ describe('ActionExecutor Unit Tests', () => {
       // Exactly one commitment in storage
       expect(inMemoryCommitments.length).toBe(1);
       expect(inMemoryCommitments[0].promisedAmount).toBe('1500.00');
+      expect(mockJobScheduler.schedule).toHaveBeenCalledOnce();
+      expect(mockJobScheduler.schedule).toHaveBeenCalledWith(expect.objectContaining({
+        merchantId,
+        caseId: receivableCaseId,
+        jobKey: expect.stringMatching(/^promise-check:/),
+        jobType: 'PROMISE_TO_PAY_CHECK',
+        scheduledFor: new Date('2026-09-01T00:00:00.000Z'),
+        payloadJson: expect.objectContaining({
+          commitmentId: inMemoryCommitments[0].id,
+          sourceActionId: action!.id,
+        }),
+      }));
 
       // executionMetadata references the commitmentId
       const storedAction = inMemoryActions.get(action!.id);
@@ -839,6 +857,59 @@ describe('ActionExecutor Unit Tests', () => {
 
       // No ACTION_DISPATCHED
       expect(inMemoryAudits.some((a) => a.eventType === 'ACTION_DISPATCHED')).toBe(false);
+    });
+
+    it.each([undefined, 'not-a-date'])(
+      'RECORD_PROMISE_TO_PAY: fails closed for non-authoritative promise date %s',
+      async (promisedDate) => {
+        const receivableCaseId = 'case_receivable_missing_date_test';
+        inMemoryCases.set(receivableCaseId, {
+          ...inMemoryCases.get(caseId),
+          id: receivableCaseId,
+          riskType: RiskType.OVERDUE_RECEIVABLE,
+        });
+
+        const { action } = await actionExecutor.authorizeAndCreateAction(merchantId, receivableCaseId, {
+          actionType: RecoveryActionType.RECORD_PROMISE_TO_PAY,
+          actionParams: { promisedAmount: '1500.00', promisedDate },
+          policyEvaluation: allowResult(),
+          attemptOrVersion: 'v1',
+        });
+        const result = await actionExecutor.executeAction(merchantId, action!.id);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('promisedDate is required');
+        expect(inMemoryCommitments).toHaveLength(0);
+        expect(mockJobScheduler.schedule).not.toHaveBeenCalled();
+        expect(inMemoryActions.get(action!.id)?.status).toBe(ActionExecutionStatus.FAILED);
+      },
+    );
+
+    it('RECORD_PROMISE_TO_PAY: exact action replay creates no duplicate durable state', async () => {
+      const receivableCaseId = 'case_receivable_replay_test';
+      inMemoryCases.set(receivableCaseId, {
+        ...inMemoryCases.get(caseId),
+        id: receivableCaseId,
+        riskType: RiskType.OVERDUE_RECEIVABLE,
+      });
+      const params = {
+        actionType: RecoveryActionType.RECORD_PROMISE_TO_PAY,
+        actionParams: { promisedAmount: '1500.00', promisedDate: '2026-09-01T00:00:00.000Z' },
+        policyEvaluation: allowResult(),
+        attemptOrVersion: 'v1',
+      };
+
+      const firstAuthorization = await actionExecutor.authorizeAndCreateAction(merchantId, receivableCaseId, params);
+      const replayAuthorization = await actionExecutor.authorizeAndCreateAction(merchantId, receivableCaseId, params);
+      expect(replayAuthorization.action?.id).toBe(firstAuthorization.action?.id);
+
+      const first = await actionExecutor.executeAction(merchantId, firstAuthorization.action!.id);
+      const replay = await actionExecutor.executeAction(merchantId, replayAuthorization.action!.id);
+
+      expect(first.success).toBe(true);
+      expect(replay).toMatchObject({ executed: false, alreadyClaimed: true });
+      expect(inMemoryCommitments).toHaveLength(1);
+      expect(mockJobScheduler.schedule).toHaveBeenCalledOnce();
     });
   });
 
@@ -990,7 +1061,7 @@ describe('ActionExecutor Unit Tests', () => {
       expect(inMemoryAudits.some((a) => a.eventType === 'ACTION_SUCCEEDED')).toBe(true);
     });
 
-    it('SCHEDULE_FOLLOWUP: dispatches to scheduler and emits ACTION_SUCCEEDED', async () => {
+    it('SCHEDULE_FOLLOWUP: persists one durable check and transitions the case to WAITING', async () => {
       const { action } = await actionExecutor.authorizeAndCreateAction(merchantId, caseId, {
         actionType: RecoveryActionType.SCHEDULE_FOLLOWUP,
         actionParams: { scheduledFor: '2026-08-30T10:00:00.000Z' },
@@ -1002,6 +1073,13 @@ describe('ActionExecutor Unit Tests', () => {
 
       expect(execResult.success).toBe(true);
       expect(mockJobScheduler.schedule).toHaveBeenCalledOnce();
+      expect(mockJobScheduler.schedule).toHaveBeenCalledWith(expect.objectContaining({
+        merchantId,
+        caseId,
+        jobType: 'RECOVERY_FOLLOWUP_CHECK',
+        jobKey: `followup:${caseId}:action:${action!.id}`,
+      }));
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
       expect(simulatedProvider.dispatchedCalls.length).toBe(0);
     });
 

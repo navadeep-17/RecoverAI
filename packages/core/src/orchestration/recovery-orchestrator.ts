@@ -793,7 +793,11 @@ export class RecoveryOrchestrator {
     let finalStatus = currentStatus;
     if (actionExecution.success) {
       if (this.isWaitingAction(proposal.proposedActionType)) {
-        if (!this.jobScheduler) {
+        if (proposal.proposedActionType === RecoveryActionType.SCHEDULE_FOLLOWUP) {
+          // The executor owns this action's durable job and WAITING transition.
+          // A successful result therefore proves both are already established.
+          finalStatus = CaseStatus.WAITING;
+        } else if (!this.jobScheduler) {
           // Scheduler unavailable: fail closed, do not leave false WAITING state
           await this.routeToHumanReview(merchantId, caseId, { planVersionId: planVersion.id, actionId: authResult.action.id, reasonForReview: 'Job scheduler unavailable for waiting action' });
           finalStatus = CaseStatus.NEEDS_REVIEW;
@@ -1028,7 +1032,8 @@ export class RecoveryOrchestrator {
       actionType === RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK ||
       actionType === RecoveryActionType.SEND_CHECKOUT_RECOVERY ||
       actionType === RecoveryActionType.SEND_RECEIVABLE_REMINDER ||
-      actionType === RecoveryActionType.RECORD_PROMISE_TO_PAY
+      actionType === RecoveryActionType.RECORD_PROMISE_TO_PAY ||
+      actionType === RecoveryActionType.SCHEDULE_FOLLOWUP
     );
   }
 }

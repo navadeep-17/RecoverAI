@@ -18,7 +18,7 @@ import {
     MerchantRepository,
     PolicyConfigRepository,
 } from '@recoverai/db';
-import { ActionExecutionError, jsonStructurallyEqual } from '@recoverai/shared';
+import { ActionExecutionError, jsonStructurallyEqual, Money } from '@recoverai/shared';
 import { IJobScheduler } from '../detection/job-scheduler-interface.js';
 import { getBoundedFollowUpTime } from '../orchestration/recovery-timing.js';
 import { ReviewGateRequester } from '../review/review-gate-requester.js';
@@ -63,8 +63,8 @@ export interface ActionExecutorOptions {
   policyEngine: IPolicyEngine;
   providerRegistry: ProviderRegistry;
   /**
-   * jobScheduler is required for SCHEDULE_FOLLOWUP internal actions.
-   * If absent, SCHEDULE_FOLLOWUP will fail safely (action marked FAILED).
+   * jobScheduler is required for durable SCHEDULE_FOLLOWUP and
+   * RECORD_PROMISE_TO_PAY internal actions. If absent, they fail safely.
    */
   jobScheduler?: IJobScheduler;
   clock?: () => Date;
@@ -1192,11 +1192,19 @@ export class ActionExecutor {
         payloadJson: { caseId: caseRecord.id, actionId: action.id },
       });
 
+      const waitingCase = await this.caseRepo.compareAndSetStatus(
+        merchantId,
+        caseRecord.id,
+        caseRecord.status,
+        CaseStatus.WAITING,
+      );
+
       const succeededAction = await this.actionRepo.updateActionStatus(merchantId, actionId, {
         status: ActionExecutionStatus.SUCCESS,
         executionMetadata: {
           internalAction: 'SCHEDULE_FOLLOWUP',
           scheduledFor: scheduledFor.toISOString(),
+          caseStatus: waitingCase.status,
         },
       });
 
@@ -1205,7 +1213,7 @@ export class ActionExecutor {
         eventType: 'ACTION_SUCCEEDED',
         actorType: AuditActorType.SYSTEM,
         inputSummaryJson: { actionId, actionType: action.actionType, scheduledFor },
-        outputSummaryJson: { status: 'SCHEDULED' },
+        outputSummaryJson: { status: 'SCHEDULED', caseStatus: waitingCase.status },
         reasonCode: 'FOLLOWUP_SCHEDULED',
       });
 
@@ -1224,25 +1232,54 @@ export class ActionExecutor {
         );
       }
 
-      const promisedAmount =
-        typeof params.promisedAmount === 'string' ? params.promisedAmount : '0.00';
-      const promisedDate = params.promisedDate
-        ? new Date(params.promisedDate as string)
-        : new Date();
+      if (!this.jobScheduler) {
+        throw new Error(
+          'RECORD_PROMISE_TO_PAY requires a jobScheduler but none was provided in ActionExecutorOptions. ' +
+            'Configure jobScheduler or do not dispatch RECORD_PROMISE_TO_PAY actions.',
+        );
+      }
+
+      if (typeof params.promisedAmount !== 'string' || !Money.isValidDecimalString(params.promisedAmount)) {
+        throw new Error('RECORD_PROMISE_TO_PAY promisedAmount must be an explicit valid monetary amount');
+      }
+      const promisedAmount = Money.fromDecimalString(params.promisedAmount, caseRecord.currency).toDecimalString();
+      if (typeof params.promisedDate !== 'string' || !params.promisedDate.trim()) {
+        throw new Error('RECORD_PROMISE_TO_PAY promisedDate is required and must be a valid timestamp');
+      }
+      const promisedDate = new Date(params.promisedDate);
+      if (Number.isNaN(promisedDate.getTime())) {
+        throw new Error('RECORD_PROMISE_TO_PAY promisedDate is required and must be a valid timestamp');
+      }
       const extractedFromText =
         typeof params.extractedFromText === 'string' ? params.extractedFromText : undefined;
 
-      // Persist authoritative commitment; any error propagates to safe failure handler
-      const commitment = await this.commitmentRepo.createCommitment(
+      const commitmentResult = await this.commitmentRepo.createCommitmentIdempotently(
         merchantId,
         caseRecord.id,
         {
+          sourceActionId: action.id,
           promisedAmount,
           promisedDate,
           extractedFromText,
           status: 'PENDING',
         },
       );
+      const commitment = commitmentResult.commitment;
+
+      await this.jobScheduler.schedule({
+        merchantId,
+        caseId: caseRecord.id,
+        jobKey: `promise-check:${commitment.id}`,
+        jobType: 'PROMISE_TO_PAY_CHECK',
+        scheduledFor: promisedDate,
+        payloadJson: {
+          caseId: caseRecord.id,
+          commitmentId: commitment.id,
+          promisedAmount,
+          promisedDate: promisedDate.toISOString(),
+          sourceActionId: action.id,
+        },
+      });
 
       // Keep executionMetadata as supplemental evidence referencing the authoritative record
       const succeededAction = await this.actionRepo.updateActionStatus(merchantId, actionId, {

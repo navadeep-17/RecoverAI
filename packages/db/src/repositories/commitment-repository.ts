@@ -7,6 +7,10 @@ export interface CreateCommitmentParams {
    */
   sourceMessageId?: string | null;
   /**
+   * Optional authoritative RecoveryAction ID for action-replay deduplication.
+   */
+  sourceActionId?: string | null;
+  /**
    * The promised amount. Must be a valid non-negative decimal string (e.g. "1500.00").
    */
   promisedAmount: string;
@@ -42,7 +46,7 @@ export class CommitmentRepository {
    * Persists an authoritative RecoveryCommitment idempotently under a tenant-scoped case.
    *
    * Verifies that the case belongs to the merchantId before creating.
-   * On unique constraint violation on [caseId, sourceMessageId], re-reads existing commitment.
+   * On a source identity unique constraint violation, re-reads the existing commitment.
    */
   async createCommitmentIdempotently(
     merchantId: string,
@@ -59,6 +63,7 @@ export class CommitmentRepository {
         data: {
           caseId,
           sourceMessageId: params.sourceMessageId ?? null,
+          sourceActionId: params.sourceActionId ?? null,
           promisedAmount: new Prisma.Decimal(params.promisedAmount),
           promisedDate: params.promisedDate,
           extractedFromText: params.extractedFromText ?? null,
@@ -70,11 +75,13 @@ export class CommitmentRepository {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
         error.code === 'P2002' &&
-        params.sourceMessageId
+        (params.sourceActionId || params.sourceMessageId)
       ) {
-        // Unique constraint violation on [caseId, sourceMessageId]
+        const sourceIdentity = params.sourceActionId
+          ? { sourceActionId: params.sourceActionId }
+          : { sourceMessageId: params.sourceMessageId! };
         const existing = await prisma.recoveryCommitment.findFirstOrThrow({
-          where: { caseId, sourceMessageId: params.sourceMessageId },
+          where: { caseId, ...sourceIdentity },
         });
         return { commitment: existing, created: false };
       }

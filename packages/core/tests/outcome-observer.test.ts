@@ -652,6 +652,34 @@ describe('OutcomeObserver Unit Tests', () => {
       expect(inMemoryAudits.some((a) => a.eventType === 'CASE_ESCALATED' && a.reasonCode === 'BROKEN_PROMISE_TO_PAY')).toBe(true);
     });
 
+    it('RECOVERY_FOLLOWUP_CHECK wakes one durable recovery iteration', async () => {
+      inMemoryScheduledJobs.set('job_followup_01', {
+        id: 'job_followup_01',
+        merchantId,
+        caseId,
+        jobType: 'RECOVERY_FOLLOWUP_CHECK',
+        status: 'SCHEDULED',
+        payloadJson: { caseId, actionId: 'act_followup_01' },
+      });
+
+      const result = await observer.observeTimerFired({
+        merchantId,
+        caseId,
+        scheduledJobId: 'job_followup_01',
+        timerType: 'RECOVERY_FOLLOWUP_CHECK',
+        payload: { caseId, actionId: 'act_followup_01' },
+      });
+
+      expect(result).toMatchObject({ observed: true, replanTriggered: true });
+      expect(mockOrchestrator.runIteration).toHaveBeenCalledOnce();
+      expect(mockOrchestrator.runIteration).toHaveBeenCalledWith(merchantId, caseId, {
+        triggerKey: 'TIMER:job_followup_01',
+        triggerType: 'TIMER_FIRED',
+        scheduledJobId: 'job_followup_01',
+      });
+      expect(inMemoryOutcomes.some((outcome) => outcome.outcomeType === 'FOLLOWUP_TIMER_FIRED')).toBe(true);
+    });
+
     it('early timer delivery is rejected without breaking commitment', async () => {
       // Commitment date is in the FUTURE relative to test clock (2026-08-28T14:00:00+05:30)
       inMemoryCommitments.set('cmt_early', {

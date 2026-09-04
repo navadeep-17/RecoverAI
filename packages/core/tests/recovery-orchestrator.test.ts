@@ -248,6 +248,15 @@ describe('RecoveryOrchestrator Unit Tests', () => {
 
     mockCommitmentRepo = {
       getActiveCommitmentsForCase: vi.fn(async () => inMemoryCommitments),
+      createCommitmentIdempotently: vi.fn(async (_mId: string, cId: string, params: any) => {
+        const existing = inMemoryCommitments.find(
+          (commitment) => commitment.caseId === cId && commitment.sourceActionId === params.sourceActionId,
+        );
+        if (existing) return { commitment: existing, created: false };
+        const commitment = { id: `cmt_${Date.now()}`, caseId: cId, ...params };
+        inMemoryCommitments.push(commitment);
+        return { commitment, created: true };
+      }),
       createCommitment: vi.fn(async (_mId: string, cId: string, params: any) => {
         const commitment = { id: `cmt_${Date.now()}`, caseId: cId, ...params };
         inMemoryCommitments.push(commitment);
@@ -577,6 +586,29 @@ describe('RecoveryOrchestrator Unit Tests', () => {
       expect(result.status).toBe(CaseStatus.WAITING);
       expect(followUp.scheduledFor).toEqual(new Date(new Date('2026-08-28T14:00:00+05:30').getTime() + 5 * 60 * 1000));
       expect(followUp.jobKey).toBe(`followup:${caseId}:${result.planVersion?.id}`);
+    });
+
+    it('treats SCHEDULE_FOLLOWUP as one durable WAITING lifecycle action', async () => {
+      mockLLM.setMockResponse({
+        diagnosisCode: 'FOLLOW_UP_LATER',
+        diagnosisSummary: 'Wait before the next recovery iteration',
+        confidence: 0.9,
+        proposedActionType: RecoveryActionType.SCHEDULE_FOLLOWUP,
+        proposedActionParams: { scheduledFor: '2026-08-30T10:00:00.000Z' },
+        reasoningSummary: 'Schedule a durable follow-up',
+      });
+
+      const result = await orchestrator.runIteration(merchantId, caseId);
+
+      expect(result.status).toBe(CaseStatus.WAITING);
+      expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
+      expect(inMemoryJobs).toHaveLength(1);
+      expect(inMemoryJobs[0]).toMatchObject({
+        merchantId,
+        caseId,
+        jobType: 'RECOVERY_FOLLOWUP_CHECK',
+        payloadJson: { caseId, actionId: result.action?.id },
+      });
     });
 
     it('transitions case to NEEDS_REVIEW when PolicyEngine returns REVIEW decision', async () => {

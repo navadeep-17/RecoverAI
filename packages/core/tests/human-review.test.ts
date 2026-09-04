@@ -28,6 +28,7 @@ describe('HumanReviewService Unit Tests', () => {
   let mockCommitmentRepo: any;
   let mockOutcomeRepo: any;
   let mockAuditRepo: any;
+  let mockJobScheduler: any;
   let policyEngine: PolicyEngine;
   let simulatedProvider: SimulatedRecoveryProvider;
   let providerRegistry: ProviderRegistry;
@@ -45,6 +46,7 @@ describe('HumanReviewService Unit Tests', () => {
   let inMemoryMerchants: Map<string, any>;
   let inMemoryActions: Map<string, any>;
   let inMemoryAudits: any[];
+  let inMemoryJobs: any[];
 
   beforeEach(() => {
     // The approval happy path is an email action. Keep it outside the configured
@@ -58,6 +60,7 @@ describe('HumanReviewService Unit Tests', () => {
     inMemoryMerchants = new Map();
     inMemoryActions = new Map();
     inMemoryAudits = [];
+    inMemoryJobs = [];
 
     inMemoryMerchants.set(merchantId, {
       id: merchantId,
@@ -346,6 +349,14 @@ describe('HumanReviewService Unit Tests', () => {
       }),
     };
 
+    mockJobScheduler = {
+      schedule: vi.fn(async (params: any) => {
+        const job = { id: `job_${Date.now()}`, ...params };
+        inMemoryJobs.push(job);
+        return { id: job.id, created: true };
+      }),
+    };
+
     policyEngine = new PolicyEngine();
     simulatedProvider = new SimulatedRecoveryProvider();
     providerRegistry = new ProviderRegistry();
@@ -361,6 +372,7 @@ describe('HumanReviewService Unit Tests', () => {
       policyConfigRepo: mockPolicyConfigRepo,
       policyEngine,
       providerRegistry,
+      jobScheduler: mockJobScheduler,
     });
 
     reviewService = new HumanReviewService({
@@ -667,6 +679,32 @@ describe('HumanReviewService Unit Tests', () => {
       actionParams: { channel: 'EMAIL', discountOffered: 0 },
     });
     expect(Array.from(inMemoryActions.values()).length).toBe(beforeCount + 1);
+  });
+
+  it('preserves reviewed SCHEDULE_FOLLOWUP as one durable WAITING action across double approval', async () => {
+    const caseRecord = inMemoryCases.get(caseId);
+    caseRecord.planVersions[0].proposedActionType = RecoveryActionType.SCHEDULE_FOLLOWUP;
+    caseRecord.planVersions[0].proposedActionParams = { scheduledFor: '2026-09-01T00:00:00.000Z' };
+    const { review } = await mockReviewRepo.createReview(merchantId, {
+      caseId,
+      planVersionId,
+      reasonForReview: 'Approve exact follow-up',
+    });
+
+    const approval = await reviewService.approveReview(merchantId, review.id, reviewerId);
+
+    expect(approval.approved).toBe(true);
+    expect(approval.executionResult?.success).toBe(true);
+    await expect(reviewService.approveReview(merchantId, review.id, reviewerId))
+      .rejects.toBeInstanceOf(ReviewStateConflictError);
+    expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
+    expect(inMemoryJobs).toHaveLength(1);
+    expect(inMemoryJobs[0]).toMatchObject({
+      merchantId,
+      caseId,
+      jobType: 'RECOVERY_FOLLOWUP_CHECK',
+      payloadJson: { caseId, actionId: approval.action?.id },
+    });
   });
 
   // B. Approval Happy Path

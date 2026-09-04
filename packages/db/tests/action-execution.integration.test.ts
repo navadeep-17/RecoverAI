@@ -9,6 +9,7 @@ import {
   AuditRepository,
   PolicyConfigRepository,
   CommitmentRepository,
+  ScheduledJobRepository,
   ActionExecutionStatus,
   CaseStatus,
   PolicyDecision,
@@ -41,6 +42,7 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
   let auditRepo: AuditRepository;
   let policyConfigRepo: PolicyConfigRepository;
   let commitmentRepo: CommitmentRepository;
+  let scheduledJobRepo: ScheduledJobRepository;
   let policyEngine: PolicyEngine;
   let simulatedProvider: SimulatedRecoveryProvider;
   let providerRegistry: ProviderRegistry;
@@ -61,6 +63,7 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
       auditRepo = new AuditRepository();
       policyConfigRepo = new PolicyConfigRepository();
       commitmentRepo = new CommitmentRepository();
+      scheduledJobRepo = new ScheduledJobRepository();
       policyEngine = new PolicyEngine();
       simulatedProvider = new SimulatedRecoveryProvider();
       providerRegistry = new ProviderRegistry([simulatedProvider]);
@@ -73,6 +76,12 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
         auditRepo,
         policyConfigRepo,
         commitmentRepo,
+        jobScheduler: {
+          schedule: async (params) => {
+            const result = await scheduledJobRepo.createJob(params.merchantId, params);
+            return { id: result.job.id, created: result.created };
+          },
+        },
         policyEngine,
         providerRegistry,
         clock: () => new Date('2026-08-28T14:00:00+05:30'),
@@ -297,7 +306,7 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────────
-  it('RECORD_PROMISE_TO_PAY: persists authoritative RecoveryCommitment in database', async () => {
+  it('RECORD_PROMISE_TO_PAY: persists one commitment and one durable check under exact replay', async () => {
     if (!dbAvailable) return;
 
     const customer = await customerRepo.getOrCreateCustomer(merchantAId, {
@@ -327,9 +336,11 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
     });
 
     const execResult = await actionExecutor.executeAction(merchantAId, action!.id);
+    const replayResult = await actionExecutor.executeAction(merchantAId, action!.id);
 
     expect(execResult.success).toBe(true);
     expect(execResult.action?.status).toBe(ActionExecutionStatus.SUCCESS);
+    expect(replayResult).toMatchObject({ executed: false, alreadyClaimed: true });
 
     // Verify authoritative RecoveryCommitment exists in database
     const commitments = await prisma.recoveryCommitment.findMany({
@@ -337,6 +348,7 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
     });
     expect(commitments.length).toBe(1);
     expect(commitments[0].status).toBe('PENDING');
+    expect(commitments[0].sourceActionId).toBe(action!.id);
     expect(commitments[0].promisedAmount.equals(new Prisma.Decimal('8000.00'))).toBe(true);
     expect(commitments[0].extractedFromText).toBe('Customer agreed to pay by 15th September');
 
@@ -344,9 +356,50 @@ describe('Action Execution & Atomic Claim PostgreSQL Integration Tests', () => {
     const dbAction = await actionRepo.getActionById(merchantAId, action!.id);
     const meta = dbAction?.executionMetadata as Record<string, unknown> | null;
     expect(meta?.commitmentId).toBe(commitments[0].id);
+
+    const promiseChecks = await prisma.scheduledJob.findMany({
+      where: { merchantId: merchantAId, caseId: testCase.id, jobType: 'PROMISE_TO_PAY_CHECK' },
+    });
+    expect(promiseChecks).toHaveLength(1);
+    expect(promiseChecks[0]).toMatchObject({
+      jobKey: `promise-check:${commitments[0].id}`,
+      status: 'PENDING_DISPATCH',
+      payloadJson: expect.objectContaining({
+        commitmentId: commitments[0].id,
+        sourceActionId: action!.id,
+      }),
+    });
   });
 
   // ──────────────────────────────────────────────────────────────────────────
+  it('SCHEDULE_FOLLOWUP: persists one durable check and leaves the authoritative case WAITING', async () => {
+    if (!dbAvailable) return;
+
+    const testCase = await caseRepo.createCase(merchantAId, {
+      riskType: RiskType.PAYMENT_FAILURE,
+      amountAtRisk: '3000.00',
+      currency: 'INR',
+      incidentKey: `${merchantAId}:FOLLOWUP_TEST:${Date.now()}`,
+      contextJson: { verifiedPaymentFailureCode: 'TEMPORARY_NETWORK_ERROR' },
+    });
+    const { action } = await actionExecutor.authorizeAndCreateAction(merchantAId, testCase.id, {
+      actionType: RecoveryActionType.SCHEDULE_FOLLOWUP,
+      actionParams: { scheduledFor: '2026-09-15T00:00:00.000Z' },
+      policyEvaluation: allowResult(),
+      attemptOrVersion: 'v1',
+    });
+
+    const result = await actionExecutor.executeAction(merchantAId, action!.id);
+
+    expect(result.success).toBe(true);
+    expect((await caseRepo.getCaseById(merchantAId, testCase.id))?.status).toBe(CaseStatus.WAITING);
+    const followups = await prisma.scheduledJob.findMany({
+      where: { merchantId: merchantAId, caseId: testCase.id, jobType: 'RECOVERY_FOLLOWUP_CHECK' },
+    });
+    expect(followups).toHaveLength(1);
+    expect(followups[0].jobKey).toBe(`followup:${testCase.id}:action:${action!.id}`);
+  });
+
   it('executes internal actions STOP_RECOVERY correctly in database', async () => {
     if (!dbAvailable) return;
 

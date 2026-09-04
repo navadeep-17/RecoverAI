@@ -361,6 +361,7 @@ model RecoveryCommitment {
   id                String          @id @default(uuid())
   caseId            String
   sourceMessageId   String?
+  sourceActionId    String?
   promisedAmount    Decimal         @db.Decimal(12, 2)
   promisedDate      DateTime
   status            String          @default("PENDING")
@@ -371,6 +372,7 @@ model RecoveryCommitment {
   case              RevenueRiskCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
 
   @@unique([caseId, sourceMessageId])
+  @@unique([caseId, sourceActionId])
   @@index([caseId])
   @@map("recovery_commitments")
 }
