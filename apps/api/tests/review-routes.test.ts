@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ReviewStatus, Role } from '@prisma/client';
 import { buildTestServer as buildServer } from './test-server.js';
-import { ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
+import { CaseStateConflictError, ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
 
 describe('Human Review API Routes & AuthenticatedPrincipal Boundary', () => {
   const merchantAId = 'mch_api_test_aaa';
@@ -304,6 +304,28 @@ describe('Human Review API Routes & AuthenticatedPrincipal Boundary', () => {
     });
 
     expect(blockRes.statusCode).toBe(422);
+  });
+
+  it('returns 409 when the approval continuation loses the case-state CAS', async () => {
+    mockReviewService.approveReview.mockRejectedValueOnce(new CaseStateConflictError(
+      'Concurrent case transition',
+      'case_01',
+      'NEEDS_REVIEW',
+      'WAITING',
+    ));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/reviews/${reviewAId}/approve`,
+      headers: {
+        'x-merchant-id': merchantAId,
+        'x-user-id': userAdminAId,
+        'x-user-role': Role.MERCHANT_ADMIN,
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: 'Concurrent case transition' });
   });
 
   it('POST /reviews/:reviewId/reject and /close endpoints work with authenticated principal', async () => {

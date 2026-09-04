@@ -9,7 +9,7 @@ import { PolicyEngine } from '@recoverai/policy';
 import { EnvConfig, loadEnv } from '@recoverai/shared';
 
 /** Real review authority graph used by the ordinary API executable. */
-export function composeApiReviewService(env: EnvConfig = loadEnv()): HumanReviewService {
+export function composeApiReviewService(jobScheduler: IJobScheduler, env: EnvConfig = loadEnv()): HumanReviewService {
   const caseRepo = new CaseRepository();
   const actionRepo = new ActionRepository();
   const customerRepo = new CustomerRepository();
@@ -24,6 +24,7 @@ export function composeApiReviewService(env: EnvConfig = loadEnv()): HumanReview
   const executor = new ActionExecutor({
     actionRepo, caseRepo, customerRepo, merchantRepo, policyConfigRepo, auditRepo,
     humanReviewRepo, commitmentRepo, policyEngine: executionPolicy,
+    jobScheduler,
     providerRegistry: ProviderRegistry.forRuntime({
       enabled: Boolean(env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET),
       keyId: env.RAZORPAY_KEY_ID,

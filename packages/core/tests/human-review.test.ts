@@ -172,6 +172,29 @@ describe('HumanReviewService Unit Tests', () => {
         inMemoryReviews.set(rId, updated);
         return updated;
       }),
+      approveReviewAndContinueCase: vi.fn(async (mId: string, rId: string, cId: string, data: any) => {
+        const rev = inMemoryReviews.get(rId);
+        const caseRecord = inMemoryCases.get(cId);
+        if (!rev || rev.merchantId !== mId || rev.caseId !== cId || rev.status !== ReviewStatus.PENDING) {
+          throw new ReviewStateConflictError(rId, ReviewStatus.PENDING, rev?.status);
+        }
+        if (!caseRecord || caseRecord.merchantId !== mId || caseRecord.status !== CaseStatus.NEEDS_REVIEW) {
+          throw new Error('Case state conflict');
+        }
+        const updated = {
+          ...rev,
+          reviewerId: data.reviewerId,
+          status: ReviewStatus.APPROVED,
+          reviewDecision: 'APPROVED',
+          reviewNotes: data.reviewNotes,
+          revalidatedPolicyDecision: PolicyDecision.ALLOW,
+          revalidatedAt: data.revalidatedAt,
+          resolvedAt: data.resolvedAt,
+        };
+        inMemoryReviews.set(rId, updated);
+        caseRecord.status = CaseStatus.WAITING;
+        return updated;
+      }),
       listReviews: vi.fn(async (mId: string, filter?: any) => {
         return Array.from(inMemoryReviews.values())
           .filter((r) => r.merchantId === mId && (!filter?.status || r.status === filter.status));
@@ -624,7 +647,7 @@ describe('HumanReviewService Unit Tests', () => {
     expect(mockReviewRepo.createReview).not.toHaveBeenCalled();
   });
 
-  it('approves a legitimate pending review while the authoritative case remains NEEDS_REVIEW and executes once', async () => {
+  it('approves a legitimate pending review, continues the case to WAITING, and executes the exact action once', async () => {
     const { review } = await mockReviewRepo.createReview(merchantId, {
       caseId,
       planVersionId,
@@ -638,6 +661,11 @@ describe('HumanReviewService Unit Tests', () => {
 
     expect(approval.approved).toBe(true);
     expect(approval.executionResult?.success).toBe(true);
+    expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.WAITING);
+    expect(approval.action).toMatchObject({
+      actionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
+      actionParams: { channel: 'EMAIL', discountOffered: 0 },
+    });
     expect(Array.from(inMemoryActions.values()).length).toBe(beforeCount + 1);
   });
 
@@ -693,6 +721,8 @@ describe('HumanReviewService Unit Tests', () => {
     expect(approval.blockedByPolicy).toBe(true);
     expect(approval.policyDecision).toBe(PolicyDecision.DENY);
     expect(approval.policyReasonCode).toBe('CUSTOMER_OPTED_OUT');
+    expect(inMemoryCases.get(caseId).status).toBe(CaseStatus.NEEDS_REVIEW);
+    expect(inMemoryReviews.get(review.id).status).toBe(ReviewStatus.PENDING);
     expect(mockActionRepo.createAction).not.toHaveBeenCalled();
 
     expect(mockAuditRepo.record).toHaveBeenCalledWith(
@@ -992,6 +1022,27 @@ describe('Phase 6 Comprehensive Lifecycle Regression', () => {
       resolveReview: vi.fn(async (m: string, id: string, data: any) => {
         const r = inMemoryReviews.get(id);
         if (r) r.status = data.status;
+        return r;
+      }),
+      approveReviewAndContinueCase: vi.fn(async (m: string, id: string, cId: string, data: any) => {
+        const r = inMemoryReviews.get(id);
+        const c = inMemoryCases.get(cId);
+        if (!r || r.merchantId !== m || r.caseId !== cId || r.status !== ReviewStatus.PENDING) {
+          throw new ReviewStateConflictError(id, ReviewStatus.PENDING, r?.status);
+        }
+        if (!c || c.merchantId !== m || c.status !== CaseStatus.NEEDS_REVIEW) {
+          throw new Error('Case state conflict');
+        }
+        Object.assign(r, {
+          reviewerId: data.reviewerId,
+          status: ReviewStatus.APPROVED,
+          reviewDecision: 'APPROVED',
+          reviewNotes: data.reviewNotes,
+          revalidatedPolicyDecision: PolicyDecision.ALLOW,
+          revalidatedAt: data.revalidatedAt,
+          resolvedAt: data.resolvedAt,
+        });
+        c.status = CaseStatus.WAITING;
         return r;
       }),
     };

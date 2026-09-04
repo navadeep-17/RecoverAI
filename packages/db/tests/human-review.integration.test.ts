@@ -29,7 +29,7 @@ import {
 } from '@recoverai/core';
 import { PolicyEngine } from '@recoverai/policy';
 import { ProviderRegistry, SimulatedRecoveryProvider } from '@recoverai/integrations';
-import { ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
+import { CaseStateConflictError, ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
 
 describe('Human Review Workflow PostgreSQL Integration Tests', () => {
   let dbAvailable = false;
@@ -513,6 +513,13 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     expect(approval.executionResult?.success).toBe(true);
     expect(approval.action?.status).toBe(ActionExecutionStatus.SUCCESS);
 
+    const continuedCase = await caseRepo.getCaseById(merchantAId, testCase.id);
+    expect(continuedCase?.status).toBe(CaseStatus.WAITING);
+    expect(approval.action).toMatchObject({
+      actionType: planVersion.proposedActionType,
+      actionParams: planVersion.proposedActionParams,
+    });
+
     // Provider called exactly once
     expect(simulatedProvider.dispatchedCalls).toHaveLength(1);
 
@@ -548,6 +555,12 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
       reviewDecision: 'APPROVED',
       revalidatedPolicyDecision: PolicyDecision.ALLOW,
     });
+    await caseRepo.compareAndSetStatus(
+      merchantAId,
+      testCase.id,
+      CaseStatus.NEEDS_REVIEW,
+      CaseStatus.WAITING,
+    );
 
     const authResult = await actionExecutor.authorizeAndCreateAction(merchantAId, testCase.id, {
       planVersionId: planVersion.id,
@@ -609,6 +622,8 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
       expect(approval.blockedByPolicy).toBe(true);
       expect(approval.policyReasonCode).toBe('KILL_SWITCH_ACTIVE');
       expect(simulatedProvider.dispatchedCalls).toHaveLength(0);
+      expect((await caseRepo.getCaseById(merchantAId, testCase.id))?.status).toBe(CaseStatus.NEEDS_REVIEW);
+      expect((await reviewRepo.getReviewById(merchantAId, req.review!.id)).status).toBe(ReviewStatus.PENDING);
     } finally {
       await merchantRepo.setKillSwitch(merchantAId, false);
     }
@@ -716,6 +731,58 @@ describe('Human Review Workflow PostgreSQL Integration Tests', () => {
     // Verify DB state has exactly 1 resolved status
     const dbReview = await reviewRepo.getReviewById(merchantAId, reviewId);
     expect(dbReview.status).not.toBe(ReviewStatus.PENDING);
+  });
+
+  it('Scenario F2: concurrent double approval executes the reviewed action at most once', async () => {
+    if (!dbAvailable) return;
+
+    const { testCase, planVersion } = await createTestCase(merchantAId);
+    const req = await reviewService.requestReview(merchantAId, testCase.id, {
+      planVersionId: planVersion.id,
+      reasonForReview: 'Double approval race',
+    });
+
+    const results = await Promise.allSettled([
+      reviewService.approveReview(merchantAId, req.review!.id, userAdminAId),
+      reviewService.approveReview(merchantAId, req.review!.id, userReviewerAId),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    expect(simulatedProvider.dispatchedCalls).toHaveLength(1);
+    expect(await prisma.recoveryAction.count({ where: { caseId: testCase.id } })).toBe(1);
+    expect((await caseRepo.getCaseById(merchantAId, testCase.id))?.status).toBe(CaseStatus.WAITING);
+  });
+
+  it('Scenario F3: case-state conflict rolls back approval authority and never resurrects a terminal case', async () => {
+    if (!dbAvailable) return;
+
+    const { testCase, planVersion } = await createTestCase(merchantAId);
+    const req = await reviewService.requestReview(merchantAId, testCase.id, {
+      planVersionId: planVersion.id,
+      reasonForReview: 'Terminal race rollback',
+    });
+    await caseRepo.compareAndSetStatus(
+      merchantAId,
+      testCase.id,
+      CaseStatus.NEEDS_REVIEW,
+      CaseStatus.RECOVERED,
+    );
+
+    await expect(reviewRepo.approveReviewAndContinueCase(
+      merchantAId,
+      req.review!.id,
+      testCase.id,
+      {
+        reviewerId: userReviewerAId,
+        revalidatedAt: testClock(),
+        resolvedAt: testClock(),
+      },
+    )).rejects.toBeInstanceOf(CaseStateConflictError);
+
+    expect((await reviewRepo.getReviewById(merchantAId, req.review!.id)).status).toBe(ReviewStatus.PENDING);
+    expect((await caseRepo.getCaseById(merchantAId, testCase.id))?.status).toBe(CaseStatus.RECOVERED);
+    expect(await prisma.recoveryAction.count({ where: { caseId: testCase.id } })).toBe(0);
   });
 
   // G. Cross-Tenant Security

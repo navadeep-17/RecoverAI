@@ -1,6 +1,7 @@
 import {
   Prisma,
   HumanReview,
+  CaseStatus,
   ReviewStatus,
   PolicyDecision,
   Role,
@@ -9,7 +10,12 @@ import {
   RecoveryAction,
   User,
 } from '@prisma/client';
-import { ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
+import {
+  CaseStateConflictError,
+  ReviewStateConflictError,
+  UnauthorizedReviewerError,
+  validateCaseTransition,
+} from '@recoverai/shared';
 import { prisma } from '../client.js';
 
 export type HumanReviewWithRelations = HumanReview & {
@@ -25,6 +31,28 @@ export interface CreateReviewResult {
 }
 
 export class HumanReviewRepository {
+  private async assertAuthorizedReviewer(merchantId: string, reviewerId: string): Promise<void> {
+    const reviewer = await prisma.user.findFirst({
+      where: { id: reviewerId, merchantId },
+    });
+
+    if (!reviewer) {
+      throw new UnauthorizedReviewerError(
+        reviewerId,
+        merchantId,
+        'Reviewer not found in merchant organization',
+      );
+    }
+
+    if (reviewer.role !== Role.MERCHANT_ADMIN && reviewer.role !== Role.REVIEWER) {
+      throw new UnauthorizedReviewerError(
+        reviewerId,
+        merchantId,
+        `Role "${reviewer.role}" is not permitted to resolve human reviews`,
+      );
+    }
+  }
+
   /**
    * Closes active review gates when the authoritative case can no longer be
    * reviewed. This is a system reconciliation path, not a human resolution,
@@ -233,25 +261,7 @@ export class HumanReviewRepository {
     },
   ): Promise<HumanReview> {
     // 1. Verify reviewer belongs to merchant and has permitted role
-    const reviewer = await prisma.user.findFirst({
-      where: { id: data.reviewerId, merchantId },
-    });
-
-    if (!reviewer) {
-      throw new UnauthorizedReviewerError(
-        data.reviewerId,
-        merchantId,
-        'Reviewer not found in merchant organization',
-      );
-    }
-
-    if (reviewer.role !== Role.MERCHANT_ADMIN && reviewer.role !== Role.REVIEWER) {
-      throw new UnauthorizedReviewerError(
-        data.reviewerId,
-        merchantId,
-        `Role "${reviewer.role}" is not permitted to resolve human reviews`,
-      );
-    }
+    await this.assertAuthorizedReviewer(merchantId, data.reviewerId);
 
     const expected = data.expectedStatus ?? ReviewStatus.PENDING;
     const now = new Date();
@@ -289,6 +299,76 @@ export class HumanReviewRepository {
 
     return prisma.humanReview.findUniqueOrThrow({
       where: { id: reviewId },
+    });
+  }
+
+  /**
+   * Atomically claims a pending approval and restores the reviewed case to the
+   * canonical executable WAITING state. Either both CAS operations commit or
+   * neither does, so a case-state race cannot leave behind approval authority.
+   */
+  async approveReviewAndContinueCase(
+    merchantId: string,
+    reviewId: string,
+    caseId: string,
+    data: {
+      reviewerId: string;
+      reviewNotes?: string;
+      revalidatedAt: Date;
+      resolvedAt: Date;
+    },
+  ): Promise<HumanReview> {
+    await this.assertAuthorizedReviewer(merchantId, data.reviewerId);
+    validateCaseTransition(CaseStatus.NEEDS_REVIEW, CaseStatus.WAITING, caseId);
+
+    return prisma.$transaction(async (transaction) => {
+      const reviewUpdate = await transaction.humanReview.updateMany({
+        where: {
+          id: reviewId,
+          merchantId,
+          caseId,
+          status: ReviewStatus.PENDING,
+        },
+        data: {
+          reviewerId: data.reviewerId,
+          status: ReviewStatus.APPROVED,
+          reviewDecision: 'APPROVED',
+          reviewNotes: data.reviewNotes,
+          revalidatedPolicyDecision: PolicyDecision.ALLOW,
+          revalidatedAt: data.revalidatedAt,
+          resolvedAt: data.resolvedAt,
+        },
+      });
+
+      if (reviewUpdate.count === 0) {
+        const current = await transaction.humanReview.findFirst({
+          where: { id: reviewId, merchantId },
+        });
+        if (!current) {
+          throw new Error(`Human review "${reviewId}" not found for merchant "${merchantId}"`);
+        }
+        throw new ReviewStateConflictError(reviewId, ReviewStatus.PENDING, current.status);
+      }
+
+      const caseUpdate = await transaction.revenueRiskCase.updateMany({
+        where: {
+          id: caseId,
+          merchantId,
+          status: CaseStatus.NEEDS_REVIEW,
+        },
+        data: { status: CaseStatus.WAITING },
+      });
+
+      if (caseUpdate.count === 0) {
+        throw new CaseStateConflictError(
+          `Concurrent modification conflict on case ${caseId}: expected status was ${CaseStatus.NEEDS_REVIEW} but row was modified concurrently`,
+          caseId,
+          CaseStatus.NEEDS_REVIEW,
+          CaseStatus.WAITING,
+        );
+      }
+
+      return transaction.humanReview.findUniqueOrThrow({ where: { id: reviewId } });
     });
   }
 }

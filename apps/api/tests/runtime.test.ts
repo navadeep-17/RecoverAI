@@ -8,11 +8,13 @@ describe('ordinary API runtime composition', () => {
   afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
 
   it('registers review routes with the real HumanReviewService graph', async () => {
-    const reviewService = composeApiReviewService({ NODE_ENV: 'test', AI_PROVIDER: 'mock' } as any);
+    const jobScheduler = { schedule: async () => ({ id: 'job-1', created: true }) };
+    const reviewService = composeApiReviewService(jobScheduler, { NODE_ENV: 'test', AI_PROVIDER: 'mock' } as any);
     const app = buildServer({ reviewService, checkDbConnection: async () => true });
     apps.push(app);
     await app.ready();
     expect(app.printRoutes()).toContain('views (GET, HEAD)');
     expect(await app.inject({ method: 'GET', url: '/reviews' })).toMatchObject({ statusCode: 401 });
+    expect((reviewService as any).actionExecutor.jobScheduler).toBe(jobScheduler);
   });
 });

@@ -2,7 +2,7 @@ import { FastifyInstance, FastifyPluginAsync, FastifyRequest, FastifyReply } fro
 import { z } from 'zod';
 import { ReviewStatus, Role } from '@prisma/client';
 import { HumanReviewService } from '@recoverai/core';
-import { ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
+import { CaseStateConflictError, ReviewStateConflictError, UnauthorizedReviewerError } from '@recoverai/shared';
 import { requirePrincipal } from '../auth/principal.js';
 
 export interface ReviewRoutesOptions {
@@ -123,7 +123,7 @@ export const reviewRoutes: FastifyPluginAsync<ReviewRoutesOptions> = async (
       if (err instanceof UnauthorizedReviewerError) {
         return reply.status(403).send({ error: err.message });
       }
-      if (err instanceof ReviewStateConflictError) {
+      if (err instanceof ReviewStateConflictError || err instanceof CaseStateConflictError) {
         return reply.status(409).send({ error: err.message });
       }
       if (

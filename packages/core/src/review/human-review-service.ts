@@ -531,17 +531,18 @@ export class HumanReviewService {
       };
     }
 
-    // 7. Policy is ALLOW -> Resolve review atomically via CAS
-    const updatedReview = await this.humanReviewRepo.resolveReview(merchantId, reviewId, {
-      reviewerId,
-      status: ReviewStatus.APPROVED,
-      expectedStatus: ReviewStatus.PENDING,
-      reviewDecision: 'APPROVED',
-      reviewNotes: options?.notes,
-      revalidatedPolicyDecision: PolicyDecision.ALLOW,
-      revalidatedAt: currentTime,
-      resolvedAt: currentTime,
-    });
+    // 7. Policy is ALLOW -> atomically claim the review and restore executable case state.
+    const updatedReview = await this.humanReviewRepo.approveReviewAndContinueCase(
+      merchantId,
+      reviewId,
+      caseRecord.id,
+      {
+        reviewerId,
+        reviewNotes: options?.notes,
+        revalidatedAt: currentTime,
+        resolvedAt: currentTime,
+      },
+    );
 
     await this.auditRepo.record(merchantId, {
       caseId: caseRecord.id,
@@ -565,6 +566,7 @@ export class HumanReviewService {
         reviewerId,
         proposedActionType,
         policyDecision: PolicyDecision.ALLOW,
+        caseTransition: `${CaseStatus.NEEDS_REVIEW}->${CaseStatus.WAITING}`,
       },
       reasonCode: 'POLICY_REVALIDATION_ALLOWED',
     });

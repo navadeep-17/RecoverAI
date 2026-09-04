@@ -18,11 +18,11 @@ test.beforeAll(async () => {
   const reviews = new HumanReviewRepository();
   const outcomes = new OutcomeRepository();
 
-  const reviewCase = await cases.createCase(merchantId, { riskType: RiskType.OVERDUE_RECEIVABLE, amountAtRisk: '85000.00', incidentKey: 'phase-9c-review', contextJson: { invoiceId: 'phase-9c-invoice' } });
+  const reviewCase = await cases.createCase(merchantId, { riskType: RiskType.OVERDUE_RECEIVABLE, amountAtRisk: '850.00', incidentKey: 'phase-9c-review', contextJson: { invoiceId: 'phase-9c-invoice' } });
   reviewCaseId = reviewCase.id;
   await cases.updateCaseStatus(merchantId, reviewCaseId, CaseStatus.NEEDS_REVIEW);
-  const plan = await cases.addPlanVersion(merchantId, reviewCaseId, { diagnosisCode: 'OVERDUE', diagnosisSummary: 'E2E overdue receivable review', confidence: 0.92, proposedActionType: RecoveryActionType.SEND_RECEIVABLE_REMINDER, proposedActionParams: { channel: 'EMAIL', template: 'phase-9c' }, reasoningSummary: 'Deterministic high-value review fixture' });
-  reviewId = (await reviews.createReview(merchantId, { caseId: reviewCaseId, planVersionId: plan.id, reasonForReview: 'High-value recovery requires review' })).review.id;
+  const plan = await cases.addPlanVersion(merchantId, reviewCaseId, { diagnosisCode: 'OVERDUE', diagnosisSummary: 'E2E overdue receivable review', confidence: 0.92, proposedActionType: RecoveryActionType.SCHEDULE_FOLLOWUP, proposedActionParams: {}, reasoningSummary: 'Deterministic reviewed follow-up fixture' });
+  reviewId = (await reviews.createReview(merchantId, { caseId: reviewCaseId, planVersionId: plan.id, reasonForReview: 'Operator approval required for follow-up' })).review.id;
 
   const organic = await cases.createCase(merchantId, { riskType: RiskType.PAYMENT_FAILURE, amountAtRisk: '100.00', incidentKey: 'phase-9c-organic', contextJson: { paymentId: 'organic-payment' } });
   organicCaseId = organic.id;
@@ -71,13 +71,22 @@ test('policy save persists through the real API', async ({ page }) => {
   await expect(page.getByRole('status')).toContainText('Policy settings saved. Server state refreshed.');
 });
 
-test('pending review detail exposes its authoritative case, reason, and proposal without dispatch', async ({ page }) => {
+test('pending review approval continues the case and durably schedules the exact proposal', async ({ page }) => {
   await page.goto('/reviews');
   await page.getByText(reviewCaseId).click();
   await expect(page.getByRole('heading', { name: `Review ${reviewId}` })).toBeVisible();
-  await expect(page.getByText('High-value recovery requires review')).toBeVisible();
-  await expect(page.getByText('SEND RECEIVABLE REMINDER')).toBeVisible();
-  await expect(page.getByText('EMAIL')).toBeVisible();
+  await expect(page.getByText('Operator approval required for follow-up')).toBeVisible();
+  await expect(page.getByText('SCHEDULE FOLLOWUP')).toBeVisible();
+  await page.getByRole('button', { name: 'Approve exact proposal' }).click();
+
+  await expect.poll(async () => (await prisma.humanReview.findUnique({ where: { id: reviewId } }))?.status).toBe('APPROVED');
+  await expect.poll(async () => (await prisma.revenueRiskCase.findUnique({ where: { id: reviewCaseId } }))?.status).toBe(CaseStatus.WAITING);
+  await expect.poll(async () => prisma.recoveryAction.count({
+    where: { caseId: reviewCaseId, actionType: RecoveryActionType.SCHEDULE_FOLLOWUP, status: ActionExecutionStatus.SUCCESS },
+  })).toBe(1);
+  await expect.poll(async () => prisma.scheduledJob.count({
+    where: { caseId: reviewCaseId, jobType: 'RECOVERY_FOLLOWUP_CHECK', status: 'SCHEDULED' },
+  })).toBe(1);
 });
 
 test('recovered cases display organic and attributed money truth from persisted outcomes', async ({ page }) => {

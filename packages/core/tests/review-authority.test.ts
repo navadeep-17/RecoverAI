@@ -88,7 +88,7 @@ describe('exact human-review authority binding', () => {
       riskType: RiskType.PAYMENT_FAILURE,
       amountAtRisk: { toString: () => '2500.00' },
       currency: 'INR',
-      status: CaseStatus.NEEDS_REVIEW,
+      status: CaseStatus.WAITING,
       openedAt: new Date('2026-08-28T06:30:00.000Z'),
       contextJson: { verifiedPaymentFailureCode: 'BAD_REQUEST_ERROR' },
       customer: {

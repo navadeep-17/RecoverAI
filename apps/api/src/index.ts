@@ -8,9 +8,10 @@ import { composeApiMerchantEventServices, composeApiReviewService } from './runt
 const env = loadEnv();
 const logger = createLogger({ level: env.LOG_LEVEL });
 const webhookQueue = new PgBossRazorpayWebhookQueue(env.DATABASE_URL, env.PG_BOSS_SCHEMA);
-const merchantEventServices = composeApiMerchantEventServices(webhookQueue.createScheduler(new ScheduledJobRepository()));
+const jobScheduler = webhookQueue.createScheduler(new ScheduledJobRepository());
+const merchantEventServices = composeApiMerchantEventServices(jobScheduler);
 const server = buildServer({
-  reviewService: composeApiReviewService(env),
+  reviewService: composeApiReviewService(jobScheduler, env),
   razorpayWebhookService: new RazorpayWebhookService({
     merchantId: env.RAZORPAY_TEST_MERCHANT_ID,
     webhookSecret: env.RAZORPAY_WEBHOOK_SECRET,

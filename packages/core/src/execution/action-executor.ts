@@ -502,15 +502,15 @@ export class ActionExecutor {
     const executionSource: PolicyExecutionSource = authority.executionSource;
     if (executionSourceIsHumanReviewApproval(executionSource)) {
       const authoritativeCase = await this.caseRepo.getCaseById(merchantId, caseRecord.id);
-      if (!authoritativeCase || authoritativeCase.status !== CaseStatus.NEEDS_REVIEW) {
+      if (!authoritativeCase || authoritativeCase.status !== CaseStatus.WAITING) {
         return await this.failActionSafely(
           merchantId,
           actionId,
           freshAction.caseId,
           freshAction.actionType,
           freshAction.idempotencyKey,
-          'Human-review execution authority is stale: authoritative case is no longer NEEDS_REVIEW; failing closed.',
-          'REVIEW_EXECUTION_BLOCKED_CASE_NOT_NEEDS_REVIEW',
+          'Human-review execution authority is stale: authoritative case is not in continuation state WAITING; failing closed.',
+          'REVIEW_EXECUTION_BLOCKED_CASE_NOT_WAITING',
         );
       }
     }
