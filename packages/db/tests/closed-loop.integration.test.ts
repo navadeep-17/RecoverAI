@@ -423,7 +423,7 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const checkoutCompletedEvent: any = {
       eventId: `evt_chk_${Date.now()}`,
       merchantId,
-      source: MerchantEventSource.MERCHANT,
+      source: MerchantEventSource.SIMULATOR,
       externalEventId: `ext_chk_${checkoutSessionId}`,
       eventType: NormalizedEventType.CHECKOUT_COMPLETED,
       occurredAt: new Date(),
@@ -456,6 +456,82 @@ describe('Closed-Loop Recovery & Canonical Demo Flows Integration Tests', () => 
     const verifiedRecovered = new Prisma.Decimal(finalDbCase!.recoveredAmount!).toFixed(2);
     const agentAttributed = winningOutcome?.actionId ? verifiedRecovered : '0.00';
     console.log(`DEMO B | EVENT ${checkoutIngestion.event.type} -> DETECT ${abandonmentDetection.riskType} -> AGENT ${iter1.planVersion?.proposedActionType} -> POLICY ${iter1.policyDecision} -> EXECUTE ${iter1.action?.providerName} -> WAITING -> OBSERVE CHECKOUT_COMPLETED -> RECOVERED | Verified recovered: ₹${verifiedRecovered} | Agent-attributed: ₹${agentAttributed}`);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  it('FLOW B NEGATIVE: MERCHANT CHECKOUT_COMPLETED does NOT recover', async () => {
+    if (!dbAvailable) return;
+
+    // New checkout session distinct from previous FLOW B
+    const checkoutSessionIdNeg = `cs_neg_${Date.now()}`;
+    // Ingest checkout started event (merchant source) to create a case
+    const checkoutIngestionNeg = await ingestionService.ingestEvent({
+      merchantId,
+      source: MerchantEventSource.MERCHANT,
+      externalEventId: `evt_checkout_started_${checkoutSessionIdNeg}`,
+      eventType: NormalizedEventType.CHECKOUT_STARTED,
+      occurredAt: new Date(),
+      dedupeKey: `checkout_started:${merchantId}:${checkoutSessionIdNeg}`,
+      amount: '8499.00',
+      currency: 'INR',
+      customer: {
+        externalCustomerId: `flow-b-neg-${Date.now()}`,
+        name: 'Flow B Neg Customer',
+        email: `flow_b_neg_${Date.now()}@example.com`,
+        phone: '+919876543210',
+        contactConsent: true,
+      },
+      checkout: { checkoutSessionId: checkoutSessionIdNeg },
+    });
+    expect(checkoutIngestionNeg.created).toBe(true);
+    // Run abandonment detection to create a case
+    const abandonmentJobNeg = await scheduledJobRepo.getJobById(
+      merchantId,
+      checkoutIngestionNeg.detectionResult.scheduledJobId!
+    );
+    expect(abandonmentJobNeg?.jobType).toBe('CHECKOUT_ABANDONMENT_CHECK');
+    expect(abandonmentJobNeg?.status).toBe('SCHEDULED');
+    const abandonmentDetectionNeg = await riskDetector.evaluateCheckoutTimer(
+      merchantId,
+      checkoutSessionIdNeg,
+      abandonmentJobNeg!.payloadJson as unknown as Record<string, unknown>,
+    );
+    expect(abandonmentDetectionNeg.riskDetected).toBe(true);
+    expect(abandonmentDetectionNeg.caseCreated).toBe(true);
+    const testCaseNeg = await caseRepo.getCaseById(merchantId, abandonmentDetectionNeg.caseId!);
+    expect(testCaseNeg?.status).toBe(CaseStatus.OPEN);
+    if (!testCaseNeg) throw new Error('Checkout abandonment detection did not persist a case');
+
+    // Ingest MERCHANT CHECKOUT_COMPLETED event (non-authoritative)
+    const merchantCheckoutCompleted = {
+      eventId: `evt_chk_${Date.now()}`,
+      merchantId,
+      source: MerchantEventSource.MERCHANT,
+      externalEventId: `ext_chk_${checkoutSessionIdNeg}`,
+      eventType: NormalizedEventType.CHECKOUT_COMPLETED,
+      occurredAt: new Date(),
+      dedupeKey: `checkout_completed:${merchantId}:${checkoutSessionIdNeg}`,
+      amount: '8499.00',
+      currency: 'INR',
+      checkout: { checkoutSessionId: checkoutSessionIdNeg },
+    } as any;
+    const chkResultNeg = await ingestionService.ingestEvent(merchantCheckoutCompleted, { skipRiskDetection: true });
+    expect(chkResultNeg.created).toBe(true);
+    const obsResultNeg = await observer.observeMerchantEvent(merchantCheckoutCompleted, chkResultNeg.event.id);
+
+    // Verify monetary authority is rejected
+    expect(obsResultNeg.observed).toBe(false);
+    expect(obsResultNeg.caseResolved).toBeUndefined(); // not resolved for MERCHANT event
+    // Case should remain OPEN and recovered amount unchanged
+    const finalNegCase = await caseRepo.getCaseById(merchantId, testCaseNeg.id);
+    expect(finalNegCase?.status).toBe(CaseStatus.OPEN);
+    expect(finalNegCase?.recoveredAmount).toBeNull();
+    // No winning monetary outcome should be recorded
+    const outcomesNeg = await outcomeRepo.listOutcomesByCase(merchantId, testCaseNeg.id);
+    const winningMonetary = outcomesNeg.find(
+      (o) => o.outcomeType === NormalizedEventType.CHECKOUT_COMPLETED,
+    );
+    expect(winningMonetary).toBeUndefined();
   });
 
   // ──────────────────────────────────────────────────────────────────────────
