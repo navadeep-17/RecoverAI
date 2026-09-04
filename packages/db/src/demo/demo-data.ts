@@ -304,7 +304,6 @@ export async function seedDemoData(db: PrismaClient = prisma): Promise<DemoSumma
       proposedActionType: RecoveryActionType.CREATE_OR_SEND_PAYMENT_LINK,
       proposedActionParams: {
         description: 'Subscription renewal recovery',
-        providerMode: 'SIMULATOR',
       },
       reasoningSummary: 'Policy requires a human decision before this exact proposal may execute.',
       followUpAfterSeconds: null,

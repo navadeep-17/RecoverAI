@@ -104,8 +104,11 @@ Razorpay support is deliberately limited to **Test Mode**:
 - `CREATE_OR_SEND_PAYMENT_LINK` can use the Razorpay Test Mode adapter and converts the exact case amount to paise.
 - `RAZORPAY_TEST_MERCHANT_ID` binds credentials, webhook ingestion, and execution to one configured merchant.
 - Live and unrecognized Razorpay key prefixes are rejected by environment validation.
+- When configured, all four values are required together: `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_TEST_MERCHANT_ID`, and `RAZORPAY_WEBHOOK_SECRET`.
 
 No Razorpay credentials are required for judging. The mock AI and simulator paths provide a deterministic local demo. This repository does not claim that live Razorpay money movement has been tested, and its Razorpay adapter does not retry charges because RecoverAI does not retain payment authorization.
+
+The operations UI reports **Razorpay Test Mode · Connected** only for the credential-bound merchant when payment-link execution and signed webhook recovery are both configured. After a successful real Test Mode payment-link action, the case page exposes only the validated HTTPS checkout URL—never arbitrary provider metadata or credentials.
 
 ## Recovery Verification / Money Truth
 

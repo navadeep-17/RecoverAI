@@ -107,11 +107,13 @@ Say:
 
 ## 7. Optional Razorpay Test Mode — 30 seconds
 
+First check the sidebar. It says **Razorpay Test Mode · Connected** only when the API has a complete Test Mode configuration for the signed-in merchant; otherwise it truthfully says **Not configured** and the simulator remains available.
+
 Explain the external path without claiming a live payment:
 
 1. Policy approves a payment-link proposal.
 2. The Test Mode adapter sends the case amount in exact paise.
-3. Link creation remains unresolved and non-monetary.
+3. A successful action exposes **Open Razorpay Test Payment Link** on the case page; link creation remains unresolved and non-monetary.
 4. Razorpay signs a webhook over the exact raw payload.
 5. RecoverAI verifies, persists, queues, normalizes, and correlates it.
 6. Only authoritative correlated monetary evidence can win recovery.
@@ -119,6 +121,8 @@ Explain the external path without claiming a live payment:
 Say:
 
 > Razorpay support is Test Mode only. The local judge path is deterministic and requires no credentials; live money movement is not claimed.
+
+For a human-operated external proof, configure all four local secrets—`RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_TEST_MERCHANT_ID`, and `RAZORPAY_WEBHOOK_SECRET`—without committing `.env`. Create or approve a payment-link action, open the displayed Test Mode link, complete a Razorpay test payment, and confirm that the signed webhook is persisted and processed. The proof is complete only when the same case has exactly one authoritative recovery winner and its verified amount is updated; agent attribution additionally requires the winning event to correlate to that RecoverAI action.
 
 ## Terminal Acceptance Trace
 

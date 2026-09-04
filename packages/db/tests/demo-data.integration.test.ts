@@ -39,10 +39,14 @@ describe('deterministic demo data', () => {
       recoveredCases: 0,
       monetaryOutcomes: 0,
     });
-    expect(
-      await db.humanReview.count({ where: { merchantId: DEMO_IDS.merchant, status: 'PENDING' } }),
-    ).toBe(1);
+    expect(await db.humanReview.count({ where: { merchantId: DEMO_IDS.merchant, status: 'PENDING' } })).toBe(1);
     expect(await db.policyConfig.count({ where: { merchantId: DEMO_IDS.merchant } })).toBe(1);
+    const reviewPlan = await db.recoveryPlanVersion.findUnique({
+      where: { id: 'recoverai-demo-plan-review' },
+    });
+    expect(reviewPlan?.proposedActionParams).toEqual({
+      description: 'Subscription renewal recovery',
+    });
   });
 
   it('does not seed false or structurally invalid recovered money', async () => {
@@ -84,8 +88,6 @@ describe('deterministic demo data', () => {
     expect(secondReset).toEqual(firstReset);
     expect(await getDemoSummary(db)).toEqual(secondReset);
     expect(await db.merchant.findUnique({ where: { id: unrelatedMerchantId } })).not.toBeNull();
-    expect(
-      await db.customer.findUnique({ where: { id: 'recoverai-demo-test-unrelated-customer' } }),
-    ).not.toBeNull();
+    expect(await db.customer.findUnique({ where: { id: 'recoverai-demo-test-unrelated-customer' } })).not.toBeNull();
   });
 });

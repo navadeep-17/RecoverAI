@@ -6,15 +6,40 @@ import { RevenueRadarPage } from './RevenueRadarPage';
 import { RecoveriesPage } from './RecoveriesPage';
 import { CaseDetailPage } from './CaseDetailPage';
 
-const api = vi.hoisted(() => ({ getRevenueRadarMetrics: vi.fn(), listCases: vi.fn(), getCase: vi.fn() }));
+const api = vi.hoisted(() => ({
+  getRevenueRadarMetrics: vi.fn(),
+  listCases: vi.fn(),
+  getCase: vi.fn(),
+}));
 vi.mock('../api/cases', () => api);
 
-function renderPage(node: React.ReactNode) { return render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>{node}</QueryClientProvider>); }
-const caseItem = { id: 'case-1', customerId: 'customer-1', riskType: 'PAYMENT_FAILURE' as const, amountAtRisk: '14999.99', recoveredAmount: '0.10', currency: 'INR', status: 'OPEN' as const, openedAt: '2025-01-01T00:00:00.000Z', updatedAt: '2025-01-02T00:00:00.000Z', customer: { id: 'customer-1', name: 'Ada', email: 'ada@example.test' } };
+function renderPage(node: React.ReactNode) {
+  return render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>{node}</QueryClientProvider>);
+}
+const caseItem = {
+  id: 'case-1',
+  customerId: 'customer-1',
+  riskType: 'PAYMENT_FAILURE' as const,
+  amountAtRisk: '14999.99',
+  recoveredAmount: '0.10',
+  currency: 'INR',
+  status: 'OPEN' as const,
+  openedAt: '2025-01-01T00:00:00.000Z',
+  updatedAt: '2025-01-02T00:00:00.000Z',
+  customer: { id: 'customer-1', name: 'Ada', email: 'ada@example.test' },
+};
 
 describe('operational pages', () => {
   it('renders API-provided authoritative radar totals and monetary risk distribution', async () => {
-    api.getRevenueRadarMetrics.mockResolvedValue({ revenueAtRisk: '15000.00', verifiedRecovered: '0.30', agentAttributedRecovered: '0.10', activeRecoveries: 51, needsReview: 1, riskTypeBreakdown: { PAYMENT_FAILURE: { count: 51, amountAtRisk: '15000.00' } }, statusBreakdown: { OPEN: 50, NEEDS_REVIEW: 1 } });
+    api.getRevenueRadarMetrics.mockResolvedValue({
+      revenueAtRisk: '15000.00',
+      verifiedRecovered: '0.30',
+      agentAttributedRecovered: '0.10',
+      activeRecoveries: 51,
+      needsReview: 1,
+      riskTypeBreakdown: { PAYMENT_FAILURE: { count: 51, amountAtRisk: '15000.00' } },
+      statusBreakdown: { OPEN: 50, NEEDS_REVIEW: 1 },
+    });
     renderPage(<RevenueRadarPage />);
     expect((await screen.findAllByText('₹15,000.00')).length).toBe(2);
     expect(screen.getByText('₹0.30')).toBeTruthy();
@@ -24,7 +49,15 @@ describe('operational pages', () => {
   });
 
   it('renders an intentional empty dashboard state', async () => {
-    api.getRevenueRadarMetrics.mockResolvedValue({ revenueAtRisk: '0.00', verifiedRecovered: '0.00', agentAttributedRecovered: '0.00', activeRecoveries: 0, needsReview: 0, riskTypeBreakdown: {}, statusBreakdown: {} });
+    api.getRevenueRadarMetrics.mockResolvedValue({
+      revenueAtRisk: '0.00',
+      verifiedRecovered: '0.00',
+      agentAttributedRecovered: '0.00',
+      activeRecoveries: 0,
+      needsReview: 0,
+      riskTypeBreakdown: {},
+      statusBreakdown: {},
+    });
     renderPage(<RevenueRadarPage />);
     expect(await screen.findByText('No recovery cases yet')).toBeTruthy();
   });
@@ -41,7 +74,79 @@ describe('operational pages', () => {
   });
 
   it('renders structured safe evidence, winning attribution, replan, and provider classification', async () => {
-    api.getCase.mockResolvedValue({ case: { ...caseItem, status: 'RECOVERED', contextJson: { verifiedPaymentFailureCode: 'CARD_EXPIRED', gatewayErrorMessage: 'issuer declined', paymentMethod: 'card', cardNetwork: 'Visa', cardLast4: '4242', bankName: 'HDFC', retryAttemptNumber: 2 }, recoveryOutcome: { id: 'outcome-1', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: 'action-1' }, planVersions: [{ id: 'plan-2', version: 2, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.92, proposedActionType: 'SEND_PAYMENT_LINK', reasoningSummary: 'Persisted evidence', createdAt: '2025-01-02T00:00:00.000Z' }, { id: 'plan-1', version: 1, diagnosisCode: 'DECLINED', diagnosisSummary: 'Payment declined', confidence: 0.9, proposedActionType: 'SCHEDULE_FOLLOWUP', reasoningSummary: 'Earlier evidence', createdAt: '2025-01-01T00:00:00.000Z' }], actions: [{ id: 'action-1', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', policyRationale: 'Within policy', providerName: null, createdAt: '2025-01-01T00:00:00.000Z', executedAt: '2025-01-01T00:01:00.000Z' }], outcomes: [{ id: 'outcome-1', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: 'action-1', observedAt: '2025-01-01T00:02:00.000Z' }] }, auditEvents: [{ id: 'audit-1', eventType: 'OUTCOME_RECORDED', actorType: 'SYSTEM', reasonCode: 'VERIFIED', createdAt: '2025-01-01T00:02:00.000Z' }] });
+    api.getCase.mockResolvedValue({
+      case: {
+        ...caseItem,
+        status: 'RECOVERED',
+        contextJson: {
+          verifiedPaymentFailureCode: 'CARD_EXPIRED',
+          gatewayErrorMessage: 'issuer declined',
+          paymentMethod: 'card',
+          cardNetwork: 'Visa',
+          cardLast4: '4242',
+          bankName: 'HDFC',
+          retryAttemptNumber: 2,
+        },
+        recoveryOutcome: {
+          id: 'outcome-1',
+          outcomeType: 'PAYMENT_SUCCEEDED',
+          amountRecovered: '0.10',
+          actionId: 'action-1',
+        },
+        planVersions: [
+          {
+            id: 'plan-2',
+            version: 2,
+            diagnosisCode: 'DECLINED',
+            diagnosisSummary: 'Payment declined',
+            confidence: 0.92,
+            proposedActionType: 'SEND_PAYMENT_LINK',
+            reasoningSummary: 'Persisted evidence',
+            createdAt: '2025-01-02T00:00:00.000Z',
+          },
+          {
+            id: 'plan-1',
+            version: 1,
+            diagnosisCode: 'DECLINED',
+            diagnosisSummary: 'Payment declined',
+            confidence: 0.9,
+            proposedActionType: 'SCHEDULE_FOLLOWUP',
+            reasoningSummary: 'Earlier evidence',
+            createdAt: '2025-01-01T00:00:00.000Z',
+          },
+        ],
+        actions: [
+          {
+            id: 'action-1',
+            actionType: 'SEND_PAYMENT_LINK',
+            status: 'SUCCESS',
+            policyDecision: 'ALLOW',
+            policyRationale: 'Within policy',
+            providerName: null,
+            createdAt: '2025-01-01T00:00:00.000Z',
+            executedAt: '2025-01-01T00:01:00.000Z',
+          },
+        ],
+        outcomes: [
+          {
+            id: 'outcome-1',
+            outcomeType: 'PAYMENT_SUCCEEDED',
+            amountRecovered: '0.10',
+            actionId: 'action-1',
+            observedAt: '2025-01-01T00:02:00.000Z',
+          },
+        ],
+      },
+      auditEvents: [
+        {
+          id: 'audit-1',
+          eventType: 'OUTCOME_RECORDED',
+          actorType: 'SYSTEM',
+          reasonCode: 'VERIFIED',
+          createdAt: '2025-01-01T00:02:00.000Z',
+        },
+      ],
+    });
     renderPage(<CaseDetailPage caseId="case-1" navigate={vi.fn()} />);
     expect(await screen.findByText('RECOVERY DECISION')).toBeTruthy();
     for (const value of ['Failure:', 'CARD_EXPIRED', 'Method:', 'card', 'Card:', 'Visa •••• 4242', 'Bank:', 'HDFC', 'Retry attempt:', '2', 'Gateway:', 'issuer declined', 'SEND PAYMENT LINK · 92%', 'Plan v2', 'SUCCESS · Internal / unclassified provider evidence', 'OUTCOME_RECORDED']) expect(screen.getByText(value)).toBeTruthy();
@@ -50,7 +155,37 @@ describe('operational pages', () => {
   });
 
   it('uses only an organic winning outcome for attribution despite an unrelated action-bound observation', async () => {
-    api.getCase.mockResolvedValue({ case: { ...caseItem, status: 'RECOVERED', recoveryOutcome: { id: 'winning-organic', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: null }, planVersions: [], actions: [], outcomes: [{ id: 'unrelated-update', outcomeType: 'PAYMENT_METHOD_UPDATED', amountRecovered: null, actionId: 'action-update', observedAt: '2025-01-01T00:02:00.000Z' }, { id: 'winning-organic', outcomeType: 'PAYMENT_SUCCEEDED', amountRecovered: '0.10', actionId: null, observedAt: '2025-01-01T00:01:00.000Z' }] }, auditEvents: [] });
+    api.getCase.mockResolvedValue({
+      case: {
+        ...caseItem,
+        status: 'RECOVERED',
+        recoveryOutcome: {
+          id: 'winning-organic',
+          outcomeType: 'PAYMENT_SUCCEEDED',
+          amountRecovered: '0.10',
+          actionId: null,
+        },
+        planVersions: [],
+        actions: [],
+        outcomes: [
+          {
+            id: 'unrelated-update',
+            outcomeType: 'PAYMENT_METHOD_UPDATED',
+            amountRecovered: null,
+            actionId: 'action-update',
+            observedAt: '2025-01-01T00:02:00.000Z',
+          },
+          {
+            id: 'winning-organic',
+            outcomeType: 'PAYMENT_SUCCEEDED',
+            amountRecovered: '0.10',
+            actionId: null,
+            observedAt: '2025-01-01T00:01:00.000Z',
+          },
+        ],
+      },
+      auditEvents: [],
+    });
     renderPage(<CaseDetailPage caseId="case-1" navigate={vi.fn()} />);
     expect((await screen.findAllByText('Organic / unattributed verified recovery')).length).toBeGreaterThan(0);
     expect(screen.getByText('Non-monetary observation')).toBeTruthy();
@@ -58,7 +193,40 @@ describe('operational pages', () => {
   });
 
   it('keeps unknown provider evidence unclassified and recognizes only explicit simulated and Razorpay Test Mode identities', async () => {
-    api.getCase.mockResolvedValue({ case: { ...caseItem, planVersions: [], outcomes: [], actions: [{ id: 'unknown', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', providerName: 'some-provider', createdAt: '2025-01-01T00:00:00.000Z' }, { id: 'simulated', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', providerName: 'SIMULATED_RECOVERY_PROVIDER', createdAt: '2025-01-01T00:00:00.000Z' }, { id: 'razorpay', actionType: 'SEND_PAYMENT_LINK', status: 'SUCCESS', policyDecision: 'ALLOW', providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS', createdAt: '2025-01-01T00:00:00.000Z' }] }, auditEvents: [] });
+    api.getCase.mockResolvedValue({
+      case: {
+        ...caseItem,
+        planVersions: [],
+        outcomes: [],
+        actions: [
+          {
+            id: 'unknown',
+            actionType: 'SEND_PAYMENT_LINK',
+            status: 'SUCCESS',
+            policyDecision: 'ALLOW',
+            providerName: 'some-provider',
+            createdAt: '2025-01-01T00:00:00.000Z',
+          },
+          {
+            id: 'simulated',
+            actionType: 'SEND_PAYMENT_LINK',
+            status: 'SUCCESS',
+            policyDecision: 'ALLOW',
+            providerName: 'SIMULATED_RECOVERY_PROVIDER',
+            createdAt: '2025-01-01T00:00:00.000Z',
+          },
+          {
+            id: 'razorpay',
+            actionType: 'SEND_PAYMENT_LINK',
+            status: 'SUCCESS',
+            policyDecision: 'ALLOW',
+            providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS',
+            createdAt: '2025-01-01T00:00:00.000Z',
+          },
+        ],
+      },
+      auditEvents: [],
+    });
     renderPage(<CaseDetailPage caseId="case-1" navigate={vi.fn()} />);
     expect((await screen.findAllByText(/SUCCESS · Internal \/ unclassified provider evidence/)).length).toBeGreaterThan(0);
     expect(screen.getByText(/Simulated provider/)).toBeTruthy();
@@ -66,8 +234,68 @@ describe('operational pages', () => {
     expect(screen.queryByText('External provider')).toBeNull();
   });
 
+  it('renders only an API-approved Razorpay Test payment link with safe new-tab attributes', async () => {
+    api.getCase.mockResolvedValue({
+      case: {
+        ...caseItem,
+        planVersions: [],
+        outcomes: [],
+        actions: [
+          {
+            id: 'razorpay-link',
+            actionType: 'CREATE_OR_SEND_PAYMENT_LINK',
+            status: 'SUCCESS',
+            policyDecision: 'ALLOW',
+            providerName: 'RAZORPAY_TEST_MODE_PAYMENT_LINKS',
+            paymentLinkUrl: 'https://rzp.io/i/test-link',
+            createdAt: '2025-01-01T00:00:00.000Z',
+          },
+        ],
+      },
+      auditEvents: [],
+    });
+    renderPage(<CaseDetailPage caseId="case-1" navigate={vi.fn()} />);
+    const link = await screen.findByRole('link', { name: 'Open Razorpay Test Payment Link' });
+    expect(link.getAttribute('href')).toBe('https://rzp.io/i/test-link');
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+  });
+
+  it('does not render a payment-link button for simulator or unavailable links', async () => {
+    api.getCase.mockResolvedValue({
+      case: {
+        ...caseItem,
+        planVersions: [],
+        outcomes: [],
+        actions: [
+          {
+            id: 'simulated-link',
+            actionType: 'CREATE_OR_SEND_PAYMENT_LINK',
+            status: 'SUCCESS',
+            policyDecision: 'ALLOW',
+            providerName: 'SIMULATED_RECOVERY_PROVIDER',
+            paymentLinkUrl: null,
+            createdAt: '2025-01-01T00:00:00.000Z',
+          },
+        ],
+      },
+      auditEvents: [],
+    });
+    renderPage(<CaseDetailPage caseId="case-1" navigate={vi.fn()} />);
+    expect((await screen.findAllByText(/Simulated provider/)).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('link', { name: 'Open Razorpay Test Payment Link' })).toBeNull();
+  });
+
   it('shows a retryable visible API error', async () => {
-    api.getRevenueRadarMetrics.mockRejectedValueOnce(new Error('API unavailable')).mockResolvedValueOnce({ revenueAtRisk: '0.00', verifiedRecovered: '0.00', agentAttributedRecovered: '0.00', activeRecoveries: 0, needsReview: 0, riskTypeBreakdown: {}, statusBreakdown: {} });
+    api.getRevenueRadarMetrics.mockRejectedValueOnce(new Error('API unavailable')).mockResolvedValueOnce({
+      revenueAtRisk: '0.00',
+      verifiedRecovered: '0.00',
+      agentAttributedRecovered: '0.00',
+      activeRecoveries: 0,
+      needsReview: 0,
+      riskTypeBreakdown: {},
+      statusBreakdown: {},
+    });
     renderPage(<RevenueRadarPage />);
     expect(await screen.findByText('API unavailable')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /try again/i }));

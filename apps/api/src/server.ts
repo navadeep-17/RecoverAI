@@ -13,6 +13,7 @@ import { caseRoutes } from './routes/case-routes.js';
 import { merchantEventRoutes } from './routes/merchant-event-routes.js';
 import { policyRoutes } from './routes/policy-routes.js';
 import { evaluationRoutes } from './routes/evaluation-routes.js';
+import { integrationStatusRoutes } from './routes/integration-status-routes.js';
 
 export interface BuildServerOptions {
   checkDbConnection?: () => Promise<boolean>;
@@ -29,7 +30,10 @@ export interface BuildServerOptions {
 
 export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   const env = options.env ?? loadEnv();
-  const logger = createLogger({ level: env.LOG_LEVEL, isProduction: env.NODE_ENV === 'production' });
+  const logger = createLogger({
+    level: env.LOG_LEVEL,
+    isProduction: env.NODE_ENV === 'production',
+  });
   const checkDb = options.checkDbConnection ?? checkDatabaseConnection;
 
   const app = fastify({
@@ -47,7 +51,11 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   app.removeContentTypeParser('application/json');
   app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (req, body, done) => {
     if (req.url.split('?')[0] === '/webhooks/razorpay') return done(null, body);
-    try { done(null, JSON.parse(body.toString('utf8'))); } catch (err) { done(err as Error); }
+    try {
+      done(null, JSON.parse(body.toString('utf8')));
+    } catch (err) {
+      done(err as Error);
+    }
   });
 
   // Plugins
@@ -120,21 +128,32 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     auditRepo: options.auditRepo || new AuditRepository(),
   });
 
-  app.register(policyRoutes, { prefix: '/policy', policyConfigRepo: options.policyConfigRepo || new PolicyConfigRepository(), auditRepo: options.auditRepo || new AuditRepository() });
+  app.register(policyRoutes, {
+    prefix: '/policy',
+    policyConfigRepo: options.policyConfigRepo || new PolicyConfigRepository(),
+    auditRepo: options.auditRepo || new AuditRepository(),
+  });
   app.register(evaluationRoutes, { prefix: '/evaluation' });
+  app.register(integrationStatusRoutes, { prefix: '/integrations', env });
 
   if (options.merchantEventIngestionService) {
-    app.register(merchantEventRoutes, { prefix: '/merchant-events', ingestionService: options.merchantEventIngestionService, outcomeObserver: options.merchantEventOutcomeObserver });
+    app.register(merchantEventRoutes, {
+      prefix: '/merchant-events',
+      ingestionService: options.merchantEventIngestionService,
+      outcomeObserver: options.merchantEventOutcomeObserver,
+    });
   }
 
   app.register(razorpayWebhookRoutes, {
     prefix: '/webhooks',
-    webhookService: options.razorpayWebhookService || new RazorpayWebhookService({
-      merchantId: env.RAZORPAY_TEST_MERCHANT_ID,
-      webhookSecret: env.RAZORPAY_WEBHOOK_SECRET,
-      eventRepo: new EventRepository(),
-      auditRepo: new AuditRepository(),
-    }),
+    webhookService:
+      options.razorpayWebhookService ||
+      new RazorpayWebhookService({
+        merchantId: env.RAZORPAY_TEST_MERCHANT_ID,
+        webhookSecret: env.RAZORPAY_WEBHOOK_SECRET,
+        eventRepo: new EventRepository(),
+        auditRepo: new AuditRepository(),
+      }),
   });
 
   return app;
