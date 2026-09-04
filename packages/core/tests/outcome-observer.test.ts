@@ -373,7 +373,7 @@ describe('OutcomeObserver Unit Tests', () => {
         occurredAt: new Date(),
         amount: '14999.00',
         currency: 'INR',
-        payment: { paymentId: 'pay_merchant' },
+        payment: { paymentId: 'pay_123456' },
       } as any);
 
       expect(result.observed).toBe(false);
