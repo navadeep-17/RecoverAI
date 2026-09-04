@@ -1,25 +1,135 @@
-# RecoverAI runtime demo
+# RecoverAI Judge Demo
 
-Prerequisites: Node 18+, a running local PostgreSQL instance, and the repository's normal `DATABASE_URL`. The current header-principal adapter is development/hackathon-only authentication, not production authentication.
+This guide is designed for a 3–5 minute walkthrough. The goal is to show RecoverAI's decision boundaries and money truth, not just a sequence of screens.
 
-Run `npm run demo:setup` to check PostgreSQL and apply migrations; it never drops or recreates data. For the full deterministic acceptance trace, run `npm run demo`. The acceptance harness uses real PostgreSQL, real event ingestion/detection, policy, orchestration, and deterministic `MockLLMProvider`; it does not prove Gemini quality or Razorpay execution.
+## Prepare
 
-Canonical trace outcomes:
+From a clean checkout:
 
-- Demo A begins with a persisted subscription-renewal failure, whose detector-created case reaches `RECOVERED`; verified recovered is ₹14,999 and agent-attributed is ₹0 unless authoritative action correlation exists.
-- Demo B begins with persisted `CHECKOUT_STARTED`, a durable abandonment schedule, and real timer detection before its ₹8,499 case reaches `RECOVERED`.
-- Demo C begins with persisted `INVOICE_CREATED`, a durable overdue schedule, and real timer detection before its ₹85,000 case creates a durable promise, then a visible `PENDING` HumanReview and `NEEDS_REVIEW` case.
-
-The canonical acceptance harness uses `MockLLMProvider` and `SIMULATED_RECOVERY_PROVIDER`. A separate worker integration test is the real pg-boss delivery proof; canonical Demo C is the domain trace and does not claim direct pg-boss delivery. Normal runtime can use Gemini when configured, Razorpay Test Mode for payment-link actions when its credentials are configured, and the simulator for non-Razorpay actions.
-
-Razorpay is optional and Test Mode only. With `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`, normal runtime payment-link creation routes to the Test Mode adapter; the acceptance harness remains simulated and CI never requires those credentials. For a non-side-effect Gemini proposal smoke, set `AI_PROVIDER=gemini`, `GEMINI_API_KEY`, and optionally `GEMINI_MODEL`, then run the focused Gemini tests or worker composition checks. Do not print keys.
-
-For normal local services after setup, use separate terminals:
-
-```powershell
-npm run --workspace=@recoverai/api dev
-npm run --workspace=@recoverai/worker dev
-npm run --workspace=@recoverai/web dev
+```bash
+npm ci
+cp .env.example .env
+npm run docker:up
+npm run demo:setup
 ```
 
-The runtime trace distinguishes verified settlement (authoritative event + exact money) from agent-attributed settlement (only a persisted, successful correlated RecoverAI action). Synthetic benchmark/evaluation figures are not runtime recovered money.
+Start the services in separate terminals:
+
+```bash
+npm run dev:api
+npm run dev:worker
+npm run dev:web
+```
+
+Open `http://localhost:5173`. The seeded local identity is `recoverai-demo-admin` under `recoverai-demo-merchant`. No external credentials are needed: the default demo uses mock AI and simulated providers.
+
+If rehearsal changed the demo tenant, restore only that tenant:
+
+```bash
+npm run demo:reset
+```
+
+## 1. Revenue Radar — 30 seconds
+
+Open **Revenue Radar**.
+
+Show:
+
+- three active cases;
+- one case each in `OPEN`, `WAITING`, and `NEEDS_REVIEW`;
+- total revenue at risk; and
+- verified and agent-attributed recovered amounts at zero.
+
+Say:
+
+> These cases came from payment failure, checkout abandonment, and overdue-receivable events. RecoverAI shows money at risk, but does not fabricate recovered revenue just because it took an action.
+
+## 2. Open Case and Proposal — 40 seconds
+
+Open `recoverai-demo-case-open`.
+
+Show the customer and failed-payment context, the structured diagnosis and versioned proposal, the failed simulated retry, the non-monetary outcome, and the audit history.
+
+Say:
+
+> Risk detection is rule- and event-driven. AI proposes a structured next action, but that proposal is not permission. Deterministic policy and the executor remain authoritative.
+
+## 3. Waiting and Durable Work — 35 seconds
+
+Open `recoverai-demo-case-waiting`.
+
+Show the `WAITING` state, persisted promise to pay, and scheduled follow-up.
+
+Say:
+
+> Waiting is durable state, not an in-memory sleep. The commitment and follow-up live in PostgreSQL, and pg-boss delivers due work so a process restart does not forget the customer promise.
+
+## 4. Human Review — 60 seconds
+
+Open **Human Review**, then select the pending review for `recoverai-demo-case-review`.
+
+Show the exact proposal, `CREATE_OR_SEND_PAYMENT_LINK`, the high-value review reason, consent evidence, and warning context. Add a reviewer note and approve the exact proposal. Then show the refreshed review, case, and action state.
+
+Explain the approved transition:
+
+- the case moves from `NEEDS_REVIEW` to `WAITING` before execution;
+- current policy is evaluated again;
+- approval authorizes only the persisted proposal; and
+- the default local provider remains the simulator.
+
+Say:
+
+> Human approval is narrow authority, not a policy bypass. If circumstances now produce a hard denial, the approved action still will not execute.
+
+Run `npm run demo:reset` after rehearsal if you need to restore the pending review.
+
+## 5. Explain Money Truth — 35 seconds
+
+Return to Revenue Radar or a case detail page.
+
+Say:
+
+> A successful action is not automatically money. A created payment link or payment-method update records progress only. Recovery requires an authoritative Razorpay or simulator monetary event correlated to the case. Each case has one atomic recovery winner, and agent-attributed recovery is always a subset of verified recovery.
+
+The invariant is:
+
+```text
+agentAttributedRecovered <= verifiedRecovered
+```
+
+## 6. Evaluation — 35 seconds
+
+Open **Evaluation**.
+
+Say:
+
+> This is a frozen synthetic safety benchmark, not merchant revenue and not an uplift study. On the 100-case heldout split, Rules+Policy recovered ₹334,042.89 with 24 independently classified unsafe actions; RecoverAI recovered ₹281,695.00 with 35. Both had zero policy violations. RecoverAI trailed by ₹52,347.89, so the honest result is reproducible safety enforcement with clear room to improve proposal quality.
+
+## 7. Optional Razorpay Test Mode — 30 seconds
+
+Explain the external path without claiming a live payment:
+
+1. Policy approves a payment-link proposal.
+2. The Test Mode adapter sends the case amount in exact paise.
+3. Link creation remains unresolved and non-monetary.
+4. Razorpay signs a webhook over the exact raw payload.
+5. RecoverAI verifies, persists, queues, normalizes, and correlates it.
+6. Only authoritative correlated monetary evidence can win recovery.
+
+Say:
+
+> Razorpay support is Test Mode only. The local judge path is deterministic and requires no credentials; live money movement is not claimed.
+
+## Terminal Acceptance Trace
+
+For a compact, deterministic proof using real PostgreSQL and simulated providers:
+
+```bash
+npm run demo
+```
+
+The trace covers event ingestion and detection, policy-governed orchestration, authoritative recovery, checkout timers, durable promises, follow-up scheduling, and human-review routing. It does not claim Gemini quality, live Razorpay execution, or direct pg-boss delivery for every scenario.
+
+## Reset Safety
+
+`demo:seed` and `demo:reset` are scoped to the exact demo merchant ID and slug. Reset deletes and recreates only that tenant; it does not truncate tables, drop schemas, or touch unrelated merchants.
