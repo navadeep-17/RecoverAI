@@ -121,8 +121,6 @@ Explain the external path without claiming a live payment:
 Say:
 
 > Razorpay support is Test Mode only. The local judge path is deterministic and requires no credentials; live money movement is not claimed.
-
-For a human-operated external proof, configure all four local secrets—`RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_TEST_MERCHANT_ID`, and `RAZORPAY_WEBHOOK_SECRET`—without committing `.env`. Create or approve a payment-link action, open the displayed Test Mode link, complete a Razorpay test payment, and confirm that the signed webhook is persisted and processed. The proof is complete only when the same case has exactly one authoritative recovery winner and its verified amount is updated; agent attribution additionally requires the winning event to correlate to that RecoverAI action.
 For a human-operated external proof, the frozen deterministic review case from January (`recoverai-demo-case-review`) is expired relative to current time under RecoverAI's safety policies (`maxRecoveryWindowDays`). Instead, seed a fresh proof fixture with current timestamps using `npm run razorpay:proof:setup`. Configure all four local secrets—`RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_TEST_MERCHANT_ID`, and `RAZORPAY_WEBHOOK_SECRET`—without committing `.env`. Approve the fresh proof review proposal (`recoverai-razorpay-proof-review`), open the displayed Test Mode link, complete a Razorpay test payment, and let the verified webhook be processed by the worker. Confirm the case becomes `RECOVERED` with ₹65,000.00 verified recovered, and run `npm run razorpay:proof:verify` to run the read-only proof verifier. See [`docs/RAZORPAY_TEST_PROOF.md`](./RAZORPAY_TEST_PROOF.md) for the complete operational runbook.
 
 ## Terminal Acceptance Trace

@@ -8,6 +8,9 @@ This runbook guides human operators through executing and verifying a real end-t
 > [!CAUTION]
 > **Never commit `.env` or credentials**: Do not stage, commit, or push `.env` files, API keys, or webhook secrets. The repository CI must remain 100% credential-free.
 
+> [!CAUTION]
+> **Razorpay Test Mode 30-Link Limit**: Razorpay's official Payment Links documentation states that Test Mode allows up to 30 Payment Links per business. Avoid repeatedly approving and resetting the proof unnecessarily. Resetting RecoverAI local database records does not delete or cancel external Razorpay Test Payment Links in your Razorpay Dashboard. Operators should preserve a completed, successful proof rather than recreating links repeatedly.
+
 ---
 
 ## Why a Fresh Proof Fixture is Required
@@ -50,18 +53,20 @@ Therefore, RecoverAI provides dedicated tooling to seed a fresh external proof f
    ```
 
 5. **Expose `/webhooks/razorpay` via Public HTTPS**
-   Use a tunnel such as `ngrok` or `cloudflared` to expose the API port (default `4000`):
-   ```bash
-   ngrok http 4000
-   ```
-   Note the public HTTPS forwarding URL (e.g., `https://xyz.ngrok-free.app`).
+   Razorpay cannot deliver webhooks to `localhost`; the webhook endpoint must be a publicly accessible HTTPS URL on public ports 80 or 443. Furthermore, Razorpay's official webhook documentation notes that many common tunneling and testing domains are blacklisted.
+
+   Expose the RecoverAI API's configured port (default `3000`; if the operator changed `PORT` in the environment, expose that configured port instead) using either:
+   - **Option A (Local development)**: Expose the RecoverAI API's configured port (default 3000) using `zrok` as recommended by Razorpay's current webhook-testing documentation (see [Razorpay Webhook Testing Guide](https://razorpay.com/docs/webhooks/testing-webhooks/)).
+   - **Option B (Staging endpoint)**: Use an existing public HTTPS staging endpoint accepted by Razorpay that proxies to the API.
+
+   Note the public HTTPS forwarding URL (e.g., `https://<public-subdomain>.<tunnel-domain>`). The canonical RecoverAI webhook path is `/webhooks/razorpay` (do not change this application route).
 
 6. **Configure Webhook in Razorpay Dashboard**
-   - Log into Razorpay Dashboard in **Test Mode**.
-   - Navigate to **Settings → Webhooks → Add New Webhook**.
-   - URL: `https://xyz.ngrok-free.app/webhooks/razorpay`
-   - Secret: The exact string matching `RAZORPAY_WEBHOOK_SECRET` in `.env`.
-   - Active Events: Select `payment_link.paid` (and optionally `payment.captured`).
+   - Log into the Razorpay Dashboard in **Test Mode**.
+   - Navigate to **Accounts & Settings** → **Webhooks** (under **Website and app settings**) → **Add New Webhook** (see [Razorpay Webhook Setup Guide](https://razorpay.com/docs/webhooks/setup-webhooks/)).
+   - **Webhook URL**: `https://<public-endpoint>/webhooks/razorpay` (must be public HTTPS on port 80 or 443; `localhost` itself cannot be registered).
+   - **Secret**: The exact string matching `RAZORPAY_WEBHOOK_SECRET` in `.env`.
+   - **Active Events**: Select `payment_link.paid` (and optionally `payment.captured`).
 
 7. **Start RecoverAI Services**
    In separate terminals, start:
@@ -105,7 +110,7 @@ Therefore, RecoverAI provides dedicated tooling to seed a fresh external proof f
 14. **Observe Webhook Ingestion and Worker Processing**
     - Razorpay dispatches the signed `payment_link.paid` webhook to your public HTTPS endpoint.
     - RecoverAI verifies the raw HMAC signature using `RAZORPAY_WEBHOOK_SECRET`.
-    - `WebhookEvent` receipt is recorded with provider event identity (`event:evt_...`).
+    - `WebhookEvent` receipt is recorded with event-based provider identity (`event:<x-razorpay-event-id>`).
     - pg-boss hands the event to the worker subscriber.
     - The worker correlates the payment link ID (`plink_...`) with the `RecoveryAction`.
     - `OutcomeObserver` validates monetary truth and transitions the case to `RECOVERED` with ₹65,000.00 verified recovered.
@@ -145,5 +150,5 @@ Therefore, RecoverAI provides dedicated tooling to seed a fresh external proof f
     ```bash
     npm run razorpay:proof:reset
     ```
-    *Note: Resetting local proof records does not delete or cancel links in the Razorpay Dashboard.*
+    *Note: Resetting local proof records does not delete or cancel links in the Razorpay Dashboard. Because Razorpay Test Mode allows a limit of up to 30 Payment Links per business, avoid repeatedly creating links and preserve completed proof runs.*
 
