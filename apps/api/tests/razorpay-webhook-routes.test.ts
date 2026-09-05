@@ -11,7 +11,11 @@ describe('Razorpay webhook route', () => {
 
     const response = await app.inject({
       method: 'POST', url: '/webhooks/razorpay', payload: raw,
-      headers: { 'content-type': 'application/json', 'x-razorpay-signature': signature },
+      headers: {
+        'content-type': 'application/json',
+        'x-razorpay-signature': signature,
+        'x-razorpay-event-id': '  provider-event-001  ',
+      },
     });
 
     expect(response.statusCode).toBe(202);
@@ -19,6 +23,7 @@ describe('Razorpay webhook route', () => {
     expect(Buffer.isBuffer(accept.mock.calls[0][0])).toBe(true);
     expect(accept.mock.calls[0][0].toString('utf8')).toBe(raw);
     expect(accept.mock.calls[0][1]).toBe(signature);
+    expect(accept.mock.calls[0][2]).toBe('provider-event-001');
     await app.close();
   });
 });

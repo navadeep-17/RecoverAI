@@ -1,4 +1,4 @@
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { RecoveryActionType } from '@recoverai/shared';
 import { ProviderExecutionOutcome } from '@recoverai/core';
@@ -46,10 +46,66 @@ describe('Phase 7 Razorpay boundaries', () => {
     expect(queue.enqueue).toHaveBeenCalledWith({ merchantId, webhookEventId: 'wh_001' });
   });
 
+  it('prefers the verified delivery provider event ID for receipt identity and deduplication', async () => {
+    const { service, eventRepo } = webhookService();
+    const result = await service.accept(
+      Buffer.from(rawPaymentFailed),
+      signature(rawPaymentFailed),
+      'provider-event-001',
+    );
+    expect(result).toMatchObject({ accepted: true, duplicate: false });
+    expect(eventRepo.recordWebhookEvent).toHaveBeenCalledWith(expect.objectContaining({
+      externalEventId: 'provider-event-001',
+      dedupeKey: 'event:provider-event-001',
+    }));
+  });
+
+  it('deduplicates repeated deliveries by the same provider event ID without duplicate downstream work', async () => {
+    const { service, eventRepo, queue } = webhookService();
+    eventRepo.recordWebhookEvent
+      .mockResolvedValueOnce({ created: true, event: { id: 'wh_001' } })
+      .mockResolvedValueOnce({ created: false, event: { id: 'wh_001', processed: true } });
+
+    const first = await service.accept(Buffer.from(rawPaymentFailed), signature(rawPaymentFailed), 'provider-event-duplicate');
+    const second = await service.accept(Buffer.from(rawPaymentFailed), signature(rawPaymentFailed), 'provider-event-duplicate');
+
+    expect(first).toMatchObject({ accepted: true, duplicate: false });
+    expect(second).toMatchObject({ accepted: true, duplicate: true });
+    expect(eventRepo.recordWebhookEvent).toHaveBeenCalledTimes(2);
+    expect(eventRepo.recordWebhookEvent).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      externalEventId: 'provider-event-duplicate',
+      dedupeKey: 'event:provider-event-duplicate',
+    }));
+    expect(queue.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['payload id', '{"id":"payload-id","event":"payment.failed","payload":{"payment":{"entity":{"id":"pay_001","amount":12345,"currency":"INR"}}}}', 'payload-id'],
+    ['payload event_id', '{"event_id":"payload-event-id","event":"payment.failed","payload":{"payment":{"entity":{"id":"pay_001","amount":12345,"currency":"INR"}}}}', 'payload-event-id'],
+  ])('retains the %s fallback when the provider event ID header is absent', async (_label, raw, expectedId) => {
+    const { service, eventRepo } = webhookService();
+    await service.accept(Buffer.from(raw), signature(raw));
+    expect(eventRepo.recordWebhookEvent).toHaveBeenCalledWith(expect.objectContaining({
+      externalEventId: expectedId,
+      dedupeKey: `event:${expectedId}`,
+    }));
+  });
+
+  it('uses a deterministic raw-body hash when header and payload event identity are absent', async () => {
+    const raw = '{"event":"payment.failed","payload":{"payment":{"entity":{"id":"pay_hash","amount":12345,"currency":"INR"}}}}';
+    const { service, eventRepo } = webhookService();
+    await service.accept(Buffer.from(raw), signature(raw));
+    const expectedHash = createHash('sha256').update(Buffer.from(raw)).digest('hex');
+    expect(eventRepo.recordWebhookEvent).toHaveBeenCalledWith(expect.objectContaining({
+      externalEventId: undefined,
+      dedupeKey: `raw:${expectedHash}`,
+    }));
+  });
+
   it('rejects an HMAC made over reconstructed JSON and persists no trusted event', async () => {
     const { service, eventRepo, queue } = webhookService();
     const reconstructed = JSON.stringify(JSON.parse(rawPaymentFailed));
-    const result = await service.accept(Buffer.from(rawPaymentFailed), signature(reconstructed));
+    const result = await service.accept(Buffer.from(rawPaymentFailed), signature(reconstructed), 'provider-event-untrusted');
     expect(result).toMatchObject({ accepted: false, statusCode: 401 });
     expect(eventRepo.recordWebhookEvent).not.toHaveBeenCalled();
     expect(queue.enqueue).not.toHaveBeenCalled();

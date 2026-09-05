@@ -24,7 +24,11 @@ export type RazorpayWebhookAcceptance =
 export class RazorpayWebhookService {
   constructor(private readonly options: RazorpayWebhookServiceOptions) {}
 
-  async accept(rawBody: Buffer, signature: string | undefined): Promise<RazorpayWebhookAcceptance> {
+  async accept(
+    rawBody: Buffer,
+    signature: string | undefined,
+    providerEventId?: string,
+  ): Promise<RazorpayWebhookAcceptance> {
     if (!this.options.merchantId || !this.options.webhookSecret) {
       return { accepted: false, statusCode: 503, reason: 'Razorpay webhook configuration unavailable' };
     }
@@ -42,7 +46,7 @@ export class RazorpayWebhookService {
       return { accepted: false, statusCode: 400, reason: 'Malformed webhook payload' };
     }
 
-    const externalEventId = this.eventId(payload);
+    const externalEventId = this.eventId(payload, providerEventId);
     const dedupeKey = externalEventId
       ? `event:${externalEventId}`
       : `raw:${createHash('sha256').update(rawBody).digest('hex')}`;
@@ -105,7 +109,9 @@ export class RazorpayWebhookService {
     return actual.length === expected.length && timingSafeEqual(actual, expected);
   }
 
-  private eventId(payload: RazorpayRawPayload): string | null {
+  private eventId(payload: RazorpayRawPayload, providerEventId?: string): string | null {
+    const normalizedProviderEventId = providerEventId?.trim();
+    if (normalizedProviderEventId) return normalizedProviderEventId;
     return payload.id || payload.event_id || null;
   }
 }
