@@ -107,7 +107,7 @@ Say:
 
 ## 7. Optional Razorpay Test Mode — 30 seconds
 
-First check the sidebar. It says **Razorpay Test Mode · Connected** only when the API has a complete Test Mode configuration for the signed-in merchant; otherwise it truthfully says **Not configured** and the simulator remains available.
+First check the sidebar. It says **Razorpay Test Mode · Configured** only when the API has a complete local Test Mode configuration for the signed-in merchant; otherwise it says **Not configured** and the simulator remains available. This status does not perform a live Razorpay connectivity check or verify Dashboard webhook registration or reachability.
 
 Explain the external path without claiming a live payment:
 

@@ -47,7 +47,7 @@ describe('integration status route', () => {
     expect(response.body).not.toMatch(/keyId|keySecret|webhookSecret|apiKey/i);
   });
 
-  it("does not report another merchant's bound integration as connected", async () => {
+  it("does not report another merchant's bound integration as configured", async () => {
     const app = buildTestServer({ env: configuredEnv });
     const response = await app.inject({
       method: 'GET',

@@ -108,7 +108,7 @@ Razorpay support is deliberately limited to **Test Mode**:
 
 No Razorpay credentials are required for judging. The mock AI and simulator paths provide a deterministic local demo. This repository does not claim that live Razorpay money movement has been tested, and its Razorpay adapter does not retry charges because RecoverAI does not retain payment authorization.
 
-The operations UI reports **Razorpay Test Mode · Connected** only for the credential-bound merchant when payment-link execution and signed webhook recovery are both configured. After a successful real Test Mode payment-link action, the case page exposes only the validated HTTPS checkout URL—never arbitrary provider metadata or credentials.
+The operations UI reports **Razorpay Test Mode · Configured** only for the credential-bound merchant when payment-link and signed-webhook paths are locally configured. This status does not perform a live Razorpay connectivity check or verify Dashboard webhook registration or reachability. After a successful real Test Mode payment-link action, the case page exposes only the validated HTTPS checkout URL—never arbitrary provider metadata or credentials.
 
 ## Recovery Verification / Money Truth
 

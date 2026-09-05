@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { IntegrationStatus } from './IntegrationStatus';
 
@@ -8,15 +8,17 @@ const api = vi.hoisted(() => ({ getIntegrationStatus: vi.fn() }));
 vi.mock('../api/integrations', () => api);
 
 function renderStatus() {
-  return render(
-    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={client}>
       <IntegrationStatus />
     </QueryClientProvider>,
   );
+  return client;
 }
 
 describe('integration status', () => {
-  it('shows connected only for a fully enabled Razorpay Test Mode loop', async () => {
+  it('labels complete local configuration without claiming verified Razorpay connectivity', async () => {
     api.getIntegrationStatus.mockResolvedValue({
       razorpay: {
         mode: 'TEST',
@@ -27,25 +29,35 @@ describe('integration status', () => {
       ai: { provider: 'gemini' },
     });
     renderStatus();
-    expect(await screen.findByText('Razorpay Test Mode · Connected')).toBeTruthy();
+    expect(await screen.findByText('Razorpay Test Mode · Configured')).toBeTruthy();
+    expect(screen.queryByText('Razorpay Test Mode · Connected')).toBeNull();
+    expect(screen.getByText('Payment-link and signed-webhook paths are configured for this merchant. This status does not perform a live Razorpay connectivity check.')).toBeTruthy();
+    expect(screen.queryByText('Payment links and signed webhook recovery are enabled for this merchant.')).toBeNull();
   });
 
-  it('shows not configured for incomplete or unavailable status', async () => {
+  it.each([
+    ['incomplete', true, true],
+    ['absent', false, false],
+  ])('shows not configured for %s configuration', async (_state, configured, paymentLinksEnabled) => {
     api.getIntegrationStatus.mockResolvedValue({
       razorpay: {
         mode: 'TEST',
-        configured: true,
-        paymentLinksEnabled: true,
+        configured,
+        paymentLinksEnabled,
         webhooksConfigured: false,
       },
       ai: { provider: 'mock' },
     });
-    const first = renderStatus();
-    expect(await screen.findByText('Razorpay Test Mode · Not configured')).toBeTruthy();
-    first.unmount();
+    const client = renderStatus();
+    await waitFor(() => expect(client.getQueryState(['integration-status'])?.status).toBe('success'));
+    expect(screen.getByText('Razorpay Test Mode · Not configured')).toBeTruthy();
+    expect(screen.getByText('The deterministic simulator remains available.')).toBeTruthy();
+  });
 
+  it('shows not configured when integration status is unavailable', async () => {
     api.getIntegrationStatus.mockRejectedValue(new Error('Unavailable'));
-    renderStatus();
-    expect(await screen.findByText('Razorpay Test Mode · Not configured')).toBeTruthy();
+    const client = renderStatus();
+    await waitFor(() => expect(client.getQueryState(['integration-status'])?.status).toBe('error'));
+    expect(screen.getByText('Razorpay Test Mode · Not configured')).toBeTruthy();
   });
 });

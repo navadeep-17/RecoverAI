@@ -7,12 +7,12 @@ export function IntegrationStatus() {
     queryFn: getIntegrationStatus,
     retry: false,
   });
-  const connected = Boolean(query.data?.razorpay.configured && query.data.razorpay.paymentLinksEnabled && query.data.razorpay.webhooksConfigured);
+  const configured = Boolean(query.data?.razorpay.configured && query.data.razorpay.paymentLinksEnabled && query.data.razorpay.webhooksConfigured);
 
   return (
     <div className="absolute bottom-5 text-xs text-slate-500">
-      <p className="font-semibold text-slate-700">Razorpay Test Mode · {connected ? 'Connected' : 'Not configured'}</p>
-      <p className="mt-2">{connected ? 'Payment links and signed webhook recovery are enabled for this merchant.' : 'The deterministic simulator remains available.'}</p>
+      <p className="font-semibold text-slate-700">Razorpay Test Mode · {configured ? 'Configured' : 'Not configured'}</p>
+      <p className="mt-2">{configured ? 'Payment-link and signed-webhook paths are configured for this merchant. This status does not perform a live Razorpay connectivity check.' : 'The deterministic simulator remains available.'}</p>
     </div>
   );
 }
